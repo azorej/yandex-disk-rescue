@@ -1,0 +1,23 @@
+[project]
+name = "example-app"
+version = "0.1.0"
+description = "An example CLI application demonstrating Typer and workspace integration"
+authors = [
+    {name = "Author Name", email = "author@example.com"}
+]
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "typer>=0.27.3",
+    "example-library",
+]
+
+[project.scripts]
+example-app = "example_app.main:app"
+
+[build-system]
+requires = ["hatchling>=1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/example_app"]

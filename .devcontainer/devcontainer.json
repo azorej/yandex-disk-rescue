@@ -1,0 +1,49 @@
+// For format details, see https://aka.ms/devcontainer.json
+{
+	"name": "python-template",
+	"build": {
+		"dockerfile": "./Dockerfile",
+		"args": {
+			"USER": "codespaces"
+		}
+	},
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"anthropic.claude-code",
+				"charliermarsh.ruff",
+				"ms-python.python",
+				"hverlin.mise-vscode",
+				"github.vscode-github-actions",
+				"eamodio.gitlens",
+				"yzhang.markdown-all-in-one",
+				"aaron-bond.better-comments",
+				"TomRijndorp.find-it-faster"
+			],
+			"settings": {
+				// mise activates .venv (see [env] in mise.toml); letting the Python
+				// extension prepend it too would shadow mise-managed tool paths.
+				"python.terminal.activateEnvironment": false
+			}
+		}
+	},
+	"mounts": [
+		// User cache (uv, mise downloads, shell history) persists across rebuilds.
+		"source=${localWorkspaceFolderBasename}-cache,target=/home/codespaces/.cache,type=volume",
+		// Claude Code login, settings and history persist across rebuilds (CLAUDE_CONFIG_DIR).
+		"source=claude-code-config-${devcontainerId},target=/home/codespaces/.claude,type=volume"
+	],
+	"workspaceMount": "source=${localWorkspaceFolder}/,target=${containerWorkspaceFolder},type=bind,consistency=cached",
+	"workspaceFolder": "/workspaces/${localWorkspaceFolderBasename}",
+
+	"postCreateCommand": ".devcontainer/post_create.sh codespaces \"${containerWorkspaceFolder}\"",
+
+	// https://containers.dev/features
+	"features": {
+		// Dagger runs its engine in Docker.
+		"ghcr.io/devcontainers/features/docker-in-docker:4": {}
+	},
+
+	// More info: https://aka.ms/dev-containers-non-root.
+	"remoteUser": "codespaces"
+}

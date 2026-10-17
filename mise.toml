@@ -1,0 +1,73 @@
+# mise.toml — tool versions, environment and tasks (https://mise.jdx.dev)
+#
+# `mise install` installs the pinned tools; `mise tasks` lists every task.
+# Versions here are the single source of truth for the devcontainer and CI
+# (jdx/mise-action). Check for newer versions with `mise outdated`.
+
+[tools]
+python = "3.14.8"
+uv = "0.13.1"
+# Must match `engineVersion` in dagger.json and .dagger/tests/dagger.json.
+dagger = "0.21.10"
+
+[env]
+# Activate the uv-managed venv. `_.path` entries are prepended after mise tool
+# paths, so mise-managed binaries always win.
+_.path = [".venv/bin"]
+VIRTUAL_ENV = "{{config_root}}/.venv"
+# Local, git-ignored secrets and settings. Copy .env.example to .env to start.
+_.file = ".env"
+
+[tasks.setup]
+description = "Install tools, Python deps and git hooks (idempotent)"
+run = [
+  "mise install",
+  "uv sync",
+  "uv run pre-commit install --install-hooks",
+]
+
+[tasks.lint]
+description = "Ruff lint + format check (no changes)"
+run = [
+  "uv run ruff check",
+  "uv run ruff format --check",
+]
+
+[tasks.format]
+description = "Auto-fix lint issues and format code"
+run = [
+  "uv run ruff check --fix",
+  "uv run ruff format",
+]
+
+[tasks.test]
+description = "Run pytest (extra args are passed through: mise run test -- -k greet)"
+run = "uv run pytest"
+
+[tasks.check]
+description = "Fast local gate: lint + test"
+depends = ["lint", "test"]
+
+[tasks.ci]
+description = "Run the full CI pipeline in Dagger — the same thing GitHub Actions runs"
+run = "dagger call check"
+
+[tasks."ci:selftest"]
+description = "Run the Dagger module's own tests (.dagger/tests)"
+dir = ".dagger/tests"
+run = "dagger call all"
+
+[tasks.lock]
+description = "Upgrade every dependency in uv.lock and re-sync the venv"
+run = [
+  "uv lock --upgrade",
+  "uv sync",
+]
+
+[tasks."dagger:develop"]
+description = "Regenerate the Dagger Python SDK and sync the Dagger venvs (for IDE support)"
+run = [
+  "dagger develop",
+  "uv sync --project .dagger",
+  "cd .dagger/tests && dagger develop && uv sync",
+]

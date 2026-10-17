@@ -1,0 +1,70 @@
+[project]
+name = "python-template"
+version = "0.1.0"
+requires-python = ">=3.14"
+
+[dependency-groups]
+dev = [
+  "ipython>=9.17.1",
+  "pre-commit>=4.7.0",
+  "pytest>=9.1.1",
+  "pytest-cov>=7.1.0",
+  "ruff>=0.17.1",
+  # Workspace members — listed here so `uv sync` installs them in editable mode.
+  "example-app",
+  "example-library",
+]
+
+[tool.uv.sources]
+example-app = { workspace = true }
+example-library = { workspace = true }
+
+[tool.uv.workspace]
+members = ["example-app", "example-library"]
+# The Dagger modules are separate uv projects with their own lock files.
+exclude = [".dagger", ".dagger/tests"]
+
+[tool.pytest.ini_options]
+testpaths = ["example-app/tests", "example-library/tests"]
+addopts = "-v --tb=short --import-mode=importlib"
+
+[tool.coverage.run]
+source = ["example_app", "example_library"]
+branch = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py314"
+# Generated Dagger SDKs (also git-ignored; listed so ruff skips them without git too).
+extend-exclude = [".dagger/sdk", ".dagger/tests/sdk"]
+
+[tool.ruff.lint]
+fixable = ["ALL"]
+select = [
+    "F",      # pyflakes
+    "E",      # pycodestyle (errors)
+    "W",      # pycodestyle (warnings) e.g. trailing/leading whitespaces
+    "Q",      # quotes
+    "I",      # unsorted imports (isort)
+    "TID",    # tidy-imports
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "BLE001", # blind except — surface failures explicitly (AGENTS.md, Core Rule 1); escape via `# noqa: BLE001 — <reason>`
+]
+ignore = [
+    "E501",  # Line too long — the formatter owns line length
+]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["BLE001"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-quotes]
+inline-quotes = "single"
+
+[tool.ruff.format]
+quote-style = "single"
+docstring-code-format = true

@@ -1,0 +1,17 @@
+[project]
+name = "tests"
+version = "0.1.0"
+requires-python = ">=3.13"
+dependencies = ["dagger-io"]
+
+[build-system]
+requires = ["uv_build>=0.13.1,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.sources]
+dagger-io = { path = "sdk", editable = true }
+
+[tool.ruff]
+# Share the repository's ruff config; only the target differs (Dagger SDK runtime).
+extend = "../../pyproject.toml"
+target-version = "py313"

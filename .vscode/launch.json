@@ -1,0 +1,88 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Example App: Hello",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "example_app.main",
+            "args": [
+                "hello"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Example App: Hello with Name",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "example_app.main",
+            "args": [
+                "hello",
+                "${input:name}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Example App: Greet Multiple",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "example_app.main",
+            "args": [
+                "greet-multiple"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Run Tests",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-v",
+                "--tb=short",
+                "${workspaceFolder}/example-app/tests/",
+                "${workspaceFolder}/example-library/tests/"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Run Specific Test File",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": [
+                "-v",
+                "--tb=short",
+                "${input:testFile}"
+            ],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ],
+    "inputs": [
+        {
+            "id": "name",
+            "description": "Name to greet",
+            "default": "World",
+            "type": "promptString"
+        },
+        {
+            "id": "testFile",
+            "description": "Test file to run",
+            "default": "example-app/tests/test_main.py",
+            "type": "promptString"
+        }
+    ]
+}

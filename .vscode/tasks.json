@@ -1,0 +1,61 @@
+{
+    // Thin wrappers over mise tasks (see mise.toml). With the mise VS Code
+    // extension every mise task is also available directly under "Run Task".
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "Setup (tools, deps, git hooks)",
+            "type": "shell",
+            "command": "mise run setup",
+            "problemMatcher": []
+        },
+        {
+            "label": "Check (lint + test)",
+            "type": "shell",
+            "command": "mise run check",
+            "problemMatcher": [],
+            "group": {
+                "kind": "test",
+                "isDefault": true
+            }
+        },
+        {
+            "label": "Format",
+            "type": "shell",
+            "command": "mise run format",
+            "problemMatcher": []
+        },
+        {
+            "label": "CI (Dagger, same as GitHub)",
+            "type": "shell",
+            "command": "mise run ci",
+            "problemMatcher": []
+        },
+        {
+            "label": "Upgrade dependencies (uv.lock)",
+            "type": "shell",
+            "command": "mise run lock",
+            "problemMatcher": []
+        },
+        {
+            "label": "Run example-app: hello",
+            "type": "shell",
+            "command": "uv run example-app hello",
+            "problemMatcher": []
+        },
+        {
+            "label": "Run example-app: greet multiple",
+            "type": "shell",
+            "command": "uv run example-app greet-multiple ${input:names}",
+            "problemMatcher": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "names",
+            "description": "Names to greet (space separated)",
+            "default": "Alice Bob Charlie",
+            "type": "promptString"
+        }
+    ]
+}

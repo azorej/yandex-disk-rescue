@@ -1,0 +1,130 @@
+name: CI
+
+# Pull requests run only the lanes their diff touches. Every other event
+# (push to main, the weekly schedule, a manual dispatch) is a full-suite
+# backstop: the path filter does not execute, so every lane is forced on.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    # Weekly: catches drift in things the lock file does not pin (base images,
+    # runner images, actions) even when nobody pushes.
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # Off a pull request `head_ref` is empty; fall back to the sha so backstop
+  # runs do not share one group. Only PR runs cancel superseded runs.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Trust this repo's mise.toml (it sets env vars and defines tasks).
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+jobs:
+  changes:
+    name: Detect changed paths
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    # Each output is an explicit boolean: dorny's 'false' is a non-empty
+    # (truthy) string, so `steps.filter.outputs.x || ...` would be wrong.
+    outputs:
+      python: ${{ steps.filter.outputs.python == 'true' || github.event_name != 'pull_request' }}
+      dagger: ${{ steps.filter.outputs.dagger == 'true' || github.event_name != 'pull_request' }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            dagger: &dagger
+              - '.dagger/**'
+              - 'dagger.json'
+              - 'mise.toml'
+              - '.github/workflows/ci.yml'
+            python:
+              - *dagger
+              - '**/*.py'
+              - '**/*.md'  # ruff formats code blocks in Markdown
+              - '**/pyproject.toml'
+              - 'uv.lock'
+              - '.python-version'
+
+  check:
+    name: Lint & test
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: dagger
+      # Same entry point as local `mise run ci`. Never pipe `dagger` output:
+      # a pipe can mask its exit status.
+      - run: mise run ci
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
+  dagger-selftest:
+    name: Dagger module tests
+    needs: changes
+    if: needs.changes.outputs.dagger == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: dagger
+      - run: mise run ci:selftest
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
+  hygiene:
+    name: Pre-commit hooks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v5
+        with:
+          install_args: python uv
+      - run: uv sync --locked
+      - run: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
+        env:
+          # Ruff already runs in the `Lint & test` lane.
+          SKIP: ruff-check,ruff-format
+
+  # The single status check to mark as required in branch protection. On a
+  # pull request a path-skipped lane passes; on a backstop run every lane was
+  # forced on, so a skip there means nothing ran and is a failure.
+  required:
+    name: CI required
+    if: always()
+    needs: [changes, check, dagger-selftest, hygiene]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every lane resolved to a result this event allows
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = pull_request ]; then allowed='["success","skipped"]'; else allowed='["success"]'; fi
+          bad=$(jq -r --argjson ok "$allowed" \
+            'to_entries[] | select(.value.result as $r | $ok | index($r) | not) | "\(.key): \(.value.result)"' \
+            <<<"$NEEDS")
+          if [ -n "$bad" ]; then
+            echo "::error::Lanes not green for a '$EVENT_NAME' run:"
+            echo "$bad"
+            exit 1
+          fi
+          echo "All lanes OK for a '$EVENT_NAME' run."
