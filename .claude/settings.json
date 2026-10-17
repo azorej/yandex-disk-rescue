@@ -18,7 +18,8 @@
     ],
     "deny": [
       "Read(./.env)",
-      "Read(./.env.*)",
+      "Read(./.env.local)",
+      "Read(./.env.*.local)",
       "Edit(./uv.lock)",
       "Edit(./.dagger/uv.lock)",
       "Edit(./.dagger/tests/uv.lock)"

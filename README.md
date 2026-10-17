@@ -5,8 +5,9 @@ account to local storage. It is a headless analogue of the Windows app
 [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
 > **Status: early development.** The CLI skeleton exists
-> (`yandex-disk-rescue --help`, `--version`). Download features are being
-> built. Planned work is tracked in GitHub issues.
+> (`yandex-disk-rescue --help`, `--version`) with OAuth token handling under
+> `yandex-disk-rescue auth`. Download features are being built. Planned work
+> is tracked in GitHub issues.
 
 ## Goals
 
@@ -23,6 +24,94 @@ account to local storage. It is a headless analogue of the Windows app
 - **CLI only.** Scriptable, cron- and systemd-friendly, no GUI.
 
 This is an independent, unofficial tool. It is not affiliated with Yandex.
+
+## Authentication
+
+The tool talks to Yandex Disk with an OAuth token that grants only Disk read
+access (`cloud_api:disk.read`) and Disk info (`cloud_api:disk.info`).
+
+### Getting a token
+
+```bash
+yandex-disk-rescue auth login
+```
+
+It prints a Yandex ID URL on stderr. Open it in a browser, sign in and allow
+access; Yandex then shows a token. Paste it at the hidden `Paste the token`
+prompt (the whole address-bar URL containing `access_token=` works too). The
+token is checked with one request to the Disk API and saved only if Yandex
+accepts it:
+
+```
+Logged in as user.name. Token saved to /home/user/.config/yandex-disk-rescue/token.
+```
+
+A rejected token exits `1` and nothing is saved.
+
+### Using your own OAuth app
+
+By default `auth login` authorizes the tool's built-in Yandex OAuth app (a
+public ClientID; no client secret is shipped). To use your own app instead,
+register one at <https://oauth.yandex.com/client/new> with:
+
+- the redirect URI `https://oauth.yandex.ru/verification_code`;
+- both Disk permissions: read all of Disk (`cloud_api:disk.read`) and
+  access information about Disk (`cloud_api:disk.info`).
+
+Then pass its ClientID with `--client-id ID` or the
+`YANDEX_DISK_RESCUE_CLIENT_ID` environment variable (the option wins). A
+value that is not 32 lowercase hex characters is a usage error (exit `2`).
+
+### Automation
+
+For cron, systemd or CI, set `YANDEX_DISK_RESCUE_TOKEN` (for example with a
+systemd `EnvironmentFile=`) instead of running `auth login`.
+
+### Where the token comes from
+
+The tool looks for the token in this order:
+
+1. The `YANDEX_DISK_RESCUE_TOKEN` environment variable. If it is set but
+   blank, that is an error; the stored file is not used as a fallback.
+   `auth login` and `auth logout` warn when it is set, because it overrides
+   the stored file.
+2. The token file `$XDG_CONFIG_HOME/yandex-disk-rescue/token`
+   (`~/.config/yandex-disk-rescue/token` when `XDG_CONFIG_HOME` is unset or
+   not an absolute path). `auth login` writes it as mode `0600` and sets
+   the `yandex-disk-rescue` directory to `0700`. A token file readable by
+   group or others is refused, as ssh does; fix it with `chmod 600 <file>`.
+   A path that is not a regular file or a file that is not UTF-8 text is
+   refused too.
+
+Surrounding whitespace is stripped from either source. A token that still
+contains whitespace or anything but printable ASCII is refused with an error
+naming its source.
+
+The token is never accepted as a command-line argument (it would show in
+`ps` and shell history), and the tool never prints it.
+
+`yandex-disk-rescue auth status` shows where the token comes from, the Yandex
+login it belongs to and the Disk usage, after checking it with one request to
+the Disk API:
+
+```
+Token: file /home/user/.config/yandex-disk-rescue/token
+Account: user.name
+Disk usage: 1.5 GiB of 10.0 GiB used (15.0%)
+```
+
+It exits `0` when Yandex accepts the token and `1` otherwise (no token, a
+malformed or unreadable token, a token Yandex rejects, an unreachable API or an unexpected response), with an
+`Error: ...` line on stderr. Every command reports such failures the same
+way; usage errors exit `2`.
+
+### Logging out
+
+`yandex-disk-rescue auth logout` deletes the stored token file. It succeeds
+when there is no file, and warns if `YANDEX_DISK_RESCUE_TOKEN` still provides
+a token. Deleting the file does not revoke the token at Yandex (that needs a
+client secret the tool does not have): revoke the app's access in Yandex ID
+at <https://id.yandex.com/personal/data-access>.
 
 ## Quick start
 
