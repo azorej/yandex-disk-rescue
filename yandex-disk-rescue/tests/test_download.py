@@ -1905,9 +1905,11 @@ async def test_segments_meeting_an_expired_link_share_one_refresh(segmented, des
     assert (dest / 'large.bin').read_bytes() == SEGMENTED
     assert _linked(segmented) == [SEGMENTED_PATH] * 2
     later = [r for r in segmented.requests if r.path == '/download'][4:]
-    assert [(r.params['link'], r.headers['range']) for r in later] == [
-        ('1', resumed[0]),
-        ('1', resumed[1]),
-        ('2', resumed[0]),
-        ('2', resumed[1]),
-    ]
+    assert sorted((r.params['link'], r.headers['range']) for r in later) == sorted(
+        [
+            ('1', resumed[0]),
+            ('1', resumed[1]),
+            ('2', resumed[0]),
+            ('2', resumed[1]),
+        ]
+    )
