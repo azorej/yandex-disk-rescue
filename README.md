@@ -720,12 +720,31 @@ every file.
 - **stdout** carries the report: the start lines, the scan summary, the
   final summary, then the `Manifest:` and `Log:` lines. Nothing else is ever
   written there, so `> report.txt` keeps exactly the report.
-- **stderr** carries the notices and the result: the `Error: …` or
+- **stderr** carries the notices as they happen, then the `Error: …` or
   `Interrupted; …` line a run ends with.
 
-`-q` / `--quiet` leaves only that result line on stderr. `-v` / `--verbose`
-also logs DEBUG records to the log file. Neither changes stdout, and giving
-both is a usage error (exit `2`).
+A notice is one line, `<UTC time> <message>`:
+
+```
+2026-10-17T09:31:02.417Z disk:/Photos/gone.jpg failed: removed from the Disk after the scan
+2026-10-17T09:35:40.002Z disk:/Photos/bad.jpg quarantined: MD5 mismatch (expected …, got …); kept at .yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg
+```
+
+By default stderr shows a notice for each file or folder that fails or is
+quarantined in this run, each `verify` finding made in this run (`missing`,
+`modified` or `corrupt`), each folder that disappeared during a scan and each
+entry left out because its name is not valid Unicode. Files `verify` lists
+from the manifest (not downloaded, or held in quarantine) get no notice; the
+summary lists them.
+
+- `-v` / `--verbose` also shows each file downloaded (size, time, average
+  speed, how it was verified), adopted, renamed or moved aside, each
+  deferral to a later pass, each pass starting, the start and commit of a
+  scan, and each Disk API throttling response and retry. It also logs DEBUG
+  records to the log file.
+- `-q` / `--quiet` leaves only the final `Error: …` or `Interrupted; …` line
+  on stderr (and the log-file warning described below).
+- Neither changes stdout, and giving both is a usage error (exit `2`).
 
 **The log file.** Every run of `scan`, `download` and `verify` appends to
 `$XDG_STATE_HOME/yandex-disk-rescue/yandex-disk-rescue.log`
@@ -746,7 +765,12 @@ both is a usage error (exit `2`).
   its full summary with every list complete (no `… and N more`), and its
   end: `completed (exit 0)`, `failed (exit N): <error>`,
   `interrupted (exit 130)`, or an unexpected error with its traceback.
-- The level is INFO, DEBUG with `-v`.
+- In between it logs every notice and every `-v` record, whatever the
+  console flags. With `-v` it also logs DEBUG records: each file skipped as
+  verified already or held in quarantine, each file `verify` found intact or
+  listed from the manifest, each transfer attempt and immediate retry, each
+  link refresh, each resumed segment with the bytes kept, the fallback to one
+  stream, each checkpoint, and each folder listed.
 - The file is rotated at 10 MiB, keeping five older files (`.1` is the most
   recent, `.5` the oldest). Every file is mode 0600 in the 0700 state
   directory.

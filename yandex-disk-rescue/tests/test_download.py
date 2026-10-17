@@ -35,6 +35,7 @@ from mirror_tree import (
     run_download,
     runner,
     start_command,
+    stderr_lines,
     wait_until,
 )
 from yandex_disk_rescue import api, localfs, mirroring
@@ -302,8 +303,11 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     assert _STAMP.fullmatch(run.name)
     assert _quarantined(run, path, reason) in result.stdout
     assert 'Failed' not in result.stdout
-    assert result.stderr == 'Error: 1 quarantined; see the list above.\n'
     copy = run / 'Photos' / '2024' / 'a.jpg'
+    assert stderr_lines(result.stderr) == [
+        f'{path} quarantined: {reason}; kept at {copy.relative_to(dest)}',
+        'Error: 1 quarantined; see the list above.',
+    ]
     assert copy.read_bytes() == corrupted
     assert copy.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     assert not local_file(dest, path).exists()
@@ -487,7 +491,14 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
         'Failed: 1\n'
         '  disk:/Checks/short.bin: the download failed: '
     ) in result.stdout
-    assert result.stderr == 'Error: 1 failed and 1 quarantined; see the lists above.\n'
+    *notices, result_line = stderr_lines(result.stderr)
+    assert result_line == 'Error: 1 failed and 1 quarantined; see the lists above.'
+    quarantined, failed = sorted(notices)
+    assert quarantined == (
+        f'disk:/Checks/sha.bin quarantined: SHA-256 mismatch (expected {"0" * 64}, got {actual}); '
+        f'kept at .yandex-disk-rescue/quarantine/{run.name}/sha.bin'
+    )
+    assert failed.startswith('disk:/Checks/short.bin failed: the download failed: ')
     assert (dest / 'size-only.bin').read_bytes() == bytes([ord('s') ^ 0xFF]) + b'ize only'
     assert not (dest / 'sha.bin').exists()
     assert (run / 'sha.bin').read_bytes() == content
@@ -997,6 +1008,15 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
     assert result.exit_code == 1
     assert failed in result.stdout
     assert '6 downloaded' in result.stdout
+    *notices, result_line = stderr_lines(result.stderr)
+    assert sorted(notices) == [
+        'disk:/Bad\\udc81 failed: the folder name is not valid Unicode, so the Disk API cannot list it or download '
+        'anything in it',
+        'disk:/Bad\\udc81 left out: the name is not valid Unicode',
+        'disk:/Docs/bad\\udc80.txt failed: the name is not valid Unicode, so the Disk API cannot download it',
+        'disk:/Docs/bad\\udc80.txt left out: the name is not valid Unicode',
+    ]
+    assert result_line == 'Error: 2 failed; see the list above.'
     assert all(local_file(dest, path).read_bytes() == content for path, content in FILES.items())
 
     for reuse in (['--no-scan'], [], ['--retry-failed']):
@@ -1401,7 +1421,9 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
     listed = ''.join(f'  {path}: {reason}\n' for path, reason in failed)
     assert f', {len(failed)} failed\n' in result.stdout
     assert f'Failed: {len(failed)}\n{listed}' in result.stdout
-    assert result.stderr == f'Error: {len(failed)} failed; see the list above.\n'
+    *notices, result_line = stderr_lines(result.stderr)
+    assert sorted(notices) == [f'{path} failed: {reason}' for path, reason in failed]
+    assert result_line == f'Error: {len(failed)} failed; see the list above.'
     assert _others_verified(dest, failed='')
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
     if obstacle != 'untraversable':

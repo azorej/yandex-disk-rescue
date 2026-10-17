@@ -8,7 +8,7 @@ from datetime import UTC
 
 import pytest
 from fake_disk_server import Delay, FakeResponse
-from mirror_tree import log_messages
+from mirror_tree import log_messages, stderr_lines
 from typer.testing import CliRunner
 from yandex_disk_rescue import scanning
 from yandex_disk_rescue.api import Resource
@@ -122,6 +122,10 @@ def test_entries_whose_names_are_not_valid_unicode_are_reported_and_not_recorded
         'Not recorded, the name is not valid Unicode: 2\n  disk:/Bad\\udc81\n  disk:/Docs/bad\\udc80.txt\n'
     ) in result.stdout
     assert result.stdout.startswith(f'Scanned disk:/: 6 files, 4 folders, {format_size(6013)}\n')
+    assert sorted(stderr_lines(result.stderr)) == [
+        'disk:/Bad\\udc81 left out: the name is not valid Unicode',
+        'disk:/Docs/bad\\udc80.txt left out: the name is not valid Unicode',
+    ]
     left_out = {'disk:/Docs/bad\udc80.txt', 'disk:/Bad\udc81', 'disk:/Bad\udc81/inside.txt'}
     assert _rows() == [r for r in _tree_rows(disk) if r.path not in left_out]
     assert 'disk:/Bad\udc81' not in [r.params.get('path') for r in disk.requests]
@@ -312,6 +316,7 @@ def test_a_folder_deleted_during_the_scan_is_reported_and_recorded_as_removed(di
         f'Manifest: {_manifest_path()}\n'
         f'Log: {log_path()}\n'
     )
+    assert stderr_lines(result.stderr) == ['disk:/Photos/2024 disappeared during the scan; it is recorded as removed']
     disk.remove('disk:/Photos/2024')
     assert _rows() == _tree_rows(disk)
 

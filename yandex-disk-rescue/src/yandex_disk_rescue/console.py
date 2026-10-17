@@ -27,7 +27,8 @@ Verbose = Annotated[
     typer.Option(
         '-v',
         '--verbose',
-        help='Also show the INFO notices on stderr, and log DEBUG records to the log file.',
+        help='Also show on stderr each file downloaded, adopted, renamed or moved aside, each pass and deferral, '
+        'the start and commit of a scan, and API throttling and retries; log DEBUG records to the log file.',
     ),
 ]
 Quiet = Annotated[
@@ -68,6 +69,11 @@ class Output:
 
     def line(self, text: str) -> None:
         typer.echo(text)
+
+    def headline(self, text: str) -> None:
+        """Write a report line saying what the run is about to do, and log it to the log file."""
+        _log.info('%s', text, extra=FILE_ONLY)
+        self.line(text)
 
     def summary(self, lines: Callable[..., list[str]]) -> None:
         """Log the summary `lines(limit=None)`, every list in full, to the log file, then print `lines()`, whose lists

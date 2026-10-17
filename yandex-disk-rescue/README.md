@@ -187,7 +187,9 @@ yandex-disk-rescue/
 │   │                 #   an open file and setting its times; the free space of a folder's filesystem
 │   ├── console.py    # The output of scan, download and verify: `-v`/`-q`, the report lines on stdout, the run
 │   │                 #   wrapped in `command_output` (log file and notice handlers attached for the run, its start
-│   │                 #   and end records, `LogFileError`), the full summary logged, the `Manifest:` and `Log:` lines
+│   │                 #   and end records, `LogFileError`), the start lines and the full summary logged, the
+│   │                 #   `Manifest:` and `Log:` lines; the engines and the API client log their own records
+│   │                 #   (failures, findings, per-file outcomes, passes, throttling) through `logging.getLogger`
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the timestamped notices on stderr
 │   ├── units.py      # format_size — binary-unit byte counts for command output
@@ -225,7 +227,8 @@ yandex-disk-rescue/
     │                       #   `/dev/shm`, another filesystem than `dest`'s)
     ├── mirror_tree.py      # The tree the download and verify tests mirror; running `download`, running a command
     │                       #   in a child process and waiting on it, the local path of a Disk file, the replaced
-    │                       #   and quarantine run folders, a corrupted copy of bytes, the messages of the log file
+    │                       #   and quarantine run folders, a corrupted copy of bytes, the messages of the log file,
+    │                       #   the lines of stderr without the notice timestamps
     ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host

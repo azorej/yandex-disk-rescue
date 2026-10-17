@@ -89,3 +89,11 @@ def log_messages(path=None) -> list[str]:
     for line in lines:
         assert LOG_LINE.match(line), line
     return [LOG_LINE.sub('', line, count=1) for line in lines]
+
+
+NOTICE_TIMESTAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ')
+
+
+def stderr_lines(stderr: str) -> list[str]:
+    """The lines of a command's stderr, each notice without its timestamp: the notices, then the result line."""
+    return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines()]

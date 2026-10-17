@@ -232,7 +232,7 @@ async def _run(
                 if reused is None:
                     output.summary(partial(scan_summary, await scan_tree(client, manifest, account, scan_root)))
                 else:
-                    output.line(reused)
+                    output.headline(reused)
                 run = MirrorRun(mirror, destination, retry_failed=retry_failed)
                 return await _mirror(client, run, destination, output, transfers, retry_failed=retry_failed)
 
@@ -249,12 +249,12 @@ async def _mirror(
     files = 'file' if run.pending_files == 1 else 'files'
     size = format_size(run.pending_size)
     if retry_failed:
-        output.line(
+        output.headline(
             f'Retrying {run.pending_files} failed, quarantined, unfinished or broken {files} ({size}) in '
             f'{destination.path}'
         )
     else:
-        output.line(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
+        output.headline(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     if (move := run.partial_move) is not None and move.downloads:
         if move.missing:
             output.line(

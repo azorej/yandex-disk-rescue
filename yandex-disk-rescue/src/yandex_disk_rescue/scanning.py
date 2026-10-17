@@ -2,6 +2,7 @@
 
 import asyncio
 import bisect
+import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
@@ -12,6 +13,7 @@ from yandex_disk_rescue.units import format_size
 SHOWN_PATHS = 20
 # Rows are staged in batches: each `ScanSession.add` is one transaction with an fsync, run on the event loop.
 _STAGE_BATCH = 1000
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -88,6 +90,7 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
     listed, and the result and the commit name it. Folders are listed with `client.limits.concurrency` concurrent listings; the first
     failed listing stops the walk, is raised, and leaves the manifest unchanged.
     """
+    _log.info('Scanning %s', display_path(root.path))
     session = manifest.begin_scan(account.uid, root.path)
     if root.resource is not None:
         session.add([root.resource])
@@ -98,6 +101,19 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
         if resource.path != root.path:
             totals.count(resource)
     diff = session.commit(unencodable=walk.unencodable)
+    changes = (
+        'first scan'
+        if diff.first_scan
+        else f'{len(diff.added)} added, {len(diff.changed)} changed, {len(diff.removed)} removed'
+    )
+    _log.info(
+        'Scan of %s committed: %s, %s, %s; %s',
+        display_path(root.path),
+        _plural(totals.files, 'file'),
+        _plural(totals.folders, 'folder'),
+        format_size(totals.size),
+        changes,
+    )
     return ScanResult(root=root.path, totals=totals, vanished=walk.vanished, unencodable=walk.unencodable, diff=diff)
 
 
@@ -206,6 +222,7 @@ class _Walk:
                 if resource.path in self._vanished:
                     continue
                 if not _is_unicode(resource.path):
+                    _log.warning('%s left out: the name is not valid Unicode', display_path(resource.path))
                     self._unencodable[resource.path] = resource
                     continue
                 self._batch.append(resource)
@@ -213,6 +230,7 @@ class _Walk:
                     folders.put_nowait(resource.path)
                 if len(self._batch) >= _STAGE_BATCH:
                     self._stage()
+            _log.debug('Listed %s', display_path(folder))
         except api.RemotePathNotFoundError, api.NotAFolderError:
             if folder == self._root:
                 raise
@@ -230,6 +248,7 @@ class _Walk:
     def _vanish(self, folder: str) -> None:
         if self._has_vanished(folder):
             return
+        _log.warning('%s disappeared during the scan; it is recorded as removed', display_path(folder))
         self._vanished = {path for path in self._vanished if not _within(path, folder)} | {folder}
         self._batch = [resource for resource in self._batch if not _within(resource.path, folder)]
         self._unencodable = {path: r for path, r in self._unencodable.items() if not _within(path, folder)}

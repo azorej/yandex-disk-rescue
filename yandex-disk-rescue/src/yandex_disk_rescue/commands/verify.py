@@ -64,7 +64,7 @@ def verify(
                         raise NotAMirrorError(destination.path, manifest_path)
                     current = None if restart else mirror.verify_pass()
                     run = VerifyRun(mirror, destination, current or mirror.start_verify_pass())
-                    output.line(_start_line(run, current, destination.path))
+                    output.headline(_start_line(run, current, destination.path))
                     report = run.run()
         except KeyboardInterrupt:
             typer.echo('Interrupted; rerun verify to continue where it stopped.', err=True)

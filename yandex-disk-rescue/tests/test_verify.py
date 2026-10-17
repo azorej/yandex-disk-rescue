@@ -26,6 +26,7 @@ from mirror_tree import (
     run_download,
     runner,
     start_command,
+    stderr_lines,
     wait_until,
 )
 from yandex_disk_rescue import localfs, verifying
@@ -208,7 +209,13 @@ def test_each_kind_of_damage_is_reported_and_recorded_and_a_link_is_never_follow
         f'Manifest: {manifest_path()}\n'
         f'Log: {log_path()}\n'
     )
-    assert result.stderr == 'Error: 4 problems found; see the lists above.\n'
+    assert stderr_lines(result.stderr) == [
+        f'{README} missing: Docs/readme.txt is missing',
+        f'{CYRILLIC} modified: {linked_reason}',
+        f'{CORRUPT} corrupt: {corrupt_reason}',
+        f'{EDITED} modified: {edited_reason}',
+        'Error: 4 problems found; see the lists above.',
+    ]
     assert _findings() == [
         (README, 'missing', 'Docs/readme.txt is missing'),
         (CYRILLIC, 'modified', linked_reason),
@@ -230,7 +237,7 @@ def test_an_unreadable_file_is_corrupt_and_the_others_are_still_checked(disk, de
     assert result.exit_code == 1
     reason = f'could not read Docs/readme.txt: {os.strerror(errno.EIO)}'
     assert _intact_lines(dest, 5, corrupt=1) + f'Corrupt: 1\n  {README}: {reason}\n' in result.stdout
-    assert result.stderr == 'Error: 1 problem found; see the list above.\n'
+    assert stderr_lines(result.stderr) == [f'{README} corrupt: {reason}', 'Error: 1 problem found; see the list above.']
     assert _findings() == [(README, 'corrupt', reason)]
 
 
@@ -596,7 +603,9 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
 
     assert child.returncode == 130, stderr
     assert stdout == f'Verifying 40 files ({MANY_SIZE}) in {dest}\n'
-    assert stderr == 'Interrupted; rerun verify to continue where it stopped.\n'
+    *notices, result_line = stderr_lines(stderr)
+    assert [notice.partition(' ')[0] for notice in notices] == [EARLY]
+    assert result_line == 'Interrupted; rerun verify to continue where it stopped.'
     started, through = _verify_pass()
     assert EARLY <= through < LATE
     assert [path for path, *_ in _findings()] == [EARLY]
@@ -610,14 +619,12 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
     uninterrupted = _verify(str(dest))
 
     assert uninterrupted.stdout.startswith(f'Verifying 40 files ({MANY_SIZE}) in {dest}\n')
-    assert (
-        (resumed.exit_code, resumed.stderr)
-        == (uninterrupted.exit_code, uninterrupted.stderr)
-        == (
-            1,
-            'Error: 2 problems found; see the list above.\n',
-        )
-    )
+    assert resumed.exit_code == uninterrupted.exit_code == 1
+    *found_now, result_line = stderr_lines(resumed.stderr)
+    *found_in_full, full_result_line = stderr_lines(uninterrupted.stderr)
+    assert result_line == full_result_line == 'Error: 2 problems found; see the list above.'
+    assert [notice.partition(' ')[0] for notice in found_now] == [LATE]
+    assert [notice.partition(' ')[0] for notice in found_in_full] == [EARLY, LATE]
     assert resumed.stdout.splitlines()[1:] == uninterrupted.stdout.splitlines()[1:]
     assert f'Verified {dest} (disk:/Many): 38 intact, 0 missing, 0 modified, 2 corrupt,' in resumed.stdout
     assert [path for path, *_ in _findings()] == [EARLY, LATE]

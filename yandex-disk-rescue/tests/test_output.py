@@ -7,11 +7,13 @@ import re
 import stat
 
 import pytest
-from mirror_tree import LOG_LINE, log_messages, run_download, runner
-from yandex_disk_rescue import logs
+from fake_disk_server import FakeResponse
+from mirror_tree import FILES, LOG_LINE, MODIFIED, TOKEN, log_messages, run_download, runner, stderr_lines
+from yandex_disk_rescue import logs, mirroring
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.paths import log_path, manifest_path, state_dir
+from yandex_disk_rescue.units import format_size
 
 TIMESTAMP = r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z'
 
@@ -149,3 +151,97 @@ def test_a_log_file_that_stops_taking_writes_never_stops_the_rescue(disk, dest, 
     assert re.fullmatch(f'{TIMESTAMP} {re.escape(warning)}\n', result.stderr)
     assert result.stdout.endswith(f'Manifest: {manifest_path()}\nLog: {log_path()} (incomplete: {reason})\n')
     assert (dest / 'Docs' / 'readme.txt').read_bytes() == b'read me'
+
+
+def test_the_log_names_every_failed_file_and_a_rerun_appends_to_it(disk, dest):
+    refused = [f'disk:/Refused/{index:02}.bin' for index in range(25)]
+    for path in refused:
+        disk.add_file(path, b'x', modified=MODIFIED)
+        disk.inject('GET', '/v1/disk/resources/download', 404, where={'path': path})
+    reason = 'removed from the Disk after the scan'
+
+    failed = run_download(str(dest))
+    retried = run_download('--retry-failed', str(dest))
+
+    assert failed.exit_code == 1
+    listed = ''.join(f'  {path}: {reason}\n' for path in refused[:20])
+    assert f'Failed: 25\n{listed}  … and 5 more\nManifest: ' in failed.stdout
+    assert retried.exit_code == 0, retried.output
+    messages = log_messages()
+    assert sorted(m for m in messages if m.endswith(f' failed: {reason}')) == [f'{p} failed: {reason}' for p in refused]
+    assert all(f'  {path}: {reason}' in messages for path in refused)
+    runs = [m for m in messages if m.startswith('download ') and ('started:' in m or '(exit ' in m)]
+    assert [m.partition(';')[0] if 'started:' in m else m for m in runs] == [
+        f'download started: version 0.1.0, pid {os.getpid()}',
+        'download failed (exit 1): 25 failed; see the list above.',
+        f'download started: version 0.1.0, pid {os.getpid()}',
+        'download completed (exit 0)',
+    ]
+
+
+def test_the_verbosity_sets_the_notices_and_the_log_level_and_never_the_report(disk, tmp_path, monkeypatch):
+    readme = 'disk:/Docs/readme.txt'
+    failure = f'{readme} failed: removed from the Disk after the scan'
+    runs = {}
+    for verbosity, flags in {'quiet': ['-q'], 'normal': [], 'verbose': ['-v']}.items():
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / verbosity))
+        (tmp_path / verbosity).mkdir()
+        disk.inject('GET', '/v1/disk/resources/download', 404, where={'path': readme})
+        result = run_download(*flags, str(tmp_path / verbosity / 'dest'))
+        assert result.exit_code == 1
+        assert all(re.match(f'{TIMESTAMP} ', line) for line in result.stderr.splitlines()[:-1])
+        *notices, result_line = stderr_lines(result.stderr)
+        assert result_line == 'Error: 1 failed; see the list above.'
+        runs[verbosity] = result.stdout.replace(str(tmp_path / verbosity), '<run>'), notices, _levels()
+
+    assert runs['quiet'][0] == runs['normal'][0] == runs['verbose'][0]
+    assert 'Failed: 1\n  disk:/Docs/readme.txt: removed from the Disk after the scan\n' in runs['normal'][0]
+    assert runs['quiet'][1] == []
+    assert runs['normal'][1] == [failure]
+    verbose = runs['verbose'][1]
+    assert failure in verbose
+    assert 'Scanning disk:/' in verbose
+    downloaded = [notice.partition(' downloaded: ')[0] for notice in verbose if ' downloaded: ' in notice]
+    assert sorted(downloaded) == sorted(path for path in FILES if path != readme)
+    assert runs['quiet'][2] == runs['normal'][2] == {'INFO', 'WARNING', 'ERROR'}
+    assert 'DEBUG' in runs['verbose'][2]
+
+
+def test_the_log_never_holds_the_token_or_a_download_link(disk, dest):
+    disk.redirect_downloads = True
+    disk.inject('GET', '/download', 410, where={'path': 'disk:/Docs/readme.txt'})
+
+    result = run_download('-v', str(dest))
+
+    assert result.exit_code == 0, result.output
+    log = log_path().read_text(encoding='utf-8')
+    assert 'disk:/Docs/readme.txt: the download host rejected the link; getting a new one' in log_messages()
+    assert TOKEN not in log
+    assert 'link=' not in log
+    assert '/storage?' not in log
+
+
+def _levels() -> set[str]:
+    return {LOG_LINE.match(line)['level'] for line in log_path().read_text(encoding='utf-8').splitlines()}
+
+
+def test_the_log_records_api_throttling_retries_deferrals_and_passes(disk, dest, monkeypatch):
+    monkeypatch.setattr(mirroring, 'PASS_PAUSE_SECONDS', 0)
+    disk.inject('GET', '/v1/disk/', FakeResponse(429, headers={'Retry-After': '0'}))
+    disk.inject('GET', '/download', 503, where={'path': 'disk:/Docs/readme.txt'})
+
+    result = run_download('-v', str(dest))
+
+    assert result.exit_code == 0, result.output
+    messages = log_messages()
+    assert 'Disk API throttling: HTTP 429; request interval now 50 ms; Retry-After 0 s' in messages
+    [retry] = [m for m in messages if m.startswith('Disk API request failed: ')]
+    assert retry.startswith('Disk API request failed: Yandex Disk API returned HTTP 429')
+    assert retry.endswith('; retry 1 of 5 in 0.0 s')
+    total = format_size(sum(map(len, FILES.values())))
+    assert [m for m in messages if m.startswith(('Pass ', 'disk:/Docs/readme.txt deferred'))] == [
+        f'Pass 1 of 7 over 6 files ({total}) starts',
+        'disk:/Docs/readme.txt deferred to a later pass: the download host 127.0.0.1 returned HTTP 503',
+        'Pass 2 of 7 over 1 file (7 B) starts in 0 s',
+    ]
+    assert 'Disk API throttling: HTTP 429; request interval now 50 ms; Retry-After 0 s' in stderr_lines(result.stderr)

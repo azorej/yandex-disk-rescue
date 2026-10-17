@@ -22,6 +22,7 @@ disconnected disk makes every file unreadable.
 """
 
 import errno
+import logging
 import stat
 import time
 from collections.abc import Iterator
@@ -55,6 +56,7 @@ CURSOR_SECONDS = 5.0
 
 # A read failing with one of these means the device is gone, whatever the destination's path still answers.
 _DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
+_log = logging.getLogger(__name__)
 
 
 class DestinationUnreadableError(RescueError):
@@ -161,9 +163,13 @@ class VerifyRun:
         elif entry.entry_id in self._verified:
             _count_intact(entry, report)
         elif is_held(entry):
-            report.quarantined.append(held_copy(entry, entry.failure))
+            held = held_copy(entry, entry.failure)
+            _log.debug('%s quarantined: kept at %s', display_path(entry.resource.path), held.copy)
+            report.quarantined.append(held)
         else:
-            report.not_downloaded.append(Problem(entry.resource.path, _not_downloaded_reason(entry)))
+            reason = _not_downloaded_reason(entry)
+            _log.debug('%s not downloaded: %s', display_path(entry.resource.path), reason)
+            report.not_downloaded.append(Problem(entry.resource.path, reason))
 
     def _commit_cursor(self) -> None:
         if self._through is not None and self._through != self._committed:
@@ -174,9 +180,11 @@ class VerifyRun:
     def _check(self, entry: MirrorEntry, report: VerifyReport) -> None:
         finding = _finding(entry, self._destination)
         if finding is not None:
+            _log.warning('%s %s: %s', display_path(entry.resource.path), finding.kind, finding.reason)
             self._mirror.record_finding(entry.entry_id, finding)
             report.add(entry, finding)
             return
+        _log.debug('%s intact', display_path(entry.resource.path))
         _count_intact(entry, report)
         if entry.finding is not None:
             self._mirror.clear_finding(entry.entry_id)
