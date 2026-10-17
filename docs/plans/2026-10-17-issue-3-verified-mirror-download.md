@@ -751,7 +751,42 @@ Three cases abort the run (exit 1):
   - **Digest on resume.** The digest of a resumed file covers the bytes in the partial. The prefix
     is re-read from disk on resume; incremental hashing is the implementer's call.
   - **Messages** never contain the href's query string.
+  - **User decisions (2026-10-17), from the real trial.** 11 of 46 files on the real account
+    stalled with 0 bytes on every attempt, consistently per file — Yandex storage trouble, the
+    reason this tool exists. The original Windows tool handles this with a silence timeout,
+    resume-on-progress retries and repeated passes. Therefore:
+    - **`download_timeout` becomes a stall (silence) timeout:** the transfer fails as stalled when
+      no new bytes arrive for N seconds (covering both the wait for the response and the gaps
+      between chunks). Time spent in the queue, the API limiter or local disk writes never
+      counts. **Default 15 s** (range stays 1–600). Message:
+      `the download stalled: no data for 15 s`. Update the Stage 5 registry entry, README and
+      tests accordingly.
+    - **Fast retries need progress:** a `TransientTransferError` is retried immediately within the
+      `download_retries` budget only if the failed attempt received new bytes; an attempt with no
+      new bytes (a stall before the first byte, a connection error) ends the file's turn in this
+      pass without spending more attempts.
+    - **Passes.** New registry option `download_passes` / `--download-passes` /
+      `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES`, **default 7**, valid 0–1000, **0 = keep passing until
+      every file is done or the user interrupts**. After a pass over all pending files, files whose
+      turn ended with a transient failure (stall, timeout, connection error, 408/429/5xx, budget
+      exhausted) are queued for the next pass, resuming from their partial bytes, with a fresh
+      link. Corrupt data (checksum mismatch), refused downloads, changed-in-cloud and local write
+      errors are never re-queued; they fail at once. The run ends when a pass completes no
+      re-queued file or the pass limit is reached; the summary reports the remaining files as
+      failed with their last reason and `(after N passes)` when N > 1, plus a line
+      `Passes: <used> of <limit>`. A short pause between passes (e.g. 5 s, interruptible) avoids
+      hammering a broken host.
 - **Behaviour to lock:** extend `tests/test_download.py`:
+  - **Stall timeout.** A `Delay` before the first byte longer than `download_timeout` fails as
+    stalled; a slow-but-steady body (`chunk_delay` below the timeout, total time well above it)
+    succeeds — the timeout measures silence, not total time.
+  - **Passes.** A file stalled on the first pass and served normally on the second verifies in one
+    run (`Passes: 2 of 7`); a file stalled on every pass with `--download-passes 2` fails with
+    `(after 2 passes)` while the other files succeed; a corrupt file is not retried in a later
+    pass; `--download-passes 0` keeps passing until the file succeeds (served on pass 4);
+    `--download-passes 1001` exits 2.
+  - **No fast retry without progress.** A stall before the first byte consumes one attempt, not
+    `download_retries + 1`, in that pass.
   - **Truncate mid-run.** `inject(Truncate(after_bytes=300_000))` on a 1 MiB file's download: the
     run exits 0, and the second `/download` request carries `range: bytes=300000-<size-1>` (Stage 4 sends closed ranges).
   - **SIGKILL** (issue acceptance). A subprocess `yandex-disk-rescue download` runs with
