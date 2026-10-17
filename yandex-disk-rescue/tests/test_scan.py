@@ -9,9 +9,9 @@ from datetime import UTC
 import pytest
 from fake_disk_server import Delay, FakeResponse
 from typer.testing import CliRunner
+from yandex_disk_rescue import scanning
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.paths import state_dir
 from yandex_disk_rescue.units import format_size
@@ -306,7 +306,7 @@ def _last_listing(fake, params: dict[str, str]):
 def test_a_folder_vanishing_on_a_later_page_discards_the_rows_of_sub_folders_listed_before(
     disk, monkeypatch, stage_batch, first_scan
 ):
-    monkeypatch.setattr(scan_command, '_STAGE_BATCH', stage_batch)
+    monkeypatch.setattr(scanning, '_STAGE_BATCH', stage_batch)
     _add_vanishing_tree(disk)
     if not first_scan:
         assert _scan().exit_code == 0

@@ -91,6 +91,10 @@ class DiskClient:
             timeout=limits.timeout,
         )
 
+    @property
+    def limits(self) -> ApiLimits:
+        return self._limits
+
     async def __aenter__(self) -> Self:
         return self
 

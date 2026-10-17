@@ -56,7 +56,9 @@ yandex-disk-rescue/
 │   │                 #   (config-file values as Click's default_map), the `auth` commands, registration of
 │   │                 #   the commands in `commands/`
 │   ├── commands/
-│   │   └── scan.py   # `scan`: concurrent walk of a remote folder into the manifest, the summary
+│   │   └── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
+│   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
+│   │                 #   scan session (folders that vanish mid-walk), the commit, the summary lines
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories
