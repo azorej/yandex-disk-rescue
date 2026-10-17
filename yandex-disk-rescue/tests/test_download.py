@@ -295,7 +295,7 @@ def _refuse_names(monkeypatch, refused: Callable[[str], bool], code: int = errno
     """Make the folder creation, the no-replace rename and a look-up relative to a folder fail with `code` for every
     name `refused` accepts, as exFAT does for a name holding `?`; return every name they were asked to create."""
     seen: list[str] = []
-    make_dir, rename_noreplace, lstat = localfs.make_dir, localfs.rename_noreplace, os.stat
+    make_dir, rename_noreplace, lstat = localfs.make_dir, localfs.rename_noreplace, localfs.lstat
 
     def refuse(name: str) -> None:
         if refused(name):
@@ -305,10 +305,9 @@ def _refuse_names(monkeypatch, refused: Callable[[str], bool], code: int = errno
         seen.append(name)
         refuse(name)
 
-    def refusing_stat(path, *, dir_fd=None, follow_symlinks=True):
-        if dir_fd is not None:
-            refuse(path)
-        return lstat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
+    def refusing_lstat(name, *, dir_fd):
+        refuse(name)
+        return lstat(name, dir_fd=dir_fd)
 
     def refusing_make_dir(name, *, dir_fd):
         check(name)
@@ -320,7 +319,7 @@ def _refuse_names(monkeypatch, refused: Callable[[str], bool], code: int = errno
 
     monkeypatch.setattr(localfs, 'make_dir', refusing_make_dir)
     monkeypatch.setattr(localfs, 'rename_noreplace', refusing_rename)
-    monkeypatch.setattr(os, 'stat', refusing_stat)
+    monkeypatch.setattr(localfs, 'lstat', refusing_lstat)
     return seen
 
 
@@ -992,23 +991,22 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
     assert f'Mirrored disk:/ to {dest}: 1 downloaded (0 B), 5 skipped, 0 failed\n' in rerun.stdout
 
 
-def _refuse_utime(monkeypatch, code: int, *, partial: bool) -> None:
-    """Make setting the times of an open file fail with `code`: of a partial file, or of every other file."""
-    utime = os.utime
+def _refuse(monkeypatch, call: str, code: int, refused: Callable[[str | int], bool]) -> None:
+    """Make `localfs.<call>` fail with `code` whenever `refused` accepts its first argument, a name or a
+    descriptor."""
+    original = getattr(localfs, call)
 
     def refusing(target, *args, **kwargs):
-        if isinstance(target, int):
-            opened = os.readlink(f'/proc/self/fd/{target}')
-            if ('/.yandex-disk-rescue/partial/' in opened) == partial:
-                raise OSError(code, os.strerror(code))
-        utime(target, *args, **kwargs)
+        if refused(target):
+            raise OSError(code, os.strerror(code))
+        return original(target, *args, **kwargs)
 
-    monkeypatch.setattr(os, 'utime', refusing)
+    monkeypatch.setattr(localfs, call, refusing)
 
 
 @pytest.mark.parametrize('code', [errno.EACCES, errno.EPERM], ids=errno.errorcode.get)
 def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monkeypatch, code):
-    _refuse_utime(monkeypatch, code, partial=True)
+    _refuse(monkeypatch, 'set_times', code, lambda fd: True)
 
     result = _download(str(dest))
 
@@ -1018,19 +1016,12 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
     assert 'Mirrored' not in result.stdout
 
 
-_AS_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not refuse root')
-
-
-@pytest.mark.parametrize(
-    'obstacle',
-    ['mtime-not-permitted', pytest.param('unreadable', marks=_AS_ROOT), pytest.param('untraversable', marks=_AS_ROOT)],
-)
+@pytest.mark.parametrize('obstacle', ['mtime-not-permitted', 'unreadable', 'untraversable'])
 def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, dest, monkeypatch, obstacle):
     readme, local = 'disk:/Docs/readme.txt', dest / 'Docs' / 'readme.txt'
-    blocked = dest / 'Photos' / '2024'
     if obstacle == 'untraversable':
         assert _download(str(dest)).exit_code == 0
-        blocked.chmod(0o600)
+        _refuse(monkeypatch, 'lstat', errno.EACCES, lambda name: name in {'a.jpg', 'b.jpg'})
         denied = os.strerror(errno.EACCES)
         failed = [
             (f'disk:/Photos/2024/{name}', f'could not read Photos/2024/{name}: {denied}') for name in ('a.jpg', 'b.jpg')
@@ -1039,18 +1030,14 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
         local.parent.mkdir(parents=True)
         local.write_bytes(FILES[readme])
         if obstacle == 'unreadable':
-            local.chmod(0)
+            _refuse(monkeypatch, 'open_file', errno.EACCES, lambda name: name == 'readme.txt')
             failed = [(readme, f'could not read Docs/readme.txt: {os.strerror(errno.EACCES)}')]
         else:
-            _refuse_utime(monkeypatch, errno.EPERM, partial=False)
+            inode = local.stat().st_ino
+            _refuse(monkeypatch, 'set_times', errno.EPERM, lambda fd: os.fstat(fd).st_ino == inode)
             failed = [(readme, f'could not set the modification time of Docs/readme.txt: {os.strerror(errno.EPERM)}')]
-    try:
-        result = _download(str(dest))
-    finally:
-        if obstacle == 'untraversable':
-            blocked.chmod(0o755)
-        else:
-            local.chmod(0o644)
+
+    result = _download(str(dest))
 
     assert result.exit_code == 1
     listed = ''.join(f'  {path}: {reason}\n' for path, reason in failed)

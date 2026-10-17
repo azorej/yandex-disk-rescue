@@ -156,7 +156,7 @@ class Destination:
             try:
                 localfs.make_dir(local.name, dir_fd=parent_fd)
             except FileExistsError:
-                existing = os.stat(local.name, dir_fd=parent_fd, follow_symlinks=False)
+                existing = localfs.lstat(local.name, dir_fd=parent_fd)
                 return stat.S_ISDIR(existing.st_mode)
             os.fsync(parent_fd)
         return True
@@ -203,13 +203,13 @@ class Destination:
         with self._folder(local.parent) as parent_fd:
             localfs.rename_noreplace(str(entry_id), local.name, src_dir_fd=self._partial_fd, dst_dir_fd=parent_fd)
             os.fsync(parent_fd)
-            return os.stat(local.name, dir_fd=parent_fd, follow_symlinks=False)
+            return localfs.lstat(local.name, dir_fd=parent_fd)
 
     @contextmanager
     def existing_file(self, local: PurePosixPath) -> Iterator[ExistingFile]:
         """Open the file at `local` for reading without following a link; the caller checks what it opened."""
         with self._folder(local.parent) as parent_fd:
-            fd = os.open(local.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent_fd)
+            fd = localfs.open_file(local.name, dir_fd=parent_fd)
         try:
             yield ExistingFile(fd)
         finally:
@@ -281,7 +281,7 @@ class ExistingFile:
 
     def set_mtime(self, mtime_ns: int) -> None:
         """Set the modification time, keeping the access time, and flush it to the disk."""
-        os.utime(self._fd, ns=(self.stat().st_atime_ns, mtime_ns))
+        localfs.set_times(self._fd, atime_ns=self.stat().st_atime_ns, mtime_ns=mtime_ns)
         os.fsync(self._fd)
 
 
@@ -323,7 +323,7 @@ class PartialFile:
     def finish(self, mtime_ns: int) -> None:
         """Set the modification time and flush the content and metadata to the disk."""
         with _work_errors(self._path):
-            os.utime(self._fd, ns=(mtime_ns, mtime_ns))
+            localfs.set_times(self._fd, atime_ns=mtime_ns, mtime_ns=mtime_ns)
             os.fsync(self._fd)
 
 
@@ -340,7 +340,7 @@ def _work_errors(path: Path) -> Iterator[None]:
 
 def _lstat_name(name: str, dir_fd: int) -> os.stat_result | None:
     try:
-        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        return localfs.lstat(name, dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in NAME_ERRNOS:
             return None

@@ -97,8 +97,9 @@ yandex-disk-rescue/
 │   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
 │   │                 #   aside into the run's `replaced/` folder and placement, never through a link; which
 │   │                 #   errors stop the run
-│   ├── localfs.py    # Name-creating syscalls relative to folder descriptors: open without following links, mkdir,
-│   │                 #   renameat2(RENAME_NOREPLACE) through ctypes
+│   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
+│   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; setting the times of
+│   │                 #   an open file
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest path
