@@ -720,8 +720,48 @@ every file.
 - **stdout** carries the report: the start lines, the scan summary, the
   final summary, then the `Manifest:` and `Log:` lines. Nothing else is ever
   written there, so `> report.txt` keeps exactly the report.
-- **stderr** carries the notices as they happen, then the `Error: …` or
-  `Interrupted; …` line a run ends with.
+- **stderr** carries the status lines and the notices as they happen, then
+  the `Error: …` or `Interrupted; …` line a run ends with.
+
+**Status lines.** Each slow phase writes one status line every
+`progress_interval` seconds (default 60; see
+[Configuration](#configuration)), then a last line when it ends, also when
+the run stops with an error or Ctrl+C. A multi-day run under `nohup` thus
+writes one line a minute:
+
+```
+2026-10-17T09:30:14.002Z Scanning disk:/: 45120 files, 3200 folders (812.3 GiB) listed, 1024 folders to list
+2026-10-17T09:44:05.310Z Scanned disk:/: 133521 files, 9800 folders (2.1 TiB) listed in 14 min 5 s
+2026-10-17T09:45:05.311Z Checking 133521 files already in /mnt/backup: 40210 checked
+2026-10-17T09:50:17.020Z Checked 133521 files already in /mnt/backup in 6 min 12 s
+2026-10-17T10:50:17.021Z Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
+2026-10-23T18:01:40.512Z Downloaded: 133521 of 133521 files, 2.1 TiB in 6 d 9 h, average 4.0 MiB/s; 0 to retry, 3 failed, 0 quarantined; 2 of 7 passes
+2026-10-24T09:00:01.733Z Verifying: 1234 of 98000 files, 120.5 GiB of 2.0 TiB (5.9%), 110.2 MiB/s, ETA 5 h 2 min; 2 problems; reading disk:/big.mkv (1.2 GiB of 4.0 GiB)
+2026-10-24T14:10:03.004Z Verified: 98000 of 98000 files, 2.0 TiB in 5 h 10 min, average 112.4 MiB/s; 2 problems
+```
+
+- The phases are the scan's listing (in `scan`, and in `download` when it
+  scans), `download`'s check of the files already verified in DEST (only
+  when there are any), the passes of `download`, and `verify`.
+- `Downloading` and `Verifying` count the files of the start line
+  (`Downloading N files`, `Verifying N files`, or the files `left` of a
+  continued pass). A file is done once it is downloaded or adopted, failed or
+  quarantined; until then it counts the bytes its partial file holds,
+  resumed bytes included. Failed folders, files held in quarantine and names
+  that are not valid Unicode are in the summary but not in these counts.
+- The speed is the rate over the last minute, and the ETA divides the bytes
+  left by the rate over the last 15 minutes (`ETA unknown` while it is 0).
+  Both count only the bytes this run moved.
+- `N active, M without data`: the files in progress, and those of them that
+  have had a connection but no data for 5 s or more. `to retry` counts the
+  files deferred to a later pass; between passes the line ends with
+  `pass 2 of 7 starts in 4 s`.
+- The last line of a phase gives the time it took and the average speed.
+
+`--no-progress` writes no status lines to stderr; the notices stay. Use it
+under cron, where periodic lines are noise. The status lines never contain
+escape codes or carriage returns, whatever `FORCE_COLOR` or
+`TTY_COMPATIBLE` say.
 
 A notice is one line, `<UTC time> <message>`:
 
@@ -743,7 +783,8 @@ summary lists them.
   scan, and each Disk API throttling response and retry. It also logs DEBUG
   records to the log file.
 - `-q` / `--quiet` leaves only the final `Error: …` or `Interrupted; …` line
-  on stderr (and the log-file warning described below).
+  on stderr (and the log-file warning described below): no status lines and
+  no notices.
 - Neither changes stdout, and giving both is a usage error (exit `2`).
 
 **The log file.** Every run of `scan`, `download` and `verify` appends to
@@ -765,12 +806,13 @@ summary lists them.
   its full summary with every list complete (no `… and N more`), and its
   end: `completed (exit 0)`, `failed (exit N): <error>`,
   `interrupted (exit 130)`, or an unexpected error with its traceback.
-- In between it logs every notice and every `-v` record, whatever the
-  console flags. With `-v` it also logs DEBUG records: each file skipped as
-  verified already or held in quarantine, each file `verify` found intact or
-  listed from the manifest, each transfer attempt and immediate retry, each
-  link refresh, each resumed segment with the bytes kept, the fallback to one
-  stream, each checkpoint, and each folder listed.
+- In between it logs every notice, every `-v` record and every status line,
+  whatever the console flags (`-q` and `--no-progress` included). With `-v`
+  it also logs DEBUG records: each file skipped as verified already or held
+  in quarantine, each file `verify` found intact or listed from the
+  manifest, each transfer attempt and immediate retry, each link refresh,
+  each resumed segment with the bytes kept, the fallback to one stream, each
+  checkpoint, and each folder listed.
 - The file is rotated at 10 MiB, keeping five older files (`.1` is the most
   recent, `.5` the oldest). Every file is mode 0600 in the 0700 state
   directory.
@@ -844,11 +886,13 @@ first one that sets it wins:
 | `download_segment_threshold_mib` | `--download-segment-threshold-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | `256` | 1 to 65536 (MiB); a larger file is downloaded as segments |
 | `partial_dir` | `--partial-dir` (`download`) | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | empty (partial files in DEST) | an absolute path of an existing folder outside DEST, or empty; see [Partial files](#downloading) |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
+| `progress_interval` | `--progress-interval` (`scan`, `download`, `verify`) | `YANDEX_DISK_RESCUE_PROGRESS_INTERVAL` | `60` | 1 to 3600 (s); seconds between two status lines on stderr and in the log file |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
 (`auth login`, `auth status`, `scan`, `download`); the `download_*` options,
-`partial_dir` and `scan_max_age` apply to `download` and `client_id` to `auth login`.
+`partial_dir` and `scan_max_age` apply to `download`, `progress_interval` to
+`scan`, `download` and `verify`, and `client_id` to `auth login`.
 `--partial-dir ''` keeps partial files in DEST whatever the config file says;
 an empty environment variable counts as unset, as for every option.
 

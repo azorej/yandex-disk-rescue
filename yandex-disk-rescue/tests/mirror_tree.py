@@ -92,8 +92,20 @@ def log_messages(path=None) -> list[str]:
 
 
 NOTICE_TIMESTAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ')
+STATUS_LINE = re.compile(
+    NOTICE_TIMESTAMP.pattern
+    + r'(?:(?:Scanning|Scanned) \S.*: \d+ files?, \d+ folders? \(.*\) listed'
+    + r'|(?:Checking|Checked) \d+ files? already in '
+    + r'|(?:Downloading|Downloaded|Verifying|Verified): \d+ of \d+ files?, )'
+)
 
 
 def stderr_lines(stderr: str) -> list[str]:
-    """The lines of a command's stderr, each notice without its timestamp: the notices, then the result line."""
-    return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines()]
+    """The lines of a command's stderr but its status lines, each notice without its timestamp: the notices, then
+    the result line."""
+    return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines() if not STATUS_LINE.match(line)]
+
+
+def status_lines(stderr: str) -> list[str]:
+    """The status lines of a command's stderr, without their timestamps."""
+    return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines() if STATUS_LINE.match(line)]

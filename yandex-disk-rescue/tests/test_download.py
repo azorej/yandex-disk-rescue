@@ -45,6 +45,7 @@ from yandex_disk_rescue.destination import Destination, PartialFile
 from yandex_disk_rescue.manifest import Manifest, Mirror, Segment
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
 from yandex_disk_rescue.paths import log_path, manifest_path
+from yandex_disk_rescue.progress import MirrorProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -323,7 +324,7 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     assert f'Downloading 0 files (0 B) to {dest}\n' in held.stdout
     assert '0 downloaded (0 B), 5 skipped, 1 quarantined, 0 failed\n' in held.stdout
     assert _quarantined(run, path, reason) in held.stdout
-    assert held.stderr == 'Error: 1 quarantined; see the list above.\n'
+    assert stderr_lines(held.stderr) == ['Error: 1 quarantined; see the list above.']
     assert _transfers(disk, earlier) == []
 
     disk.repair(path)
@@ -437,7 +438,7 @@ def test_a_run_killed_between_quarantining_a_copy_and_recording_it_downloads_the
         stopped = run_download('disk:/Docs', str(dest))
 
     assert stopped.exit_code == 130
-    assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stopped.stderr) == ['Interrupted; rerun to continue the download.']
     [run] = quarantine_runs(dest)
     copy = run / 'readme.txt'
     assert copy.read_bytes() == corrupted
@@ -651,7 +652,7 @@ def test_a_run_stopped_once_a_converted_file_is_placed_finds_it_there_on_the_nex
     stopped = run_download('disk:/Odd', str(dest))
 
     assert stopped.exit_code == 1
-    assert stopped.stderr == f'Error: Could not write {dest / converted}: {os.strerror(errno.EIO)}.\n'
+    assert stderr_lines(stopped.stderr) == [f'Error: Could not write {dest / converted}: {os.strerror(errno.EIO)}.']
 
     monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
     earlier = len(disk.requests)
@@ -988,7 +989,8 @@ def test_a_token_rejected_on_a_link_request_stops_the_run(disk, dest):
     result = run_download(str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr.startswith('Error: Yandex rejected the token (invalid, expired or revoked).')
+    [error] = stderr_lines(result.stderr)
+    assert error.startswith('Error: Yandex rejected the token (invalid, expired or revoked).')
     assert 'Mirrored' not in result.stdout
 
 
@@ -1343,7 +1345,7 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(
 
     assert result.exit_code == 1
     [path] = set(refused)
-    assert result.stderr == f'Error: Could not write {path}: {os.strerror(code)}.\n'
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {path}: {os.strerror(code)}.']
     assert 'Mirrored' not in result.stdout
     if partial_root is None:
         assert not (dest / 'top.txt').exists()
@@ -1390,7 +1392,9 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
 
     assert result.exit_code == 1
     partials = _partials(dest)
-    assert result.stderr in {f'Error: Could not write {partial}: {os.strerror(code)}.\n' for partial in partials}
+    assert stderr_lines(result.stderr) in [
+        [f'Error: Could not write {partial}: {os.strerror(code)}.'] for partial in partials
+    ]
     assert 'Mirrored' not in result.stdout
 
 
@@ -1855,7 +1859,7 @@ def test_with_a_partial_folder_a_run_stopped_on_the_way_to_dest_finishes_on_the_
         stopped = run_download('--partial-dir', str(partial_root), 'disk:/Seg', str(dest))
 
     assert stopped.exit_code == 130
-    assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stopped.stderr) == ['Interrupted; rerun to continue the download.']
     local = dest / 'large.bin'
     placed = point in ('placed', 'recorded')
     assert local.read_bytes() == SEGMENTED if placed else not local.exists()
@@ -2130,7 +2134,7 @@ def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_f
     result = run_download(*_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.\n'
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.']
     assert big.read_bytes()[:300_000] == BIG[:300_000]
     assert segmented.exists()
 
@@ -2422,7 +2426,9 @@ def test_a_run_stopped_while_a_file_waits_for_room_ends_at_once_and_the_rerun_go
         result = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {folder / str(_entry_id(BIG_PATH))}: No space left on device.\n'
+    assert stderr_lines(result.stderr) == [
+        f'Error: Could not write {folder / str(_entry_id(BIG_PATH))}: No space left on device.'
+    ]
     assert _content_started(big, BIG2_PATH) == []
 
     rerun = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
@@ -2620,7 +2626,7 @@ def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_
     result = run_download('disk:/Stop', str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.\n'
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.']
     assert 'Mirrored' not in result.stdout
     assert len(failed) == len(slow)
     assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, 1024 * 1024, 0, None)] * len(slow)
@@ -2639,7 +2645,7 @@ def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_th
         child.communicate()
 
     assert child.returncode == 130, stderr
-    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert log_messages()[-1] == 'download interrupted (exit 130)'
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
@@ -2707,7 +2713,7 @@ def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_
         child.communicate()
 
     assert child.returncode == 130, stderr
-    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert len(_fetches(big, BIG_PATH)) == 2
     assert _partial_size(dest) == 300_000
 
@@ -2769,7 +2775,7 @@ def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error
         child.communicate()
 
     assert child.returncode == 130, stderr
-    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, MiB, 0, None)] * len(slow)
 
 
@@ -3038,9 +3044,12 @@ async def _mirror_run(
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
         with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=None) as destination:
-            await scan_tree(client, manifest, account, scan_root)
+            await scan_tree(client, manifest, account, scan_root, ScanProgress())
             run = MirrorRun(
-                manifest.mirror(account.uid, scan_root.path, destination.path), destination, retry_failed=False
+                manifest.mirror(account.uid, scan_root.path, destination.path),
+                destination,
+                retry_failed=False,
+                progress=MirrorProgress(),
             )
             yield lambda: run.run(client, content, policy, passes=1, room_measured=lambda _: None)
 

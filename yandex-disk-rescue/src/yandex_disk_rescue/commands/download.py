@@ -16,6 +16,7 @@ from yandex_disk_rescue.destination import Destination, check_destination, check
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ScanTime
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, PartialRoom, TransferPolicy, mirror_summary
+from yandex_disk_rescue.progress import MirrorProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -80,12 +81,16 @@ def download(
     api_timeout: settings.ApiTimeout = settings.API_TIMEOUT.default,
     api_retries: settings.ApiRetries = settings.API_RETRIES.default,
     api_url: settings.ApiUrl = settings.API_URL.default,
+    progress_interval: settings.ProgressInterval = settings.PROGRESS_INTERVAL.default,
+    no_progress: console.NoProgress = False,
     verbose: console.Verbose = False,
     quiet: console.Quiet = False,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
     skipped on a rerun, or with --retry-failed only the failed, quarantined, unfinished and broken ones."""
-    options = console.output_options(verbose=verbose, quiet=quiet)
+    options = console.output_options(
+        verbose=verbose, quiet=quiet, no_progress=no_progress, progress_interval=progress_interval
+    )
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
@@ -230,11 +235,16 @@ async def _run(
             with Destination.open(destination_path, partial_dir=partial_dir) as destination:
                 mirror = manifest.mirror(account.uid, scan_root.path, destination.path)
                 if reused is None:
-                    output.summary(partial(scan_summary, await scan_tree(client, manifest, account, scan_root)))
+                    scan_progress = ScanProgress()
+                    with output.progress(scan_progress):
+                        scanned = await scan_tree(client, manifest, account, scan_root, scan_progress)
+                    output.summary(partial(scan_summary, scanned))
                 else:
                     output.headline(reused)
-                run = MirrorRun(mirror, destination, retry_failed=retry_failed)
-                return await _mirror(client, run, destination, output, transfers, retry_failed=retry_failed)
+                progress = MirrorProgress()
+                with output.progress(progress):
+                    run = MirrorRun(mirror, destination, retry_failed=retry_failed, progress=progress)
+                return await _mirror(client, run, destination, output, progress, transfers, retry_failed=retry_failed)
 
 
 async def _mirror(
@@ -242,6 +252,7 @@ async def _mirror(
     run: MirrorRun,
     destination: Destination,
     output: console.Output,
+    progress: MirrorProgress,
     transfers: _Transfers,
     *,
     retry_failed: bool,
@@ -274,7 +285,8 @@ async def _mirror(
             segments=transfers.segments,
             segment_threshold=transfers.segment_threshold_mib * 2**20,
         )
-        return await run.run(client, content, policy, passes=transfers.passes, room_measured=_show_room)
+        with output.progress(progress):
+            return await run.run(client, content, policy, passes=transfers.passes, room_measured=_show_room)
 
 
 def _show_room(room: PartialRoom) -> None:

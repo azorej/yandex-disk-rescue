@@ -1,0 +1,464 @@
+"""The progress of a run's slow phases: thread-safe states the engines update as they work, and the status lines of
+their snapshots, which a renderer in another thread samples.
+
+A state is updated from the thread doing the work and read from any thread; each update and each `snapshot()` holds
+the state's lock for a few attribute changes only. Speeds are measured over the bytes the phase itself moved (never
+the bytes a resumed file already held): the current speed over the last `SPEED_SECONDS`, and the ETA from the speed
+over the last `ETA_SECONDS`, so one stall does not swing it.
+"""
+
+import threading
+import time
+from collections import deque
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+from yandex_disk_rescue.units import format_duration, format_size
+
+# A transfer that has received nothing for this long since it got its connection, or since its last bytes, is shown
+# as without data.
+STALL_SECONDS = 5.0
+SPEED_SECONDS = 60.0
+ETA_SECONDS = 15 * 60.0
+_SAMPLE_SECONDS = 1.0
+
+type TransferState = Literal['waiting for a connection', 'downloading', 'preallocating', 'hashing', 'reading back']
+type Outcome = Literal['downloaded', 'failed', 'quarantined']
+type MirrorPhase = Literal['idle', 'checking', 'transferring', 'pausing']
+
+
+class Snapshot(Protocol):
+    def status_line(self, *, final: bool) -> str | None:
+        """The status line of the phase (the last one of it when `final`), or `None` before the phase has started."""
+        ...
+
+
+class ProgressState(Protocol):
+    def snapshot(self) -> Snapshot: ...
+
+
+class _Rate:
+    """The history of a growing byte count, one sample a second at most, kept for the last `ETA_SECONDS`; not
+    thread-safe."""
+
+    def __init__(self, now: float) -> None:
+        self._samples: deque[tuple[float, int]] = deque([(now, 0)])
+
+    def note(self, now: float, total: int) -> None:
+        if now - self._samples[-1][0] >= _SAMPLE_SECONDS:
+            self._samples.append((now, total))
+        while len(self._samples) > 1 and self._samples[1][0] <= now - ETA_SECONDS:
+            self._samples.popleft()
+
+    def per_second(self, now: float, total: int, window: float) -> float:
+        """The bytes a second from the newest sample at least `window` seconds old (the oldest one kept while none
+        is) to `total` now."""
+        since, base = self._samples[0]
+        for moment, value in self._samples:
+            if moment > now - window:
+                break
+            since, base = moment, value
+        return (total - base) / (now - since) if now > since else 0.0
+
+
+@dataclass(frozen=True)
+class Speeds:
+    current: float
+    for_eta: float
+    average: float
+
+    @classmethod
+    def of(cls, rate: _Rate, now: float, started: float, moved: int) -> Speeds:
+        elapsed = now - started
+        return cls(
+            current=rate.per_second(now, moved, SPEED_SECONDS),
+            for_eta=rate.per_second(now, moved, ETA_SECONDS),
+            average=moved / elapsed if elapsed > 0 else 0.0,
+        )
+
+
+def _speed(per_second: float) -> str:
+    return f'{format_size(round(per_second))}/s'
+
+
+def _eta(remaining: int, per_second: float) -> str:
+    return f'ETA {format_duration(remaining / per_second)}' if per_second > 0 else 'ETA unknown'
+
+
+def _share(done: int, total: int) -> str:
+    """`done of total` bytes, with the percentage when there is anything to count."""
+    share = f'{format_size(done)} of {format_size(total)}'
+    return f'{share} ({done / total:.1%})' if total else share
+
+
+def _count(count: int, noun: str) -> str:
+    return f'{count} {noun}' if count == 1 else f'{count} {noun}s'
+
+
+def _of(done: int, total: int, noun: str) -> str:
+    return f'{done} of {_count(total, noun)}'
+
+
+@dataclass(frozen=True)
+class ScanSnapshot:
+    root: str | None
+    files: int
+    folders: int
+    size: int
+    to_list: int
+    elapsed: float
+
+    def status_line(self, *, final: bool) -> str | None:
+        if self.root is None:
+            return None
+        listed = f'{_count(self.files, "file")}, {_count(self.folders, "folder")} ({format_size(self.size)}) listed'
+        if final:
+            return f'Scanned {self.root}: {listed} in {format_duration(self.elapsed)}'
+        return f'Scanning {self.root}: {listed}, {_count(self.to_list, "folder")} to list'
+
+
+class ScanProgress:
+    """A scan's walk: the files, folders and bytes listed so far, and the folders still to list."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._root: str | None = None
+        self._started = time.monotonic()
+        self._files = self._folders = self._size = self._to_list = 0
+
+    def start(self, root: str) -> None:
+        """The walk of `root` starts, with the root itself to list."""
+        with self._lock:
+            self._root, self._started, self._to_list = root, time.monotonic(), 1
+
+    def listed_file(self, size: int) -> None:
+        with self._lock:
+            self._files += 1
+            self._size += size
+
+    def listed_folder(self) -> None:
+        """A folder was listed in its parent; it is to list itself."""
+        with self._lock:
+            self._folders += 1
+            self._to_list += 1
+
+    def folder_done(self) -> None:
+        """A folder to list was listed, or left out."""
+        with self._lock:
+            self._to_list -= 1
+
+    def snapshot(self) -> ScanSnapshot:
+        with self._lock:
+            elapsed = time.monotonic() - self._started
+            return ScanSnapshot(self._root, self._files, self._folders, self._size, self._to_list, elapsed)
+
+
+@dataclass(frozen=True)
+class ActiveTransfer:
+    """A file in progress: its `held` bytes of `size`, its state, and `idle`, the seconds since it last received
+    bytes or got its connection (`None` while it has no connection)."""
+
+    path: str
+    size: int
+    held: int
+    state: TransferState
+    idle: float | None
+
+    @property
+    def without_data(self) -> bool:
+        return self.state == 'downloading' and self.idle is not None and self.idle >= STALL_SECONDS
+
+
+@dataclass(frozen=True)
+class MirrorSnapshot:
+    phase: MirrorPhase
+    destination: str
+    to_check: int
+    checked: int
+    elapsed: float
+    files: int
+    size: int
+    settled: dict[Outcome, int]
+    done_size: int
+    to_retry: int
+    active: tuple[ActiveTransfer, ...]
+    pass_number: int
+    passes: int
+    starts_in: float | None
+    speeds: Speeds
+
+    def status_line(self, *, final: bool) -> str | None:
+        match self.phase:
+            case 'idle':
+                return None
+            case 'checking':
+                checking = f'{_count(self.to_check, "file")} already in {self.destination}'
+                if final:
+                    return f'Checked {checking} in {format_duration(self.elapsed)}'
+                return f'Checking {checking}: {self.checked} checked'
+        settled = sum(self.settled.values())
+        outcomes = (
+            f'{self.to_retry} to retry, {self.settled["failed"]} failed, {self.settled["quarantined"]} quarantined'
+        )
+        limit = f' of {self.passes}' if self.passes else ''
+        if final:
+            passes = f'{self.pass_number}{limit} passes' if limit or self.pass_number > 1 else '1 pass'
+            return (
+                f'Downloaded: {_of(settled, self.files, "file")}, {format_size(self.done_size)} in '
+                f'{format_duration(self.elapsed)}, average {_speed(self.speeds.average)}; {outcomes}; {passes}'
+            )
+        without_data = sum(1 for transfer in self.active if transfer.without_data)
+        starts = '' if self.starts_in is None else f' starts in {format_duration(self.starts_in)}'
+        return (
+            f'Downloading: {_of(settled, self.files, "file")}, {_share(self.done_size, self.size)}, '
+            f'{_speed(self.speeds.current)}, {_eta(self.size - self.done_size, self.speeds.for_eta)}; '
+            f'{len(self.active)} active, {without_data} without data; {outcomes}; '
+            f'pass {self.pass_number}{limit}{starts}'
+        )
+
+
+@dataclass
+class _Active:
+    path: str
+    size: int
+    held: int
+    state: TransferState
+    connected: float | None
+
+
+class MirrorProgress:
+    """A mirror run: first the check of the files already in the destination, then the passes over the files to
+    download.
+
+    The transfer counts cover the files the run attempts. Each one settles once (downloaded or adopted, failed or
+    quarantined); one deferred to a later pass waits as to retry, its partial file's bytes still counted, until it
+    starts again or settles. A file in progress counts the bytes its partial file holds.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        now = time.monotonic()
+        self._phase: MirrorPhase = 'idle'
+        self._started = now
+        self._destination = ''
+        self._to_check = self._checked = 0
+        self._files = self._size = 0
+        self._settled: dict[Outcome, int] = {'downloaded': 0, 'failed': 0, 'quarantined': 0}
+        self._settled_size = 0
+        self._active: dict[int, _Active] = {}
+        self._retry: dict[int, int] = {}
+        self._received = 0
+        self._rate = _Rate(now)
+        self._pass_number, self._passes = 1, 0
+        self._starts_at: float | None = None
+
+    def start_checking(self, files: int, destination: str) -> None:
+        """The check of `files` files already in `destination` starts."""
+        with self._lock:
+            self._phase, self._started = 'checking', time.monotonic()
+            self._to_check, self._destination = files, destination
+
+    def checked(self) -> None:
+        with self._lock:
+            self._checked += 1
+
+    def start_transferring(self, files: int, size: int, *, passes: int) -> None:
+        """The first of at most `passes` passes (0: no limit) over `files` files of `size` bytes starts."""
+        with self._lock:
+            now = time.monotonic()
+            self._phase, self._started, self._rate = 'transferring', now, _Rate(now)
+            self._files, self._size, self._passes = files, size, passes
+
+    def pausing(self, number: int, seconds: float) -> None:
+        """Pass `number` starts in `seconds`."""
+        with self._lock:
+            self._phase, self._pass_number = 'pausing', number
+            self._starts_at = time.monotonic() + seconds
+
+    def resumed(self) -> None:
+        """The pass the run paused for starts."""
+        with self._lock:
+            self._phase, self._starts_at = 'transferring', None
+
+    def begin(self, key: int, path: str, size: int) -> ActiveFile:
+        """File `key` (`path`, `size` bytes) starts its turn; the bytes it held as to retry are left to the turn to
+        count again."""
+        with self._lock:
+            self._retry.pop(key, None)
+            self._active[key] = _Active(path, size, 0, 'waiting for a connection', None)
+        return ActiveFile(self, key)
+
+    def defer(self, key: int) -> None:
+        """File `key`'s turn ended with the file deferred to a later pass; its bytes stay counted."""
+        with self._lock:
+            active = self._active.pop(key)
+            self._retry[key] = active.held
+
+    def settle(self, key: int, size: int, outcome: Outcome) -> None:
+        """File `key` of `size` bytes is done for this run, in its turn, after it was deferred, or without a turn."""
+        with self._lock:
+            self._active.pop(key, None)
+            self._retry.pop(key, None)
+            self._settled[outcome] += 1
+            self._settled_size += size
+
+    def snapshot(self) -> MirrorSnapshot:
+        with self._lock:
+            now = time.monotonic()
+            active = tuple(
+                ActiveTransfer(
+                    a.path, a.size, a.held, a.state, None if a.connected is None else max(now - a.connected, 0.0)
+                )
+                for a in self._active.values()
+            )
+            held = sum(a.held for a in self._active.values()) + sum(self._retry.values())
+            return MirrorSnapshot(
+                phase=self._phase,
+                destination=self._destination,
+                to_check=self._to_check,
+                checked=self._checked,
+                elapsed=now - self._started,
+                files=self._files,
+                size=self._size,
+                settled=dict(self._settled),
+                done_size=self._settled_size + held,
+                to_retry=len(self._retry),
+                active=active,
+                pass_number=self._pass_number,
+                passes=self._passes,
+                starts_in=None if self._starts_at is None else max(self._starts_at - now, 0.0),
+                speeds=Speeds.of(self._rate, now, self._started, self._received),
+            )
+
+    def _update(self, key: int, *, state: TransferState | None = None, held: int = 0, received: int = 0) -> None:
+        with self._lock:
+            active = self._active[key]
+            now = time.monotonic()
+            if state is not None and state != active.state:
+                active.state = state
+                active.connected = now if state == 'downloading' else None
+            active.held += held
+            if received:
+                active.connected = now
+                self._received += received
+                self._rate.note(now, self._received)
+
+    def _cut(self, key: int) -> None:
+        with self._lock:
+            self._active[key].held = 0
+
+
+class ActiveFile:
+    """The progress of one file's turn in a `MirrorProgress`."""
+
+    def __init__(self, progress: MirrorProgress, key: int) -> None:
+        self._progress = progress
+        self._key = key
+
+    def state(self, state: TransferState) -> None:
+        self._progress._update(self._key, state=state)
+
+    def kept(self, size: int) -> None:
+        """The partial file holds `size` more bytes kept from an earlier turn."""
+        self._progress._update(self._key, held=size)
+
+    def wrote(self, size: int) -> None:
+        """`size` bytes arrived and were written to the partial file."""
+        self._progress._update(self._key, state='downloading', held=size, received=size)
+
+    def cut(self) -> None:
+        """The partial file was cut back to byte 0."""
+        self._progress._cut(self._key)
+
+
+@dataclass(frozen=True)
+class VerifySnapshot:
+    started: bool
+    files: int
+    size: int
+    checked: int
+    done_size: int
+    problems: int
+    reading: tuple[str, int, int] | None
+    elapsed: float
+    speeds: Speeds
+
+    def status_line(self, *, final: bool) -> str | None:
+        if not self.started:
+            return None
+        problems = _count(self.problems, 'problem')
+        if final:
+            return (
+                f'Verified: {_of(self.checked, self.files, "file")}, {format_size(self.done_size)} in '
+                f'{format_duration(self.elapsed)}, average {_speed(self.speeds.average)}; {problems}'
+            )
+        line = (
+            f'Verifying: {_of(self.checked, self.files, "file")}, {_share(self.done_size, self.size)}, '
+            f'{_speed(self.speeds.current)}, {_eta(self.size - self.done_size, self.speeds.for_eta)}; {problems}'
+        )
+        if self.reading is not None:
+            path, read, size = self.reading
+            line += f'; reading {path} ({format_size(read)} of {format_size(size)})'
+        return line
+
+
+class VerifyProgress:
+    """A part of a `verify` pass: the files and bytes of this part checked so far, the file being read, and the
+    problems the report holds so far."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        now = time.monotonic()
+        self._started_at = now
+        self._started = False
+        self._files = self._size = self._checked = self._done_size = self._problems = self._read = self._current = 0
+        self._reading: tuple[str, int] | None = None
+        self._rate = _Rate(now)
+
+    def start(self, files: int, size: int) -> None:
+        """The part over `files` files of `size` bytes starts."""
+        with self._lock:
+            now = time.monotonic()
+            self._started, self._started_at, self._rate = True, now, _Rate(now)
+            self._files, self._size = files, size
+
+    def reading(self, path: str, size: int) -> None:
+        """The check of the file `path` of `size` bytes starts."""
+        with self._lock:
+            self._reading, self._current = (path, size), 0
+
+    def read(self, size: int) -> None:
+        """`size` more bytes of the file being checked were hashed."""
+        with self._lock:
+            self._current += size
+            self._read += size
+            self._rate.note(time.monotonic(), self._read)
+
+    def checked(self) -> None:
+        """The check of the file being read ended."""
+        with self._lock:
+            if self._reading is None:
+                raise RuntimeError('no file is being checked')
+            self._checked += 1
+            self._done_size += self._reading[1]
+            self._reading, self._current = None, 0
+
+    def problems(self, count: int) -> None:
+        with self._lock:
+            self._problems = count
+
+    def snapshot(self) -> VerifySnapshot:
+        with self._lock:
+            now = time.monotonic()
+            reading = None if self._reading is None else (self._reading[0], self._current, self._reading[1])
+            return VerifySnapshot(
+                started=self._started,
+                files=self._files,
+                size=self._size,
+                checked=self._checked,
+                done_size=self._done_size + (0 if reading is None else reading[1]),
+                problems=self._problems,
+                reading=reading,
+                elapsed=now - self._started_at,
+                speeds=Speeds.of(self._rate, now, self._started_at, self._read),
+            )

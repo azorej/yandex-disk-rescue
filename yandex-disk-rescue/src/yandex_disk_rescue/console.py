@@ -1,13 +1,16 @@
-"""The output of the `scan`, `download` and `verify` commands: the report on stdout, the notices on stderr, and the
-log file every run writes.
+"""The output of the `scan`, `download` and `verify` commands: the report on stdout, the notices and status lines on
+stderr, and the log file every run writes.
 
-stdout carries the report only, whatever the verbosity. stderr carries the notices (WARNING records; INFO too with
-`--verbose`; none with `--quiet`) and the final `Error: …` or `Interrupted; …` line. The log file gets every INFO
-record (DEBUG too with `--verbose`) whatever the console flags, and a start and an end record per run.
+stdout carries the report only, whatever the verbosity. stderr carries the status lines of each slow phase (none with
+`--no-progress` or `--quiet`), the notices (WARNING records; INFO too with `--verbose`; none with `--quiet`) and the
+final `Error: …` or `Interrupted; …` line. The log file gets every INFO record (DEBUG too with `--verbose`) and every
+status line whatever the console flags, and a start and an end record per run.
 """
 
+import dataclasses
 import logging
 import os
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,6 +22,7 @@ import typer
 from yandex_disk_rescue import __version__, paths
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.logs import CONSOLE, LOGGER_NAME, LogFile, Notices, notice
+from yandex_disk_rescue.progress import ProgressState
 
 type Verbosity = Literal['quiet', 'normal', 'verbose']
 
@@ -35,6 +39,12 @@ Quiet = Annotated[
     bool,
     typer.Option('-q', '--quiet', help='Show nothing on stderr but the final error line; stdout is unchanged.'),
 ]
+NoProgress = Annotated[
+    bool,
+    typer.Option(
+        '--no-progress', help='Write no status lines to stderr; the log file still gets them, and notices still show.'
+    ),
+]
 
 FILE_ONLY = {CONSOLE: False}
 _log = logging.getLogger(LOGGER_NAME)
@@ -47,21 +57,28 @@ class LogFileError(RescueError):
 
 @dataclass(frozen=True)
 class OutputOptions:
+    """The verbosity; `progress`, whether stderr gets status lines; and the seconds between two status lines."""
+
     verbosity: Verbosity
+    progress: bool
+    progress_interval: int
 
 
-def output_options(*, verbose: bool, quiet: bool) -> OutputOptions:
-    """The options of `--verbose` and `--quiet`; raises `typer.BadParameter` when both are given."""
+def output_options(*, verbose: bool, quiet: bool, no_progress: bool, progress_interval: int) -> OutputOptions:
+    """The options of `--verbose`, `--quiet`, `--no-progress` and `--progress-interval`; raises `typer.BadParameter`
+    when both `--verbose` and `--quiet` are given."""
     if verbose and quiet:
         raise typer.BadParameter('--verbose and --quiet cannot be used together.', param_hint="'-v' / '-q'")
-    return OutputOptions(verbosity='verbose' if verbose else 'quiet' if quiet else 'normal')
+    verbosity: Verbosity = 'verbose' if verbose else 'quiet' if quiet else 'normal'
+    return OutputOptions(verbosity=verbosity, progress=not no_progress, progress_interval=progress_interval)
 
 
 class Output:
-    """The running command's output: `line` writes one report line to stdout."""
+    """The running command's output: `line` writes one report line to stdout, and `progress` reports a slow phase."""
 
-    def __init__(self, log_file: LogFile) -> None:
+    def __init__(self, log_file: LogFile, options: OutputOptions) -> None:
         self._log_file = log_file
+        self._options = options
 
     @property
     def log_path(self) -> Path:
@@ -81,6 +98,37 @@ class Output:
         _log.info('Summary:\n%s', '\n'.join(lines(limit=None)), extra=FILE_ONLY)
         for line in lines():
             self.line(line)
+
+    @contextmanager
+    def progress(self, state: ProgressState) -> Iterator[None]:
+        """Report the phase `state` follows while the context runs: every `progress_interval` seconds its status line
+        goes to the log file and, unless `--no-progress` or `--quiet` was given, to stderr as a notice; when the
+        context exits, on every path, the phase's last line goes out the same way. Nothing is written for a phase that
+        has not started. No line is written once the context has exited."""
+        to_stderr = self._options.progress and self._options.verbosity != 'quiet'
+
+        def emit(*, final: bool) -> None:
+            line = state.snapshot().status_line(final=final)
+            if line is None:
+                return
+            _log.info('%s', line, extra=FILE_ONLY)
+            if to_stderr:
+                notice(line)
+
+        stop = threading.Event()
+
+        def tick() -> None:
+            while not stop.wait(self._options.progress_interval):
+                emit(final=False)
+
+        ticker = threading.Thread(target=tick, name='progress', daemon=True)
+        ticker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            ticker.join()
+            emit(final=True)
 
     def footer(self, manifest: Path) -> None:
         """The last lines of the report: the manifest's path, then the log's (with why it is incomplete, if it is)."""
@@ -115,10 +163,10 @@ def command_output(command: str, options: OutputOptions, *, details: Mapping[str
     for handler in handlers:
         _log.addHandler(handler)
     try:
-        arguments = ', '.join(f'{name}={value}' for name, value in {**details, 'verbosity': options.verbosity}.items())
+        arguments = ', '.join(f'{name}={value}' for name, value in {**details, **dataclasses.asdict(options)}.items())
         _log.info('%s started: version %s, pid %d; %s', command, __version__, os.getpid(), arguments, extra=FILE_ONLY)
         try:
-            yield Output(log_file)
+            yield Output(log_file, options)
         except BaseException as exc:
             _log_end(command, exc)
             raise

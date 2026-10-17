@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import os
 import random
+import re
 import signal
 import sqlite3
 import stat
@@ -26,6 +27,7 @@ from mirror_tree import (
     run_download,
     runner,
     start_command,
+    status_lines,
     stderr_lines,
     wait_until,
 )
@@ -172,7 +174,7 @@ def test_a_complete_mirror_is_intact_with_no_token_and_no_network(
         + f'Manifest: {manifest_path()}\n'
         + f'Log: {log_path()}\n'
     )
-    assert result.stderr == ''
+    assert stderr_lines(result.stderr) == []
     assert len(disk.requests) == earlier
     assert _findings() == []
     assert [folder.stat().st_mtime_ns for folder in separate] == mtimes
@@ -266,9 +268,9 @@ def test_a_destination_gone_mid_check_stops_it_with_nothing_recorded(disk, dest,
 
     assert stopped.exit_code == 1
     assert stopped.stdout == f'Verifying 6 files ({TOTAL}) in {dest}\n'
-    assert stopped.stderr == (
-        f'Error: Could not read {dest}: {os.strerror(code)}; verify stopped. Rerun it once the disk is back.\n'
-    )
+    assert stderr_lines(stopped.stderr) == [
+        f'Error: Could not read {dest}: {os.strerror(code)}; verify stopped. Rerun it once the disk is back.'
+    ]
     assert _findings() == []
     started, through = _verify_pass()
     assert through == CYRILLIC
@@ -306,7 +308,7 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
         '  disk:/New/n.txt: not downloaded yet\n'
         f'  {EDITED}: changed on the Disk since it was downloaded\n'
     ) in result.stdout
-    assert result.stderr == 'Error: 4 problems found; see the lists above.\n'
+    assert stderr_lines(result.stderr) == ['Error: 4 problems found; see the lists above.']
     assert local_file(dest, EDITED).stat().st_ino not in reads
     assert (run / 'Photos' / '2024' / 'a.jpg').stat().st_ino not in reads
     assert _findings() == []
@@ -341,7 +343,7 @@ def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_
         + f'Log: {log_path()}\n'
     ) in again.stdout
     assert 'Quarantined:' not in again.stdout
-    assert again.stderr == 'Error: 1 problem found; see the list above.\n'
+    assert stderr_lines(again.stderr) == ['Error: 1 problem found; see the list above.']
 
 
 def _md5_mismatch(expected: bytes, got: bytes) -> str:
@@ -591,9 +593,10 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
     (site / 'sitecustomize.py').write_text(_SLOW_READS)
     monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
     monkeypatch.setenv('READ_GATE', str(gate))
-    child = start_command('verify', str(dest))
+    child = start_command('verify', '--progress-interval', '1', str(dest))
     try:
-        wait_until(lambda: len(list(gate.iterdir())) >= 10, child, 'read 10 files')
+        # Each file takes two reads, so 20 files take 2 s at least, the time of one status line and more.
+        wait_until(lambda: len(list(gate.iterdir())) >= 20, child, 'read 20 files')
         child.send_signal(signal.SIGINT)
         stdout, stderr = child.communicate(timeout=60)
     finally:
@@ -606,6 +609,13 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
     *notices, result_line = stderr_lines(stderr)
     assert [notice.partition(' ')[0] for notice in notices] == [EARLY]
     assert result_line == 'Interrupted; rerun verify to continue where it stopped.'
+    *verifying, stopped_line = status_lines(stderr)
+    assert verifying
+    checked = [
+        int(re.match(r'Verifying: (\d+) of 40 files, .*; 1 problem(?:$|; reading )', line)[1]) for line in verifying
+    ]
+    assert checked == sorted(checked)
+    assert stopped_line.startswith('Verified: ')
     started, through = _verify_pass()
     assert EARLY <= through < LATE
     assert [path for path, *_ in _findings()] == [EARLY]
@@ -614,6 +624,9 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
 
     left = _after(through)
     assert resumed.stdout.startswith(f'{_started(started)} {len(left)} files ({format_size(1024 * len(left))}) left\n')
+    [resumed_line] = status_lines(resumed.stderr)
+    assert resumed_line.startswith(f'Verified: {len(left)} of {len(left)} files, {format_size(1024 * len(left))} in ')
+    assert resumed_line.endswith('; 2 problems')
     assert _verify_pass() is None
 
     uninterrupted = _verify(str(dest))

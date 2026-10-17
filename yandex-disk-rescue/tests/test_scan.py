@@ -228,10 +228,10 @@ def test_a_folder_failing_past_the_retries_names_it_and_keeps_the_previous_scan(
     result = _scan('--api-retries', '1')
 
     assert result.exit_code == 1
-    assert result.stderr == (
+    assert stderr_lines(result.stderr) == [
         'Error: Could not list disk:/Photos/2024: Yandex Disk API returned HTTP 503: Injected HTTP 503 '
-        '(after 2 attempts)\n'
-    )
+        '(after 2 attempts)'
+    ]
     assert 'Traceback' not in result.output
     assert _rows() == previous
 
@@ -268,7 +268,7 @@ def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
 
     if stop == signal.SIGINT:
         assert child.returncode == 130, stderr
-        assert stderr == 'Interrupted; the manifest holds the last completed scan.\n'
+        assert stderr_lines(stderr) == ['Interrupted; the manifest holds the last completed scan.']
         assert stdout == ''
     else:
         assert child.returncode == -signal.SIGKILL
@@ -406,8 +406,8 @@ def test_a_vanished_sub_folder_is_reported_once_under_its_vanished_parent(disk, 
 @pytest.mark.parametrize(
     ('answer', 'message'),
     [
-        (404, "Error: Remote path 'disk:/Photos' does not exist.\n"),
-        (_now_a_file('disk:/Photos'), "Error: Remote path 'disk:/Photos' is a file, not a folder.\n"),
+        (404, "Error: Remote path 'disk:/Photos' does not exist."),
+        (_now_a_file('disk:/Photos'), "Error: Remote path 'disk:/Photos' is a file, not a folder."),
     ],
     ids=['deleted', 'replaced-by-a-file'],
 )
@@ -418,5 +418,5 @@ def test_the_scanned_folder_itself_vanishing_fails_the_scan(disk, answer, messag
 
     result = _scan('disk:/Photos')
 
-    assert (result.exit_code, result.stderr) == (1, message)
+    assert (result.exit_code, stderr_lines(result.stderr)) == (1, [message])
     assert _rows() == previous

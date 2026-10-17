@@ -37,6 +37,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | Size above which a file is downloaded as segments, 1 to 65536 MiB (default 256). Same as `--download-segment-threshold-mib`. |
 | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | Existing folder, an absolute path outside DEST, below which `download` keeps DEST's partial files (in `<folder>/<key>/`) and copies each finished one to DEST; empty counts as unset (default: partial files in DEST). Same as `--partial-dir`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
+| `YANDEX_DISK_RESCUE_PROGRESS_INTERVAL` | Seconds between two status lines of `scan`, `download` and `verify`, on stderr and in the log file, 1 to 3600 (default 60). Same as `--progress-interval`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest and the log file (default `~/.local/state`). |
 
@@ -185,14 +186,19 @@ yandex-disk-rescue/
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
 │   │                 #   an open file and setting its times; the free space of a folder's filesystem
-│   ├── console.py    # The output of scan, download and verify: `-v`/`-q`, the report lines on stdout, the run
-│   │                 #   wrapped in `command_output` (log file and notice handlers attached for the run, its start
-│   │                 #   and end records, `LogFileError`), the start lines and the full summary logged, the
-│   │                 #   `Manifest:` and `Log:` lines; the engines and the API client log their own records
-│   │                 #   (failures, findings, per-file outcomes, passes, throttling) through `logging.getLogger`
+│   ├── console.py    # The output of scan, download and verify: `-v`/`-q`/`--no-progress`, the report lines on
+│   │                 #   stdout, the run wrapped in `command_output` (log file and notice handlers attached for the
+│   │                 #   run, its start and end records, `LogFileError`), the start lines and the full summary
+│   │                 #   logged, the `Manifest:` and `Log:` lines, and `Output.progress`, the status-line thread of
+│   │                 #   one phase (to the log file always, to stderr unless `--no-progress` or `-q`); the engines
+│   │                 #   and the API client log their own records (failures, findings, per-file outcomes, passes,
+│   │                 #   throttling) through `logging.getLogger`
+│   ├── progress.py   # Thread-safe progress states the engines update (ScanProgress, MirrorProgress with one
+│   │                 #   ActiveFile per file in progress, VerifyProgress), their snapshots and status lines; speed
+│   │                 #   over the last minute, ETA over the last 15 minutes; no I/O
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the timestamped notices on stderr
-│   ├── units.py      # format_size — binary-unit byte counts for command output
+│   ├── units.py      # format_size and format_duration — binary-unit byte counts and durations for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its

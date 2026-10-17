@@ -25,7 +25,7 @@ import errno
 import logging
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -48,6 +48,7 @@ from yandex_disk_rescue.mirroring import (
     size_mismatch,
     unencodable_reason,
 )
+from yandex_disk_rescue.progress import VerifyProgress
 from yandex_disk_rescue.scanning import SHOWN_PATHS, display_path, listed
 
 # The longest a pass keeps its cursor uncommitted while files are checked: a killed pass reads again at most the files
@@ -109,7 +110,7 @@ class VerifyReport:
 
 class VerifyRun:
     """One part of a `verify` pass over a mirror: the files still to read are counted on construction (`files`,
-    `size`); `run` checks them.
+    `size`); `run` checks them, reporting each file and the bytes it hashes to `progress`.
 
     The pass checks the files in path order and moves its cursor (`VerifyPass.checked_through`) past each file once
     its check is recorded, committing it at least every `CURSOR_SECONDS` and whenever the run stops, so a later part
@@ -117,9 +118,12 @@ class VerifyRun:
     while it is verified for its current identity and has no finding.
     """
 
-    def __init__(self, mirror: Mirror, destination: ReadOnlyDestination, verify_pass: VerifyPass) -> None:
+    def __init__(
+        self, mirror: Mirror, destination: ReadOnlyDestination, verify_pass: VerifyPass, progress: VerifyProgress
+    ) -> None:
         self._mirror = mirror
         self._destination = destination
+        self._progress = progress
         self._entries = [e for e in mirror.entries() if e.resource.kind == 'file']
         through = verify_pass.checked_through
         verified = [e for e in self._entries if _verified_now(e)]
@@ -139,9 +143,11 @@ class VerifyRun:
         says the device is gone; nothing is recorded for that file, and the cursor stays before it.
         """
         report = VerifyReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
+        self._progress.start(self.files, self.size)
         try:
             for entry in self._entries:
                 self._report(entry, report)
+                self._progress.problems(report.problems)
         except KeyboardInterrupt, DestinationUnreadableError:
             self._commit_cursor()
             raise
@@ -150,6 +156,7 @@ class VerifyRun:
             Problem(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()
         ]
         report.not_downloaded.sort(key=lambda problem: problem.path)
+        self._progress.problems(report.problems)
         return report
 
     def _report(self, entry: MirrorEntry, report: VerifyReport) -> None:
@@ -178,7 +185,9 @@ class VerifyRun:
         self._committed_at = time.monotonic()
 
     def _check(self, entry: MirrorEntry, report: VerifyReport) -> None:
-        finding = _finding(entry, self._destination)
+        self._progress.reading(display_path(entry.resource.path), entry.resource.size or 0)
+        finding = _finding(entry, self._destination, self._progress.read)
+        self._progress.checked()
         if finding is not None:
             _log.warning('%s %s: %s', display_path(entry.resource.path), finding.kind, finding.reason)
             self._mirror.record_finding(entry.entry_id, finding)
@@ -216,8 +225,9 @@ def _problem_lines(title: str, shown: list[str], limit: int | None) -> list[str]
     return [f'{title}: {len(shown)}', *listed('', shown, len(shown), '', limit=limit)] if shown else []
 
 
-def _finding(entry: MirrorEntry, destination: ReadOnlyDestination) -> Finding | None:
-    """What is wrong with the file at the entry's final path, or `None` when it is intact."""
+def _finding(entry: MirrorEntry, destination: ReadOnlyDestination, read: Callable[[int], None]) -> Finding | None:
+    """What is wrong with the file at the entry's final path, or `None` when it is intact; `read` gets the size of
+    each chunk hashed."""
     record = _record(entry)
     local = _local_path(entry)
     try:
@@ -234,7 +244,7 @@ def _finding(entry: MirrorEntry, destination: ReadOnlyDestination) -> Finding | 
             if opened.st_size != record.identity.size:
                 mismatch = size_mismatch(record.identity, opened.st_size)
             else:
-                mismatch = _content_mismatch(file.chunks(), record.identity)
+                mismatch = _content_mismatch(file.chunks(), record.identity, read)
     except OSError as exc:
         if exc.errno in _DEVICE_GONE_ERRNOS or not destination.reachable():
             raise DestinationUnreadableError(destination.path, exc.strerror or str(exc)) from None
@@ -250,10 +260,11 @@ def _count_intact(entry: MirrorEntry, report: VerifyReport) -> None:
         report.size_only.append(entry.resource.path)
 
 
-def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity) -> str | None:
+def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity, read: Callable[[int], None]) -> str | None:
     digest = Digest()
     for chunk in chunks:
         digest.update(digest.size, chunk)
+        read(len(chunk))
     return digest.mismatch(identity)
 
 

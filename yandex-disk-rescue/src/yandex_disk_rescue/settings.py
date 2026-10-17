@@ -160,6 +160,13 @@ SCAN_MAX_AGE = Setting(
     'scans.',
     _in_range(0, 10080),
 )
+PROGRESS_INTERVAL = Setting(
+    'progress_interval',
+    60,
+    'Seconds between two status lines on stderr when it is not a terminal, and between two status records in the '
+    'log file.',
+    _in_range(1, 3600),
+)
 CLIENT_ID = Setting(
     'client_id',
     '9e2a0382c430429c9d57913b61d7d48f',
@@ -184,6 +191,7 @@ SETTINGS: dict[str, Setting[Any]] = {
         DOWNLOAD_SEGMENT_THRESHOLD_MIB,
         PARTIAL_DIR,
         SCAN_MAX_AGE,
+        PROGRESS_INTERVAL,
         CLIENT_ID,
     )
 }
@@ -202,6 +210,7 @@ DownloadSegments = Annotated[int, DOWNLOAD_SEGMENTS.typer_option()]
 DownloadSegmentThresholdMib = Annotated[int, DOWNLOAD_SEGMENT_THRESHOLD_MIB.typer_option()]
 PartialDir = Annotated[str, PARTIAL_DIR.typer_option()]
 ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
+ProgressInterval = Annotated[int, PROGRESS_INTERVAL.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 
 
