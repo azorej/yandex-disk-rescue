@@ -78,6 +78,9 @@ class Destination:
 
     An error in the work directory that every file would meet (a full disk, an I/O error, a read-only filesystem, a
     permission error) raises `DestinationError`; other errors are the `OSError` of the call.
+
+    Every method blocks on the disk and may run in a worker thread. Moving aside creates this run's replaced folder
+    on first use, so two moves aside must not run at once.
     """
 
     def __init__(
@@ -276,8 +279,11 @@ class ExistingFile:
         return os.fstat(self._fd)
 
     def chunks(self) -> Iterator[bytes]:
-        while chunk := os.read(self._fd, _READ_SIZE):
+        """The content in order, in chunks of at most 1 MiB."""
+        offset = 0
+        while chunk := localfs.read(self._fd, _READ_SIZE, offset):
             yield chunk
+            offset += len(chunk)
 
     def set_mtime(self, mtime_ns: int) -> None:
         """Set the modification time, keeping the access time, and flush it to the disk."""
@@ -286,8 +292,8 @@ class ExistingFile:
 
 
 class PartialFile:
-    """An open partial file at `path`: its size, reading back and cutting what it holds, positional writes, then the
-    final mtime and an fsync."""
+    """An open partial file at `path`: its size, reading back any range of what it holds, cutting or extending it
+    (`truncate`), positional writes, fsyncs of the content written so far, then the final mtime and an fsync."""
 
     def __init__(self, fd: int, path: Path) -> None:
         self._fd = fd
@@ -297,12 +303,12 @@ class PartialFile:
         with _work_errors(self._path):
             return os.fstat(self._fd).st_size
 
-    def chunks(self, end: int) -> Iterator[bytes]:
-        """The bytes `[0, end)` in order; the file must hold at least `end` bytes."""
-        offset = 0
+    def chunks(self, start: int, end: int) -> Iterator[bytes]:
+        """The bytes `[start, end)` in order, in chunks of at most 1 MiB; the file must hold at least `end` bytes."""
+        offset = start
         while offset < end:
             with _work_errors(self._path):
-                chunk = os.pread(self._fd, min(_READ_SIZE, end - offset), offset)
+                chunk = localfs.read(self._fd, min(_READ_SIZE, end - offset), offset)
             if not chunk:
                 raise ValueError(f'the partial file ends at {offset} bytes, before {end}')
             yield chunk
@@ -319,6 +325,11 @@ class PartialFile:
                 written = os.pwrite(self._fd, view, offset)
                 view = view[written:]
                 offset += written
+
+    def sync(self) -> None:
+        """Flush the content written so far to the disk."""
+        with _work_errors(self._path):
+            os.fsync(self._fd)
 
     def finish(self, mtime_ns: int) -> None:
         """Set the modification time and flush the content and metadata to the disk."""

@@ -1,5 +1,5 @@
 """The filesystem calls a destination makes on names and open files: looking a name up, opening a folder or a file,
-creating a folder, the rename that never replaces an existing path, and setting the times of an open file.
+creating a folder, the rename that never replaces an existing path, reading an open file and setting its times.
 
 Every call on a name works relative to an open folder descriptor and never follows a symbolic link, so nothing is
 ever read or written through a link that appears inside the destination.
@@ -27,6 +27,11 @@ def open_dir(name: str, *, dir_fd: int) -> int:
 def open_file(name: str, *, dir_fd: int) -> int:
     """Open the file `name` in `dir_fd` for reading without blocking on a FIFO; a symbolic link raises `ELOOP`."""
     return os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=dir_fd)
+
+
+def read(fd: int, size: int, offset: int) -> bytes:
+    """Up to `size` bytes of the open file `fd` from `offset`, without moving its file position; empty at the end."""
+    return os.pread(fd, size, offset)
 
 
 def make_dir(name: str, *, dir_fd: int) -> None:

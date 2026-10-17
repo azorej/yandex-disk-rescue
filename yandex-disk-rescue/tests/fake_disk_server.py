@@ -13,6 +13,7 @@ import re
 import threading
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -64,13 +65,18 @@ class Truncate:
     after_bytes: int
 
 
-@dataclass(frozen=True)
+@dataclass
 class RecordedRequest:
+    """One request as received; `finished` is when its response ended (its last byte written or its connection
+    broken), `None` while it is being answered, and `sent` the body bytes written to the socket so far."""
+
     method: str
     path: str
     query: str
     headers: dict[str, str]
     started: float
+    finished: float | None = None
+    sent: int = 0
 
     @property
     def params(self) -> dict[str, str]:
@@ -89,6 +95,7 @@ class FakeNode:
 @dataclass
 class _Fault:
     where: dict[str, str]
+    where_headers: dict[str, str]
     responses: deque[FakeResponse | Delay | Truncate]
 
 
@@ -121,6 +128,10 @@ class FakeDiskApi:
     Its faults: `corrupt` (undone by `repair`), `expire_links`, `ignore_range` (200 with the full body for any range),
     `redirect_downloads` (`/download` answers 302 to `/storage` with the same query, which serves the bytes,
     as the real host redirects to a storage host), `chunk_delay`, and the `Truncate` fault for `inject`.
+
+    `peak_in_flight` is the most requests ever answered at once; `peak_content_in_flight` the most content requests
+    (`/download`, `/storage`), each counted until just before its last byte is sent. A request still sleeping in a
+    `Delay` counts, also after its client gave up.
     """
 
     base_url: str
@@ -130,12 +141,14 @@ class FakeDiskApi:
     page_cap: int | None = None
     token: str | None = None
     peak_in_flight: int = 0
+    peak_content_in_flight: int = 0
     ignore_range: bool = False
     redirect_downloads: bool = False
     chunk_delay: float = 0.0
     tree: dict[str, FakeNode] = field(default_factory=lambda: {'/': FakeNode('dir', DEFAULT_MODIFIED)})
     _faults: dict[tuple[str, str], list[_Fault]] = field(default_factory=dict)
     _in_flight: int = 0
+    _content_in_flight: int = 0
     _links_issued: int = 0
     _expired_links: dict[int, int] = field(default_factory=dict)
     _corruptions: dict[str, set[int]] = field(default_factory=dict)
@@ -208,26 +221,43 @@ class FakeDiskApi:
         route: str,
         *responses: FakeResponse | Delay | Truncate | int,
         where: dict[str, str] | None = None,
+        where_headers: dict[str, str] | None = None,
     ) -> None:
         """Answer the next matching requests with `responses` in order, then serve the route normally again.
 
-        An int is a status with a Yandex-style JSON error body. `where` matches query parameters exactly.
+        An int is a status with a Yandex-style JSON error body. `where` matches query parameters exactly, and
+        `where_headers` request headers (lower-case names), for example `{'range': 'bytes=0-1023'}`.
         """
         queue = deque(FakeResponse.error(r) if isinstance(r, int) else r for r in responses)
-        self._faults.setdefault((method, route), []).append(_Fault(where or {}, queue))
+        self._faults.setdefault((method, route), []).append(_Fault(where or {}, where_headers or {}, queue))
 
-    def _next_fault(self, method: str, path: str, params: dict[str, str]) -> FakeResponse | Delay | Truncate | None:
+    def _next_fault(self, request: RecordedRequest) -> FakeResponse | Delay | Truncate | None:
+        params = request.params
         with self._lock:
-            for fault in self._faults.get((method, path), []):
-                if fault.responses and all(params.get(k) == v for k, v in fault.where.items()):
+            for fault in self._faults.get((request.method, request.path), []):
+                if (
+                    fault.responses
+                    and all(params.get(k) == v for k, v in fault.where.items())
+                    and all(request.headers.get(k) == v for k, v in fault.where_headers.items())
+                ):
                     return fault.responses.popleft()
         return None
 
-    def _enter(self, request: RecordedRequest) -> None:
+    def _enter(self, request: RecordedRequest) -> bool:
+        """Count `request` in flight; `True` when it is a content request, counted until `_content_ends`."""
+        content = request.path in _CONTENT_PATHS
         with self._lock:
             self.requests.append(request)
             self._in_flight += 1
             self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+            if content:
+                self._content_in_flight += 1
+                self.peak_content_in_flight = max(self.peak_content_in_flight, self._content_in_flight)
+        return content
+
+    def _content_ends(self) -> None:
+        with self._lock:
+            self._content_in_flight -= 1
 
     def _leave(self) -> None:
         with self._lock:
@@ -238,7 +268,7 @@ class FakeDiskApi:
             return FakeResponse.json(
                 400, {'error': 'AuthorizationNotExpected', 'description': 'The download host takes no token.'}
             )
-        fault = self._next_fault(request.method, request.path, request.params)
+        fault = self._next_fault(request)
         if isinstance(fault, FakeResponse):
             return fault
         if isinstance(fault, Delay):
@@ -364,25 +394,44 @@ def _handler_for(api: FakeDiskApi) -> type[BaseHTTPRequestHandler]:
                 headers={name.lower(): value for name, value in self.headers.items()},
                 started=time.monotonic(),
             )
-            api._enter(request)
+            counted = api._enter(request)
+
+            # A content request stops counting before its last byte goes out, so a client that has read a whole
+            # response, and starts its next request, never finds the old one still counted.
+            def content_ends() -> None:
+                nonlocal counted
+                if counted:
+                    counted = False
+                    api._content_ends()
+
             try:
                 response = api.respond(request)
                 self.send_response(response.status)
                 for name, value in response.headers.items():
                     self.send_header(name, value)
                 self.send_header('Content-Length', str(len(response.body)))
+                body = response.body[: response.truncate_after]
+                if not body:
+                    content_ends()
                 self.end_headers()
-                self._send_body(response)
+                self._send_body(request, response, body, before_last=content_ends)
             finally:
+                content_ends()
+                request.finished = time.monotonic()
                 api._leave()
 
-        def _send_body(self, response: FakeResponse) -> None:
-            body = response.body[: response.truncate_after]
+        def _send_body(
+            self, request: RecordedRequest, response: FakeResponse, body: bytes, *, before_last: Callable[[], None]
+        ) -> None:
             try:
                 for start in range(0, len(body), _CHUNK):
                     if start:
                         time.sleep(api.chunk_delay)
-                    self.wfile.write(body[start : start + _CHUNK])
+                    if start + _CHUNK >= len(body):
+                        before_last()
+                    chunk = body[start : start + _CHUNK]
+                    self.wfile.write(chunk)
+                    request.sent += len(chunk)
             except BrokenPipeError, ConnectionResetError:
                 self.close_connection = True
             if response.truncate_after is not None:

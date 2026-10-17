@@ -8,7 +8,8 @@ the entries it left out because their names are not valid Unicode (`unencodable_
 scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
-the local name of every entry (`local_names`) and each file's download state (`downloads`), keyed by `entries.id`.
+the local name of every entry (`local_names`) and each file's download state (`downloads`), keyed by `entries.id`,
+with the checkpoint journal of a partial download (`download_segments`).
 A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
 the manifest deletes its rows.
 
@@ -23,7 +24,8 @@ Schema changes append a migration; released migrations are never edited.
 import fcntl
 import os
 import sqlite3
-from collections.abc import Iterable, Iterator, Mapping
+from collections import defaultdict
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -142,6 +144,29 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    (
+        # The checkpoint journal of a partial download: bytes [start, confirmed) of each segment were fsynced before
+        # the row recording them was committed, and `digest` is their SHA-256 hex.
+        """
+        CREATE TABLE download_segments (
+            mirror_id INTEGER NOT NULL,
+            entry_id INTEGER NOT NULL,
+            start INTEGER NOT NULL,
+            end INTEGER NOT NULL,
+            confirmed INTEGER NOT NULL,
+            digest TEXT,
+            PRIMARY KEY (mirror_id, entry_id, start),
+            FOREIGN KEY (mirror_id, entry_id) REFERENCES downloads (mirror_id, entry_id) ON DELETE CASCADE,
+            CHECK (0 <= start AND start < end AND start <= confirmed AND confirmed <= end),
+            CHECK ((confirmed = start) = (digest IS NULL))
+        )
+        """,
+        # The partial files of earlier versions were never confirmed: each restarts from byte 0.
+        """
+        INSERT INTO download_segments (mirror_id, entry_id, start, end, confirmed, digest)
+        SELECT mirror_id, entry_id, 0, size, 0, NULL FROM downloads WHERE state = 'partial' AND size > 0
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -193,13 +218,28 @@ class LocalFingerprint:
 
 
 @dataclass(frozen=True)
+class Segment:
+    """One byte range `[start, end)` of a partial download and how much of it is confirmed."""
+
+    start: int
+    end: int
+    confirmed: int  # bytes [start, confirmed) were fsynced before this was recorded
+    digest: str | None  # SHA-256 hex of [start, confirmed); None exactly when confirmed == start
+
+
+@dataclass(frozen=True)
 class DownloadRecord:
-    """A file's download state in one mirror: `verified_by` and `local` are set exactly when it is verified."""
+    """A file's download state in one mirror: `verified_by` and `local` are set exactly when it is verified.
+
+    `segments` is the checkpoint journal: a partial record's segments tile `[0, size)` in order (none for a zero-byte
+    file), and a verified record has none.
+    """
 
     state: Literal['partial', 'verified']
     identity: RemoteIdentity
     verified_by: VerifiedBy | None
     local: LocalFingerprint | None
+    segments: tuple[Segment, ...]
 
 
 @dataclass(frozen=True)
@@ -462,9 +502,21 @@ class Mirror:
         """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names and
         download records, read in full so no read stays open across later writes."""
         params = {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
-        with self._manifest._errors('read'):
-            rows = self._manifest._connection.execute(_MIRROR_ENTRIES_SQL, params).fetchall()
-        return [_mirror_entry(row) for row in rows]
+        connection = self._manifest._connection
+        with self._manifest._transaction('read'):
+            rows = connection.execute(_MIRROR_ENTRIES_SQL, params).fetchall()
+            segments: defaultdict[int, list[Segment]] = defaultdict(list)
+            for entry_id, *segment in connection.execute(_MIRROR_SEGMENTS_SQL, {'mirror': self.id}):
+                segments[entry_id].append(Segment(*segment))
+        return [_mirror_entry(row, tuple(segments[row[0]])) for row in rows]
+
+    def download(self, entry_id: int) -> DownloadRecord | None:
+        """The entry's download record with its segments as the manifest holds it now; `None` when it has none."""
+        connection = self._manifest._connection
+        with self._manifest._transaction('read'):
+            row = connection.execute(_DOWNLOAD_SQL, {'mirror': self.id, 'entry': entry_id}).fetchone()
+            segments = self._segments(entry_id)
+        return None if row is None else _download_record(row, segments)
 
     def unencodable(self) -> list[UnencodableEntry]:
         """The entries below `remote_root` the last scans covering them left out for their names, ordered by path."""
@@ -511,19 +563,44 @@ class Mirror:
             )
             connection.execute(_RENAME_DESCENDANTS_SQL, {'mirror': self.id, 'old': old, 'new': new, **_below(old)})
 
-    def record_partial(self, entry_id: int, identity: RemoteIdentity) -> None:
-        """Record that a download of `identity` into the entry's partial file has started, replacing any record."""
-        self._record(entry_id, identity, 'partial', None, None)
+    def record_partial(self, entry_id: int, identity: RemoteIdentity, segments: Sequence[Segment]) -> None:
+        """Record that a download of `identity` into the entry's partial file has started with `segments` as its
+        journal, replacing any record and its segments; raises `ValueError` unless `segments` tile `[0, size)` in
+        order."""
+        if not _tiles(segments, identity.size):
+            raise ValueError(f'segments {list(segments)} do not tile [0, {identity.size}) in order')
+        self._record(entry_id, identity, 'partial', None, None, segments)
+
+    def checkpoint(self, entry_id: int, segments: Sequence[Segment]) -> None:
+        """Record the confirmed offset and digest of each of `segments`, matched by `start`, in one transaction.
+
+        Raises `ValueError`, writing nothing, when the entry has no partial record or `segments` are not exactly the
+        recorded boundaries.
+        """
+        connection = self._manifest._connection
+        params = [
+            {'mirror': self.id, 'entry': entry_id, 'start': s.start, 'confirmed': s.confirmed, 'digest': s.digest}
+            for s in segments
+        ]
+        with self._manifest._transaction('update'):
+            row = connection.execute(_DOWNLOAD_SQL, {'mirror': self.id, 'entry': entry_id}).fetchone()
+            if row is None or row[0] != 'partial':
+                raise ValueError(f'entry {entry_id} has no partial download record in mirror {self.id}')
+            recorded = [(s.start, s.end) for s in self._segments(entry_id)]
+            if [(s.start, s.end) for s in segments] != recorded:
+                raise ValueError(f'segments {list(segments)} are not the recorded segments {recorded}')
+            connection.executemany(_CHECKPOINT_SQL, params)
 
     def record_verified(
         self, entry_id: int, identity: RemoteIdentity, verified_by: VerifiedBy, local: os.stat_result
     ) -> None:
         """Record the entry's file as verified against `identity`, placed at its final path with `lstat` `local`.
 
-        Any other verified record of this mirror holding the same inode is deleted: the caller has just placed this
-        file there, so that record describes a file that is gone and whose inode number was reused.
+        The record's segments are deleted. Any other verified record of this mirror holding the same inode is deleted:
+        the caller has just placed this file there, so that record describes a file that is gone and whose inode
+        number was reused.
         """
-        self._record(entry_id, identity, 'verified', verified_by, LocalFingerprint.of(local))
+        self._record(entry_id, identity, 'verified', verified_by, LocalFingerprint.of(local), ())
 
     def verified_owner(self, ino: int) -> MirrorEntry | None:
         """The entry of this mirror whose verified record holds inode `ino`, if any."""
@@ -531,14 +608,22 @@ class Mirror:
             row = self._manifest._connection.execute(
                 _VERIFIED_OWNER_SQL, {'mirror': self.id, 'ino': _signed_ino(ino)}
             ).fetchone()
-        return None if row is None else _mirror_entry(row)
+        return None if row is None else _mirror_entry(row, ())
 
     def forget(self, entry_id: int) -> None:
-        """Delete the entry's download record, if any."""
+        """Delete the entry's download record and its segments, if any."""
         with self._manifest._transaction('update'):
             self._manifest._connection.execute(
                 'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
+
+    def _segments(self, entry_id: int) -> tuple[Segment, ...]:
+        rows = self._manifest._connection.execute(
+            'SELECT start, end, confirmed, digest FROM download_segments WHERE mirror_id = ? AND entry_id = ? '
+            'ORDER BY start',
+            (self.id, entry_id),
+        )
+        return tuple(Segment(*row) for row in rows)
 
     def _record(
         self,
@@ -547,6 +632,7 @@ class Mirror:
         state: Literal['partial', 'verified'],
         verified_by: VerifiedBy | None,
         local: LocalFingerprint | None,
+        segments: Sequence[Segment],
     ) -> None:
         connection = self._manifest._connection
         params = {
@@ -562,11 +648,27 @@ class Mirror:
             'local_mtime_ns': None if local is None else local.mtime_ns,
             'local_ino': None if local is None else _signed_ino(local.ino),
         }
+        rows = [
+            {
+                'mirror': self.id,
+                'entry': entry_id,
+                'start': s.start,
+                'end': s.end,
+                'confirmed': s.confirmed,
+                'digest': s.digest,
+            }
+            for s in segments
+        ]
         with self._manifest._transaction('update'):
             self._check_entry(entry_id)
             if local is not None:
                 connection.execute(_RELEASE_INO_SQL, params)
+            # The upsert updates the row in place, so no cascade deletes the old segments.
+            connection.execute(
+                'DELETE FROM download_segments WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            )
             connection.execute(_RECORD_DOWNLOAD_SQL, params)
+            connection.executemany(_INSERT_SEGMENT_SQL, rows)
 
     def _check_entry(self, entry_id: int) -> None:
         params = {'entry': entry_id, **_subtree_params(self.account_uid, self.remote_root)}
@@ -588,6 +690,22 @@ _MIRROR_ENTRIES_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
     WHERE e.account_uid = :account AND e.path >= :low AND e.path < :high
     ORDER BY e.path
+"""
+_MIRROR_SEGMENTS_SQL = """
+    SELECT entry_id, start, end, confirmed, digest FROM download_segments WHERE mirror_id = :mirror
+    ORDER BY entry_id, start
+"""
+_DOWNLOAD_SQL = """
+    SELECT state, size, md5, sha256, modified, verified_by, local_size, local_mtime_ns, local_ino
+    FROM downloads WHERE mirror_id = :mirror AND entry_id = :entry
+"""
+_INSERT_SEGMENT_SQL = """
+    INSERT INTO download_segments (mirror_id, entry_id, start, end, confirmed, digest)
+    VALUES (:mirror, :entry, :start, :end, :confirmed, :digest)
+"""
+_CHECKPOINT_SQL = """
+    UPDATE download_segments SET confirmed = :confirmed, digest = :digest
+    WHERE mirror_id = :mirror AND entry_id = :entry AND start = :start
 """
 _VERIFIED_OWNER_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
@@ -844,20 +962,33 @@ def _timestamp(moment: datetime) -> str:
     return moment.astimezone(UTC).isoformat(timespec='microseconds')
 
 
-def _mirror_entry(row: tuple) -> MirrorEntry:
-    """Build a `MirrorEntry` from a row of `_MIRROR_ENTRY_COLUMNS`."""
+def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
+    """Build a `MirrorEntry` from a row of `_MIRROR_ENTRY_COLUMNS` and the segments of its download record."""
     entry_id, local_path = row[0], row[7]
-    state, size, md5, sha256, modified, verified_by, local_size, local_mtime_ns, local_ino = row[8:]
-    download = None
-    if state is not None:
-        identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
-        local = None
-        if state == 'verified':
-            local = LocalFingerprint(size=local_size, mtime_ns=local_mtime_ns, ino=local_ino % 2**64)
-        download = DownloadRecord(state=state, identity=identity, verified_by=verified_by, local=local)
     return MirrorEntry(
         entry_id=entry_id,
         resource=_resource(row[1:7]),
         local_path=None if local_path is None else PurePosixPath(local_path),
-        download=download,
+        download=None if row[8] is None else _download_record(row[8:], segments),
     )
+
+
+def _download_record(row: tuple, segments: tuple[Segment, ...]) -> DownloadRecord:
+    """Build a `DownloadRecord` from the `downloads` columns state, size, md5, sha256, modified, verified_by,
+    local_size, local_mtime_ns and local_ino."""
+    state, size, md5, sha256, modified, verified_by, local_size, local_mtime_ns, local_ino = row
+    identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
+    local = None
+    if state == 'verified':
+        local = LocalFingerprint(size=local_size, mtime_ns=local_mtime_ns, ino=local_ino % 2**64)
+    return DownloadRecord(state=state, identity=identity, verified_by=verified_by, local=local, segments=segments)
+
+
+def _tiles(segments: Sequence[Segment], size: int) -> bool:
+    """Whether `segments` cover `[0, size)` in order, each non-empty and each starting where the last one ended."""
+    edge = 0
+    for segment in segments:
+        if segment.start != edge or segment.end <= segment.start:
+            return False
+        edge = segment.end
+    return edge == size

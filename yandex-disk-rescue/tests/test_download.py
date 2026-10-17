@@ -1,9 +1,11 @@
 """Tests for `yandex-disk-rescue download` against the fake Disk API and download host, into a real `tmp_path`
 destination, with the real manifest in the XDG state directory."""
 
+import asyncio
 import errno
 import fcntl
 import hashlib
+import itertools
 import os
 import random
 import re
@@ -11,20 +13,25 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 import pytest
 from fake_disk_server import Delay, FakeResponse, Truncate
 from typer.testing import CliRunner
-from yandex_disk_rescue import localfs, mirroring
+from yandex_disk_rescue import api, localfs, mirroring
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.manifest import Manifest
+from yandex_disk_rescue.destination import Destination, PartialFile
+from yandex_disk_rescue.manifest import Manifest, Segment
+from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
 from yandex_disk_rescue.paths import manifest_path
+from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
 runner = CliRunner()
@@ -47,6 +54,12 @@ CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to f
 # A stall timeout no ordinary local transfer comes near, and an injected silence well past it.
 STALL_TIMEOUT = '3'
 STALL = Delay(4.5)
+MiB = 2**20
+# A 4 MiB file above a 1 MiB segment threshold: four segments of 1 MiB, 16 chunks each.
+SEGMENTED_PATH = 'disk:/Seg/large.bin'
+SEGMENTED = random.Random(17).randbytes(4 * MiB)
+SEGMENTED_ARGS = ('--download-segment-threshold-mib', '1')
+SEGMENT_RANGES = [f'bytes={n * MiB}-{(n + 1) * MiB - 1}' for n in range(4)]
 _STAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z')
 
 
@@ -125,6 +138,13 @@ def big(disk):
     return disk
 
 
+@pytest.fixture
+def segmented(disk):
+    """The `disk` tree plus `SEGMENTED` at `SEGMENTED_PATH`."""
+    disk.add_file(SEGMENTED_PATH, SEGMENTED, modified=MODIFIED)
+    return disk
+
+
 def _partials(dest) -> list:
     folder = dest / '.yandex-disk-rescue' / 'partial'
     return sorted(folder.iterdir()) if folder.is_dir() else []
@@ -150,7 +170,24 @@ def _leave_partial(fake, dest, *, after_bytes: int = 300_000):
     assert result.exit_code == 1
     [partial] = _partials(dest)
     assert partial.stat().st_size == after_bytes
+    assert _journal() == [(0, len(BIG), after_bytes, hashlib.sha256(BIG[:after_bytes]).hexdigest())]
     return partial
+
+
+def _journal() -> list[tuple[int, int, int, str | None]]:
+    """The segments of every download journal in the manifest (start, end, confirmed, digest), read with a connection
+    of its own; none while the manifest or its journal table does not exist yet."""
+    try:
+        with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+            return connection.execute(
+                'SELECT start, end, confirmed, digest FROM download_segments ORDER BY entry_id, start'
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _confirmed() -> int:
+    return sum(confirmed - start for start, _, confirmed, _ in _journal())
 
 
 def _others_verified(dest, failed: str) -> bool:
@@ -203,33 +240,38 @@ def test_a_rerun_skips_verified_files_without_reading_them(disk, dest):
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
-def test_a_corrupted_download_fails_that_file_and_a_rerun_fetches_it(disk, dest):
+@pytest.mark.parametrize('segmented', [False, True], ids=['one-stream', 'segmented'])
+def test_a_corrupted_download_fails_that_file_and_a_rerun_fetches_it(disk, dest, segmented):
     path = 'disk:/Photos/2024/a.jpg'
-    disk.corrupt(path, offset=10)
-    good = hashlib.md5(FILES[path]).hexdigest()
-    corrupted = bytearray(FILES[path])
-    corrupted[10] ^= 0xFF
+    # Segmented, the corrupt byte lies in the third segment and only reading the whole file back can catch it.
+    content, offset, args = (SEGMENTED, 2 * MiB + 10, SEGMENTED_ARGS) if segmented else (FILES[path], 10, ())
+    disk.add_file(path, content, modified=MODIFIED)
+    disk.corrupt(path, offset=offset)
+    good = hashlib.md5(content).hexdigest()
+    corrupted = bytearray(content)
+    corrupted[offset] ^= 0xFF
     bad = hashlib.md5(corrupted).hexdigest()
 
-    result = _download(str(dest))
+    result = _download(*args, str(dest))
 
     assert result.exit_code == 1
-    assert f'5 downloaded ({format_size(sum(map(len, FILES.values())) - 70_000)}), 0 skipped, 1 failed\n' in (
-        result.stdout
-    )
+    others = sum(map(len, FILES.values())) - len(FILES[path])
+    assert f'5 downloaded ({format_size(others)}), 0 skipped, 1 failed\n' in result.stdout
     assert f'Failed: 1\n  {path}: MD5 mismatch (expected {good}, got {bad})\n' in result.stdout
     assert result.stderr == 'Error: 1 failed; see the list above.\n'
     assert not _local(dest, path).exists()
     assert list((dest / '.yandex-disk-rescue' / 'partial').iterdir()) == []
+    assert _journal() == []
 
     disk.repair(path)
     earlier = len(disk.requests)
-    rerun = _download(str(dest))
+    rerun = _download(*args, str(dest))
 
     assert rerun.exit_code == 0, rerun.output
-    assert '1 downloaded (68.4 KiB), 5 skipped, 0 failed\n' in rerun.stdout
-    assert _local(dest, path).read_bytes() == FILES[path]
-    assert _transfers(disk, earlier) == ['/v1/disk/resources/download', '/download']
+    assert f'1 downloaded ({format_size(len(content))}), 5 skipped, 0 failed\n' in rerun.stdout
+    assert _local(dest, path).read_bytes() == content
+    assert _transfers(disk, earlier) == ['/v1/disk/resources/download'] + ['/download'] * (4 if segmented else 1)
+    assert sorted(_fetches(disk, path, earlier), key=str) == (SEGMENT_RANGES if segmented else [None])
 
 
 def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by_size(disk, dest):
@@ -684,6 +726,34 @@ def test_a_hard_link_to_another_verified_file_is_never_replaced(disk, dest):
         assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
+def test_hard_linked_untracked_copies_handled_at_once_adopt_only_one(disk, tmp_path, monkeypatch):
+    disk.add_file('disk:/Pair/a.bin', b'same bytes')
+    disk.add_file('disk:/Pair/b.bin', b'same bytes')
+
+    for attempt in range(20):
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / f'state-{attempt}'))
+        dest = tmp_path / f'dest-{attempt}'
+        dest.mkdir()
+        (dest / 'a.bin').write_bytes(b'same bytes')
+        os.link(dest / 'a.bin', dest / 'b.bin')
+
+        result = _download('disk:/Pair', str(dest))
+
+        assert result.exit_code == 1, result.output
+        match = re.search(r'Already on disk and verified: 1\n  disk:/Pair/(\w)\.bin\n', result.stdout)
+        assert match is not None, result.stdout
+        adopted, other = match[1], {'a': 'b', 'b': 'a'}[match[1]]
+        assert (
+            f'Failed: 1\n  disk:/Pair/{other}.bin: {other}.bin is the same file as disk:/Pair/{adopted}.bin on this '
+            'filesystem; it was left untouched\n'
+        ) in result.stdout
+        assert ', 1 skipped, 1 failed\n' in result.stdout
+        assert (dest / 'a.bin').stat().st_ino == (dest / 'b.bin').stat().st_ino
+        assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+        with closing(sqlite3.connect(manifest_path())) as connection:
+            assert connection.execute("SELECT count(*) FROM downloads WHERE state = 'verified'").fetchone() == (1,)
+
+
 @pytest.mark.parametrize(
     ('status', 'reason'),
     [
@@ -915,9 +985,18 @@ def test_a_destination_mirrors_one_remote_folder(disk, dest):
         ('--download-timeout', '0', '1 to 600'),
         ('--download-retries', '99', '0 to 20'),
         ('--download-passes', '1001', '0 to 1000'),
+        ('--download-connections', '0', '1 to 64'),
+        ('--download-connections', '65', '1 to 64'),
+        ('--download-checkpoint-mib', '0', '1 to 1024'),
+        ('--download-checkpoint-mib', '1025', '1 to 1024'),
+        ('--download-segments', '0', '1 to 8'),
+        ('--download-segments', '9', '1 to 8'),
+        ('--download-segment-threshold-mib', '0', '1 to 65536'),
+        ('--download-segment-threshold-mib', '65537', '1 to 65536'),
     ],
 )
-def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, flag, value, valid):
+def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, monkeypatch, flag, value, valid):
+    monkeypatch.setenv('COLUMNS', '200')
     result = _download(flag, value, str(dest))
 
     assert result.exit_code == 2
@@ -981,14 +1060,18 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
     assert result.exit_code == 1
     assert result.stderr == f'Error: Could not write {dest / "top.txt"}: {os.strerror(code)}.\n'
     assert 'Mirrored' not in result.stdout
-    assert _others_verified(dest, 'disk:/top.txt')
     assert not (dest / 'top.txt').exists()
 
     monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
     rerun = _download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
-    assert f'Mirrored disk:/ to {dest}: 1 downloaded (0 B), 5 skipped, 0 failed\n' in rerun.stdout
+    counts = re.search(
+        rf'Mirrored disk:/ to {re.escape(str(dest))}: (\d+) downloaded \(.+\), (\d+) skipped, 0 failed\n', rerun.stdout
+    )
+    assert counts is not None, rerun.stdout
+    assert int(counts[1]) + int(counts[2]) == len(FILES)
+    assert _others_verified(dest, failed='')
 
 
 def _refuse(monkeypatch, call: str, code: int, refused: Callable[[str | int], bool]) -> None:
@@ -1011,8 +1094,8 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
     result = _download(str(dest))
 
     assert result.exit_code == 1
-    [partial] = _partials(dest)
-    assert result.stderr == f'Error: Could not write {partial}: {os.strerror(code)}.\n'
+    partials = _partials(dest)
+    assert result.stderr in {f'Error: Could not write {partial}: {os.strerror(code)}.\n' for partial in partials}
     assert 'Mirrored' not in result.stdout
 
 
@@ -1061,6 +1144,47 @@ def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(dis
     assert f'Failed: 1\n  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' in result.stdout
     assert _fetches(disk, path) == [None]
     assert _others_verified(dest, path)
+
+
+def test_dead_files_do_not_hold_up_the_healthy_ones(disk, dest):
+    dead = [f'disk:/Mixed/a-dead{n}.bin' for n in range(3)]
+    healthy = [f'disk:/Mixed/b-healthy{n:02}.bin' for n in range(12)]
+    for path in dead + healthy:
+        disk.add_file(path, path.encode() * 100)
+    for path in dead:
+        disk.inject('GET', '/download', STALL, where={'path': path})
+
+    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', 'disk:/Mixed', str(dest))
+
+    assert result.exit_code == 1
+    stalled = ''.join(f'  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' for path in dead)
+    assert f'12 downloaded ({format_size(sum(len(p) * 100 for p in healthy))}), 0 skipped, 3 failed\n' in result.stdout
+    assert f'Passes: 1 of 1\nFailed: 3\n{stalled}' in result.stdout
+    assert all(_local(dest, path.replace('Mixed/', '')).read_bytes() == path.encode() * 100 for path in healthy)
+    started = {r.params['path']: r.started for r in disk.requests if r.path == '/download'}
+    first_dead = min(started[path] for path in dead)
+    assert max(started[path] for path in healthy) - first_dead < float(STALL_TIMEOUT)
+
+
+def test_throughput_scales_with_the_connection_cap_and_never_passes_it(disk, tmp_path):
+    for n in range(8):
+        disk.add_file(f'disk:/Load/f{n}.bin', random.Random(n).randbytes(10 * 64 * 1024))
+    disk.chunk_delay = 0.05
+    spans = {}
+
+    for cap in (1, 4):
+        disk.peak_content_in_flight = 0
+        earlier = len(disk.requests)
+
+        result = _download('--download-connections', str(cap), 'disk:/Load', str(tmp_path / f'dest-{cap}'))
+
+        assert result.exit_code == 0, result.output
+        assert disk.peak_content_in_flight == cap
+        content = [r for r in disk.requests[earlier:] if r.path == '/download']
+        assert len(content) == 8
+        spans[cap] = max(r.finished for r in content) - min(r.started for r in content)
+
+    assert spans[4] < spans[1] / 2
 
 
 def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, dest):
@@ -1161,22 +1285,33 @@ def test_retries_after_new_data_are_bounded_by_download_retries(big, dest, cuts,
         assert _partial_size(dest) == 6000
 
 
-@pytest.mark.parametrize('expiries', [1, 2])
-def test_an_expired_link_is_refreshed_once(big, dest, expiries):
+@pytest.mark.parametrize(
+    ('expiries', 'passes'), [(1, '7'), (2, '7'), (2, '1')], ids=['refreshed', 'next-pass', 'no-pass-left']
+)
+def test_an_expired_link_is_refreshed_once_per_pass(big, dest, expiries, passes):
     big.inject('GET', '/download', Truncate(after_bytes=300_000), *[410] * expiries, where={'path': BIG_PATH})
 
-    result = _download(str(dest))
+    result = _download('--download-passes', passes, str(dest))
 
-    assert _linked(big).count(BIG_PATH) == 2
-    assert _fetches(big, BIG_PATH) == [None, _tail(300_000), _tail(300_000)]
-    assert 'Passes' not in result.stdout
     assert _others_verified(dest, BIG_PATH)
     if expiries == 1:
         assert result.exit_code == 0, result.output
+        assert 'Passes' not in result.stdout
+        assert _linked(big).count(BIG_PATH) == 2
+        assert _fetches(big, BIG_PATH) == [None, _tail(300_000), _tail(300_000)]
+        assert (dest / 'Big' / 'big.bin').read_bytes() == BIG
+    elif passes == '7':
+        assert result.exit_code == 0, result.output
+        assert 'Passes: 2 of 7\n' in result.stdout
+        assert _linked(big).count(BIG_PATH) == 3
+        assert _fetches(big, BIG_PATH) == [None, *[_tail(300_000)] * 3]
         assert (dest / 'Big' / 'big.bin').read_bytes() == BIG
     else:
         assert result.exit_code == 1
+        assert 'Passes: 1 of 1\n' in result.stdout
         assert f'Failed: 1\n  {BIG_PATH}: download link rejected again after a refresh (HTTP 410)\n' in result.stdout
+        assert _linked(big).count(BIG_PATH) == 2
+        assert _partial_size(dest) == 300_000
 
 
 @pytest.mark.parametrize('ignore_range', [False, True], ids=['ranged', 'range-ignored'])
@@ -1223,10 +1358,17 @@ def test_a_partial_file_of_a_file_changed_in_the_cloud_is_never_resumed(big, des
     assert not (dest / 'big.bin').exists()
 
 
-@pytest.mark.parametrize('held', ['complete', 'longer'])
-def test_a_partial_file_holding_the_whole_file_is_not_fetched_again(big, dest, held):
+@pytest.mark.parametrize('held', ['confirmed', 'unconfirmed-tail'])
+def test_a_partial_file_keeps_only_what_its_journal_confirms(big, dest, held):
     partial = _leave_partial(big, dest)
-    partial.write_bytes(BIG if held == 'complete' else BIG + b'extra')
+    if held == 'confirmed':
+        partial.write_bytes(BIG)
+        with Manifest.open(manifest_path()) as manifest:
+            mirror = manifest.mirror('1', 'disk:/Big', dest.resolve())
+            mirror.checkpoint(int(partial.name), [Segment(0, len(BIG), len(BIG), hashlib.sha256(BIG).hexdigest())])
+    else:
+        with partial.open('ab') as file:
+            file.write(b'never confirmed' * 1000)
     earlier = len(big.requests)
 
     result = _download('disk:/Big', str(dest))
@@ -1234,8 +1376,110 @@ def test_a_partial_file_holding_the_whole_file_is_not_fetched_again(big, dest, h
     assert result.exit_code == 0, result.output
     assert f'1 downloaded ({format_size(len(BIG))}), ' in result.stdout
     assert (dest / 'big.bin').read_bytes() == BIG
-    assert _fetches(big, BIG_PATH, earlier) == ([] if held == 'complete' else [None])
-    assert _linked(big).count(BIG_PATH) == (1 if held == 'complete' else 2)
+    assert _fetches(big, BIG_PATH, earlier) == ([] if held == 'confirmed' else [_tail(300_000)])
+    assert _linked(big).count(BIG_PATH) == (1 if held == 'confirmed' else 2)
+    assert _journal() == []
+
+
+@pytest.mark.parametrize('change', ['tampered', 'shortened', 'deleted'])
+def test_a_partial_file_whose_confirmed_bytes_changed_on_disk_is_fetched_again_from_byte_0(big, dest, change):
+    partial = _leave_partial(big, dest)
+    if change == 'tampered':
+        held = bytearray(partial.read_bytes())
+        held[123_456] ^= 0xFF
+        partial.write_bytes(held)
+    elif change == 'shortened':
+        os.truncate(partial, 299_999)
+    else:
+        partial.unlink()
+    earlier = len(big.requests)
+
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(big, BIG_PATH, earlier) == [None]
+    assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_a_file_deferred_after_new_bytes_resumes_in_the_next_pass_from_its_journal(big, dest):
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+
+    result = _download('--download-retries', '0', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'Passes: 2 of 7\n' in result.stdout
+    assert _fetches(big, BIG_PATH) == [None, _tail(300_000)]
+    assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_a_slow_download_takes_a_checkpoint_every_checkpoint_seconds(big, dest, monkeypatch):
+    monkeypatch.setattr(mirroring, 'CHECKPOINT_SECONDS', 0.3)
+    big.chunk_delay = 0.2
+    results = []
+    # `asyncio.run` installs no signal handler outside the main thread, so the command runs as it would there.
+    worker = threading.Thread(target=lambda: results.append(_download('disk:/Big', str(dest))))
+    worker.start()
+    while_running: set[int] = set()
+    try:
+        while worker.is_alive():
+            fetches = [r for r in big.requests if r.path == '/download']
+            confirmed = _confirmed()
+            if fetches and fetches[0].finished is None:
+                while_running.add(confirmed)
+            time.sleep(0.02)
+    finally:
+        worker.join()
+
+    [result] = results
+    assert result.exit_code == 0, result.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert len({confirmed for confirmed in while_running if 0 < confirmed < len(BIG)}) >= 2
+
+
+def _fail_fsync(monkeypatch) -> tuple[threading.Event, list[int]]:
+    """Make `os.fsync` fail with EIO once the returned event is set; the list collects the descriptors it failed."""
+    failing, failed = threading.Event(), []
+    fsync = os.fsync
+
+    def maybe_failing(fd):
+        if failing.is_set():
+            failed.append(fd)
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        fsync(fd)
+
+    monkeypatch.setattr(os, 'fsync', maybe_failing)
+    return failing, failed
+
+
+def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_line(disk, dest, monkeypatch):
+    slow = [f'disk:/Stop/slow{n}.bin' for n in range(3)]
+    for n, path in enumerate(slow):
+        disk.add_file(path, random.Random(n).randbytes(1024 * 1024))
+    disk.add_file('disk:/Stop/z.txt', b'placed last')
+    disk.chunk_delay = 0.2
+    failing, failed = _fail_fsync(monkeypatch)
+    rename_noreplace = localfs.rename_noreplace
+
+    def failing_once_the_others_have_bytes(src, dst, *, src_dir_fd, dst_dir_fd):
+        if dst == 'z.txt':
+            deadline = time.monotonic() + 10
+            while sum(p.stat().st_size >= 64 * 1024 for p in _partials(dest)) < len(slow):
+                assert time.monotonic() < deadline, 'the slow files never received a chunk'
+                time.sleep(0.01)
+            failing.set()
+            raise OSError(errno.EIO, os.strerror(errno.EIO), dst)
+        rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(localfs, 'rename_noreplace', failing_once_the_others_have_bytes)
+
+    result = _download('disk:/Stop', str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.\n'
+    assert 'Mirrored' not in result.stdout
+    assert len(failed) == len(slow)
+    assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, 1024 * 1024, 0, None)] * len(slow)
+    assert len(_partials(dest)) == len(slow) + 1
 
 
 def _start_download(*args: str) -> subprocess.Popen[str]:
@@ -1258,25 +1502,22 @@ def _wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
         time.sleep(0.01)
 
 
-@pytest.mark.parametrize('stop', [signal.SIGINT, signal.SIGKILL], ids=['sigint', 'sigkill'])
-def test_a_download_stopped_mid_file_resumes_from_its_partial_file(big, dest, stop):
+def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_there(big, dest):
     big.chunk_delay = 0.2
     child = _start_download('disk:/Big', str(dest))
     try:
         _wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
-        child.send_signal(stop)
+        child.send_signal(signal.SIGINT)
         _, stderr = child.communicate(timeout=60)
     finally:
         child.kill()
         child.communicate()
 
-    if stop == signal.SIGINT:
-        assert child.returncode == 130, stderr
-        assert stderr == 'Interrupted; rerun to continue the download.\n'
-    else:
-        assert child.returncode == -signal.SIGKILL
+    assert child.returncode == 130, stderr
+    assert stderr == 'Interrupted; rerun to continue the download.\n'
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
+    assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
 
     big.chunk_delay = 0
     earlier = len(big.requests)
@@ -1285,6 +1526,39 @@ def test_a_download_stopped_mid_file_resumes_from_its_partial_file(big, dest, st
     assert result.exit_code == 0, result.output
     assert _fetches(big, BIG_PATH, earlier) == [_tail(held)]
     assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_a_download_killed_mid_file_fetches_at_most_one_checkpoint_interval_again(disk, dest):
+    path, content = 'disk:/Kill/k.bin', random.Random(5).randbytes(4 * 1024 * 1024)
+    disk.add_file(path, content, modified=MODIFIED)
+    disk.chunk_delay = 0.25
+    child = _start_download('--download-checkpoint-mib', '1', 'disk:/Kill', str(dest))
+    try:
+        _wait_until(lambda: _confirmed() >= 1024 * 1024, child, 'confirmed 1 MiB')
+        child.kill()
+        child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    [(_, _, confirmed, digest)] = _journal()
+    assert digest == hashlib.sha256(content[:confirmed]).hexdigest()
+    [served] = [r for r in disk.requests if r.path == '/download']
+    deadline = time.monotonic() + 10
+    while served.finished is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert served.finished is not None
+    # The interval itself, plus one chunk crossing it, one received but not yet written when the fsync began, and two
+    # sent but not yet read by the client.
+    assert served.sent - confirmed <= 1024 * 1024 + 4 * 64 * 1024
+
+    disk.chunk_delay = 0
+    earlier = len(disk.requests)
+    result = _download('disk:/Kill', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(disk, path, earlier) == [f'bytes={confirmed}-{len(content) - 1}']
+    assert (dest / 'k.bin').read_bytes() == content
 
 
 def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_file(big, dest, monkeypatch):
@@ -1305,3 +1579,519 @@ def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_
     assert stderr == 'Interrupted; rerun to continue the download.\n'
     assert len(_fetches(big, BIG_PATH)) == 2
     assert _partial_size(dest) == 300_000
+
+
+# Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, an fsync of a partial file
+# waits for the marker `go` there; the first one after it fails with EIO at once, each later one creates a `blocked-<n>`
+# marker and fails with EIO once the marker `release` exists.
+_FSYNC_GATE = """
+import errno, itertools, os, pathlib, threading, time
+
+_gate = pathlib.Path(os.environ['FSYNC_GATE'])
+_fsync, _calls, _lock = os.fsync, itertools.count(1), threading.Lock()
+
+
+def _wait(marker):
+    while not (_gate / marker).exists():
+        time.sleep(0.01)
+
+
+def fsync(fd):
+    if '/.yandex-disk-rescue/partial/' not in os.readlink(f'/proc/self/fd/{fd}'):
+        return _fsync(fd)
+    _wait('go')
+    with _lock:
+        call = next(_calls)
+    if call > 1:
+        (_gate / f'blocked-{call}').touch()
+        _wait('release')
+    raise OSError(errno.EIO, os.strerror(errno.EIO))
+
+
+os.fsync = fsync
+"""
+
+
+def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error(disk, dest, tmp_path, monkeypatch):
+    slow = [f'disk:/Stop/slow{n}.bin' for n in range(3)]
+    for n, path in enumerate(slow):
+        disk.add_file(path, random.Random(n).randbytes(MiB))
+    disk.add_file('disk:/Stop/z.txt', b'placed last')
+    disk.chunk_delay = 0.2
+    site, gate = tmp_path / 'site', tmp_path / 'gate'
+    site.mkdir()
+    gate.mkdir()
+    (site / 'sitecustomize.py').write_text(_FSYNC_GATE)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
+    monkeypatch.setenv('FSYNC_GATE', str(gate))
+    child = _start_download('disk:/Stop', str(dest))
+    try:
+        _wait_until(
+            lambda: sum(p.stat().st_size >= 64 * 1024 for p in _partials(dest)) == len(slow),
+            child,
+            'wrote a chunk of every slow file',
+        )
+        # z.txt fails as it is finished, which stops the run; each slow file's checkpoint then hangs in its fsync.
+        (gate / 'go').touch()
+        _wait_until(lambda: len(list(gate.glob('blocked-*'))) == len(slow), child, 'checkpointed the cancelled files')
+        child.send_signal(signal.SIGINT)
+        time.sleep(0.5)
+        (gate / 'release').touch()
+        _, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    assert child.returncode == 130, stderr
+    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, MiB, 0, None)] * len(slow)
+
+
+@pytest.mark.parametrize(
+    ('size', 'args', 'ranges', 'peak'),
+    [
+        (4 * MiB, SEGMENTED_ARGS, SEGMENT_RANGES, 4),
+        (4 * MiB, (*SEGMENTED_ARGS, '--download-connections', '2'), SEGMENT_RANGES, 2),
+        (4 * MiB, (*SEGMENTED_ARGS, '--download-connections', '1'), SEGMENT_RANGES, 1),
+        (1 * MiB, SEGMENTED_ARGS, [None], 1),
+        (4 * MiB, (*SEGMENTED_ARGS, '--download-segments', '1'), [None], 1),
+    ],
+    ids=['four-segments', 'two-connections', 'one-connection', 'at-the-threshold', 'one-segment'],
+)
+def test_a_file_above_the_segment_threshold_is_fetched_as_parallel_segments_tiling_it(
+    disk, dest, size, args, ranges, peak
+):
+    content = random.Random(17).randbytes(size)
+    disk.add_file(SEGMENTED_PATH, content, modified=MODIFIED)
+    disk.chunk_delay = 0.02
+
+    result = _download(*args, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert f'Mirrored disk:/Seg to {dest}: 1 downloaded ({format_size(size)}), 0 skipped, 0 failed\n' in result.stdout
+    assert sorted(_fetches(disk, SEGMENTED_PATH), key=str) == ranges
+    assert disk.peak_content_in_flight == peak
+    assert _linked(disk) == [SEGMENTED_PATH]
+    local = dest / 'large.bin'
+    assert local.read_bytes() == content
+    assert local.stat().st_mtime_ns == _mtime_ns(MODIFIED)
+    assert _partials(dest) == []
+    assert _journal() == []
+
+
+def _segments_confirmed(at_least: int) -> bool:
+    journal = _journal()
+    return len(journal) == 4 and all(confirmed - start >= at_least for start, _, confirmed, _ in journal)
+
+
+def test_a_segmented_download_killed_midway_fetches_at_most_one_checkpoint_interval_per_segment_again(disk, dest):
+    path, content = 'disk:/Kill/k.bin', random.Random(19).randbytes(16 * MiB)
+    disk.add_file(path, content, modified=MODIFIED)
+    disk.chunk_delay = 0.25
+    ranges = [f'bytes={n * 4 * MiB}-{(n + 1) * 4 * MiB - 1}' for n in range(4)]
+    child = _start_download(
+        *SEGMENTED_ARGS, '--download-segments', '4', '--download-checkpoint-mib', '1', 'disk:/Kill', str(dest)
+    )
+    try:
+        _wait_until(lambda: _segments_confirmed(MiB), child, 'confirmed 1 MiB of every segment')
+        child.kill()
+        child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    journal = _journal()
+    assert [(start, end) for start, end, _, _ in journal] == [(n * 4 * MiB, (n + 1) * 4 * MiB) for n in range(4)]
+    served = {r.headers['range']: r for r in disk.requests if r.path == '/download'}
+    assert sorted(served) == sorted(ranges)
+    deadline = time.monotonic() + 10
+    while any(r.finished is None for r in served.values()) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    for (start, end, confirmed, digest), segment in zip(journal, ranges, strict=True):
+        assert start < confirmed < end
+        assert digest == hashlib.sha256(content[start:confirmed]).hexdigest()
+        # As for one stream: the interval, one chunk crossing it, one not yet written when the fsync began, and two
+        # sent but not yet read. A checkpoint another segment triggered only lowers this segment's share.
+        assert served[segment].finished is not None
+        assert served[segment].sent - (confirmed - start) <= MiB + 4 * 64 * 1024
+
+    disk.chunk_delay = 0
+    earlier = len(disk.requests)
+    result = _download(*SEGMENTED_ARGS, 'disk:/Kill', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert sorted(_fetches(disk, path, earlier)) == sorted(
+        f'bytes={confirmed}-{end - 1}' for _, end, confirmed, _ in journal
+    )
+    assert (dest / 'k.bin').read_bytes() == content
+
+
+def _each_segment_sent(fake, at_least: int) -> bool:
+    fetches = [r for r in fake.requests if r.path == '/download' and r.params['path'] == SEGMENTED_PATH]
+    return len(fetches) == 4 and all(r.sent >= at_least for r in fetches)
+
+
+def _interrupt_segmented(fake, dest) -> list[tuple[int, int, int, str | None]]:
+    """Start a segmented download of `SEGMENTED_PATH`, stop it with Ctrl+C once every segment has received some data,
+    and return its journal."""
+    fake.chunk_delay = 0.2
+    child = _start_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+    try:
+        _wait_until(lambda: _each_segment_sent(fake, 256 * 1024), child, 'sent 256 KiB of every segment')
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    assert child.returncode == 130, stderr
+    journal = _journal()
+    assert [(start, end) for start, end, _, _ in journal] == [(n * MiB, (n + 1) * MiB) for n in range(4)]
+    for start, end, confirmed, digest in journal:
+        assert start + 64 * 1024 <= confirmed < end
+        assert digest == hashlib.sha256(SEGMENTED[start:confirmed]).hexdigest()
+    return journal
+
+
+@pytest.mark.parametrize('change', ['none', 'tampered', 'fewer-segments'])
+def test_an_interrupted_segmented_download_resumes_each_segment_from_its_own_checkpoint(segmented, dest, change):
+    journal = _interrupt_segmented(segmented, dest)
+    [partial] = _partials(dest)
+    assert partial.stat().st_size == len(SEGMENTED)
+    resumed_from = {start: confirmed for start, _, confirmed, _ in journal}
+    args = list(SEGMENTED_ARGS)
+    if change == 'tampered':
+        second = journal[1][0]
+        held = bytearray(partial.read_bytes())
+        held[second + 1000] ^= 0xFF
+        partial.write_bytes(held)
+        resumed_from[second] = second
+    elif change == 'fewer-segments':
+        args += ['--download-segments', '1']
+    segmented.chunk_delay = 0
+    earlier = len(segmented.requests)
+
+    result = _download(*args, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier)) == sorted(
+        f'bytes={resumed_from[start]}-{end - 1}' for start, end, _, _ in journal
+    )
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def test_a_stalled_segment_alone_is_fetched_again_in_the_next_pass(segmented, dest):
+    segmented.inject(
+        'GET', '/download', STALL, where={'path': SEGMENTED_PATH}, where_headers={'range': SEGMENT_RANGES[2]}
+    )
+
+    result = _download('--download-timeout', STALL_TIMEOUT, *SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f'Mirrored disk:/Seg to {dest}: 1 downloaded ({format_size(len(SEGMENTED))}), 0 skipped, 0 failed\n'
+        'Passes: 2 of 7\n'
+    ) in result.stdout
+    fetches = _fetches(segmented, SEGMENTED_PATH)
+    assert sorted(fetches[:4]) == SEGMENT_RANGES
+    assert fetches[4:] == [SEGMENT_RANGES[2]]
+    assert _linked(segmented) == [SEGMENTED_PATH] * 2
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def test_a_segment_failing_for_good_fails_the_file_and_its_other_segments_keep_their_checkpoints(segmented, dest):
+    segmented.chunk_delay = 0.2
+    failing = SEGMENT_RANGES[2]
+    segmented.inject(
+        'GET',
+        '/download',
+        Delay(1, FakeResponse.error(404)),
+        where={'path': SEGMENTED_PATH},
+        where_headers={'range': failing},
+    )
+
+    result = _download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 1
+    assert f'Failed: 1\n  {SEGMENTED_PATH}: the download host 127.0.0.1 returned HTTP 404\n' in result.stdout
+    journal = _journal()
+    assert [(start, end) for start, end, _, _ in journal] == [(n * MiB, (n + 1) * MiB) for n in range(4)]
+    for position, (start, end, confirmed, digest) in enumerate(journal):
+        if position == 2:
+            assert (confirmed, digest) == (start, None)
+        else:
+            assert start < confirmed < end
+            assert digest == hashlib.sha256(SEGMENTED[start:confirmed]).hexdigest()
+    assert len(_partials(dest)) == 1
+
+    segmented.chunk_delay = 0
+    earlier = len(segmented.requests)
+    rerun = _download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier)) == sorted(
+        f'bytes={confirmed}-{end - 1}' for _, end, confirmed, _ in journal
+    )
+    assert failing in _fetches(segmented, SEGMENTED_PATH, earlier)
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def test_a_file_takes_its_download_link_only_once_it_holds_a_connection(segmented, dest):
+    segmented.add_file('disk:/Seg/small.txt', b'queued behind the segments', modified=MODIFIED)
+    segmented.chunk_delay = 0.05
+
+    result = _download(*SEGMENTED_ARGS, '--download-connections', '2', 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (dest / 'small.txt').read_bytes() == b'queued behind the segments'
+    [small_link] = [
+        r
+        for r in segmented.requests
+        if r.path == '/v1/disk/resources/download' and r.params['path'] == 'disk:/Seg/small.txt'
+    ]
+    first_segment = min(r.started for r in segmented.requests if r.path == '/download')
+    # Each segment takes 15 chunk delays; the small file's turn starts at once but waits for a connection first.
+    assert small_link.started - first_segment > 0.5
+
+
+def test_a_host_ignoring_the_range_of_a_segment_gets_the_file_as_one_stream(segmented, dest, monkeypatch):
+    segmented.ignore_range = True
+    monkeypatch.setattr(mirroring, '_PREALLOCATION_STEP', MiB)
+    lengths: list[int] = []
+    ends: list[int] = []
+    write, truncate = PartialFile.write, PartialFile.truncate
+
+    def recording_truncate(partial, length):
+        lengths.append(length)
+        truncate(partial, length)
+
+    def recording_write(partial, offset, chunk):
+        ends.append(offset + len(chunk))
+        write(partial, offset, chunk)
+
+    monkeypatch.setattr(PartialFile, 'truncate', recording_truncate)
+    monkeypatch.setattr(PartialFile, 'write', recording_write)
+
+    result = _download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+    fetches = _fetches(segmented, SEGMENTED_PATH)
+    assert fetches[-1] is None
+    assert fetches[:-1]
+    assert set(fetches[:-1]) <= set(SEGMENT_RANGES)
+    assert lengths == [MiB, 2 * MiB, 3 * MiB, 4 * MiB, 0]
+    assert max(ends) == len(SEGMENTED)
+    assert _journal() == []
+
+
+FAST_API = api.ApiLimits(interval=0.001, concurrency=7, timeout=5, retries=0, backoff_initial=0.001, backoff_max=0.01)
+POLICY = mirroring.TransferPolicy(retries=0, checkpoint_bytes=32 * 2**20, segments=4, segment_threshold=256 * 2**20)
+
+
+@asynccontextmanager
+async def _mirror_run(
+    fake, root: str, dest, policy: mirroring.TransferPolicy = POLICY
+) -> AsyncIterator[Callable[[], Awaitable[MirrorReport]]]:
+    """Scan `root` in this event loop, then yield a call running the mirror run of `root` into `dest` here too, with
+    real clients, the real manifest and a real destination, fetching as `policy` says."""
+    async with (
+        api.DiskClient(TOKEN, base_url=fake.base_url, limits=FAST_API) as client,
+        api.ContentClient(timeout=5, connections=20) as content,
+    ):
+        account = await client.account()
+        scan_root = await resolve_scan_root(client, root)
+        with Manifest.open(manifest_path()) as manifest, Destination.open(dest) as destination:
+            await scan_tree(client, manifest, account, scan_root)
+            run = MirrorRun(manifest.mirror(account.uid, scan_root.path, destination.path), destination)
+            yield lambda: run.run(client, content, policy, passes=1)
+
+
+async def _until(condition: Callable[[], bool], what: str) -> None:
+    deadline = time.monotonic() + 10
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail(f'never {what}')
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_run_waits_for_the_write_in_flight_before_closing_the_partial_file(big, dest, monkeypatch):
+    big.chunk_delay = 0.01
+    blocked, release = threading.Event(), threading.Event()
+    written: list[bytes] = []
+    open_after_write: list[os.stat_result] = []
+    write = PartialFile.write
+
+    def blocking_write(partial, offset, chunk):
+        if written:
+            blocked.set()
+            release.wait(5)
+        write(partial, offset, chunk)
+        written.append(chunk)
+        open_after_write.append(os.fstat(partial._fd))
+
+    monkeypatch.setattr(PartialFile, 'write', blocking_write)
+    async with _mirror_run(big, 'disk:/Big', dest) as run:
+        task = asyncio.create_task(run())
+        await _until(blocked.is_set, 'blocked in the second write')
+        task.cancel()
+        await asyncio.sleep(0.3)
+        finished_while_blocked = task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert not finished_while_blocked
+    assert len(written) == 2
+    [partial] = _partials(dest)
+    assert [stat.st_ino for stat in open_after_write] == [partial.stat().st_ino] * 2
+    assert partial.read_bytes() == BIG[: len(written[0]) + len(written[1])]
+
+
+@pytest.mark.anyio
+async def test_the_event_loop_keeps_running_while_a_local_copy_is_hashed(disk, dest, monkeypatch):
+    copy = random.Random(11).randbytes(8 * 1024 * 1024)
+    disk.add_file('disk:/Hash/copy.bin', copy, modified=MODIFIED)
+    dest.mkdir()
+    (dest / 'copy.bin').write_bytes(copy)
+    reads: list[float] = []
+    read = localfs.read
+
+    def slow_read(fd, size, offset):
+        reads.append(time.monotonic())
+        time.sleep(0.05)
+        chunk = read(fd, size, offset)
+        reads.append(time.monotonic())
+        return chunk
+
+    monkeypatch.setattr(localfs, 'read', slow_read)
+    ticks: list[float] = []
+
+    async def tick() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    async with _mirror_run(disk, 'disk:/Hash', dest) as run:
+        ticker = asyncio.create_task(tick())
+        try:
+            report = await run()
+        finally:
+            ticker.cancel()
+
+    assert report.adopted == ['disk:/Hash/copy.bin']
+    assert len(reads) > 16
+    hashing_began, hashing_ended = reads[0], reads[-1]
+    wakeups = [hashing_began, *(t for t in ticks if hashing_began < t < hashing_ended), hashing_ended]
+    assert max(later - earlier for earlier, later in itertools.pairwise(wakeups)) < 0.2
+
+
+@pytest.mark.anyio
+async def test_a_file_downloads_while_another_ones_local_copy_is_hashed(disk, dest, monkeypatch):
+    copy = random.Random(13).randbytes(8 * 1024 * 1024)
+    disk.add_file('disk:/Overlap/a-copy.bin', copy, modified=MODIFIED)
+    disk.add_file('disk:/Overlap/b-fetched.bin', b'fetched meanwhile', modified=MODIFIED)
+    dest.mkdir()
+    (dest / 'a-copy.bin').write_bytes(copy)
+    reads: list[tuple[float, float]] = []
+    read = localfs.read
+
+    def slow_read(fd, size, offset):
+        began = time.monotonic()
+        time.sleep(0.1)
+        chunk = read(fd, size, offset)
+        reads.append((began, time.monotonic()))
+        return chunk
+
+    monkeypatch.setattr(localfs, 'read', slow_read)
+    async with _mirror_run(disk, 'disk:/Overlap', dest) as run:
+        report = await run()
+
+    assert report.adopted == ['disk:/Overlap/a-copy.bin']
+    assert report.downloaded == 1
+    assert (dest / 'b-fetched.bin').read_bytes() == b'fetched meanwhile'
+    [fetch] = [r for r in disk.requests if r.path == '/download']
+    assert reads[0][0] < fetch.started
+    assert fetch.finished < reads[-1][1]
+
+
+@pytest.mark.anyio
+async def test_a_file_cancelled_while_a_segment_meets_an_ignored_range_keeps_its_segments(segmented, dest, monkeypatch):
+    segmented.chunk_delay = 0.1
+    segmented.inject(
+        'GET',
+        '/download',
+        Delay(0.5, FakeResponse(200)),
+        where={'path': SEGMENTED_PATH},
+        where_headers={'range': SEGMENT_RANGES[3]},
+    )
+    release = threading.Event()
+    blocked: list[int] = []
+    writes: dict[int, int] = {}
+    write = PartialFile.write
+
+    def write_one_chunk_per_segment(partial, offset, chunk):
+        segment = offset // MiB
+        writes[segment] = writes.get(segment, 0) + 1
+        if writes[segment] > 1:
+            blocked.append(segment)
+            release.wait(10)
+        write(partial, offset, chunk)
+
+    monkeypatch.setattr(PartialFile, 'write', write_one_chunk_per_segment)
+
+    def checkpointed_the_first_chunks() -> bool:
+        received = [confirmed - start for start, _, confirmed, _ in _journal()]
+        return len(received) == 4 and all(received[:3]) and received[3] == 0
+
+    async with _mirror_run(segmented, 'disk:/Seg', dest, replace(POLICY, segment_threshold=MiB)) as run:
+        task = asyncio.create_task(run())
+        await _until(checkpointed_the_first_chunks, 'checkpointed after the ignored range')
+        await asyncio.sleep(0.1)
+        task.cancel()
+        await asyncio.sleep(0.1)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert sorted(blocked) == [0, 1, 2]
+    assert None not in _fetches(segmented, SEGMENTED_PATH)
+    assert [(start, end) for start, end, _, _ in _journal()] == [(n * MiB, (n + 1) * MiB) for n in range(4)]
+    [partial] = _partials(dest)
+    assert partial.stat().st_size == len(SEGMENTED)
+    assert not (dest / 'large.bin').exists()
+
+
+@pytest.mark.anyio
+async def test_segments_meeting_an_expired_link_share_one_refresh(segmented, dest):
+    segmented.chunk_delay = 0.1
+    cut = 512 * 1024
+    first, last = SEGMENT_RANGES[0], SEGMENT_RANGES[3]
+    resumed = [f'bytes={cut}-{MiB - 1}', f'bytes={3 * MiB + cut}-{4 * MiB - 1}']
+    # Both cut segments resume on the expired link before either learns it has expired, the first one earlier.
+    for segment, resumed_segment, wait in ((first, resumed[0], 0.3), (last, resumed[1], 0.6)):
+        where = {'path': SEGMENTED_PATH}
+        segmented.inject('GET', '/download', Truncate(after_bytes=cut), where=where, where_headers={'range': segment})
+        segmented.inject('GET', '/download', Delay(wait), where=where, where_headers={'range': resumed_segment})
+    policy = replace(POLICY, retries=5, segment_threshold=MiB)
+
+    async with _mirror_run(segmented, 'disk:/Seg', dest, policy) as run:
+        task = asyncio.create_task(run())
+        await _until(lambda: len(_fetches(segmented, SEGMENTED_PATH)) == 4, 'started every segment')
+        segmented.expire_links()
+        report = await task
+
+    assert report.failed == []
+    assert report.downloaded == 1
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+    assert _linked(segmented) == [SEGMENTED_PATH] * 2
+    later = [r for r in segmented.requests if r.path == '/download'][4:]
+    assert sorted((r.params['link'], r.headers['range']) for r in later) == sorted(
+        [
+            ('1', resumed[0]),
+            ('1', resumed[1]),
+            ('2', resumed[0]),
+            ('2', resumed[1]),
+        ]
+    )
