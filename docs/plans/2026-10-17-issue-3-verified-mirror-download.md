@@ -776,6 +776,11 @@ Three cases abort the run (exit 1):
       failed with their last reason and `(after N passes)` when N > 1, plus a line
       `Passes: <used> of <limit>`. A short pause between passes (e.g. 5 s, interruptible) avoids
       hammering a broken host.
+    - **As built (5c68fab), accepted by main:** link refresh is once per *pass* (each pass fetches a
+      fresh link anyway); there is no backoff inside a turn (retries only follow progress, and
+      `Retry-After` stretches the pause between passes instead); retry exhaustion is tested with
+      repeated `Truncate` cuts rather than 503s (a 503 brings no bytes, so it defers to the next
+      pass); the changed-in-cloud message suggests `--scan-max-age 0`.
 - **Behaviour to lock:** extend `tests/test_download.py`:
   - **Stall timeout.** A `Delay` before the first byte longer than `download_timeout` fails as
     stalled; a slow-but-steady body (`chunk_delay` below the timeout, total time well above it)
