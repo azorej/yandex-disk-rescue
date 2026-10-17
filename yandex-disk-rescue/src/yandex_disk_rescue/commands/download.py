@@ -50,6 +50,7 @@ def download(
     download_timeout: settings.DownloadTimeout = settings.DOWNLOAD_TIMEOUT.default,
     download_retries: settings.DownloadRetries = settings.DOWNLOAD_RETRIES.default,
     download_passes: settings.DownloadPasses = settings.DOWNLOAD_PASSES.default,
+    download_connections: settings.DownloadConnections = settings.DOWNLOAD_CONNECTIONS.default,
     api_interval_ms: settings.ApiIntervalMs = settings.API_INTERVAL_MS.default,
     api_concurrency: settings.ApiConcurrency = settings.API_CONCURRENCY.default,
     api_timeout: settings.ApiTimeout = settings.API_TIMEOUT.default,
@@ -75,7 +76,12 @@ def download(
                 base_url=api_url,
                 limits=limits,
                 scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
-                transfers=_Transfers(timeout=download_timeout, retries=download_retries, passes=download_passes),
+                transfers=_Transfers(
+                    timeout=download_timeout,
+                    retries=download_retries,
+                    passes=download_passes,
+                    connections=download_connections,
+                ),
                 manifest_path=manifest_path,
             )
         )
@@ -136,11 +142,12 @@ class _ScanPolicy:
 @dataclass(frozen=True)
 class _Transfers:
     """How files are fetched: the stall timeout in seconds, the immediate retries after new data, the passes (0: no
-    limit)."""
+    limit), the requests to the download host in flight at most."""
 
     timeout: int
     retries: int
     passes: int
+    connections: int
 
 
 async def _run(
@@ -174,5 +181,5 @@ async def _mirror(
 ) -> MirrorReport:
     files = 'file' if run.pending_files == 1 else 'files'
     typer.echo(f'Downloading {run.pending_files} {files} ({format_size(run.pending_size)}) to {destination.path}')
-    async with api.ContentClient(timeout=transfers.timeout) as content:
+    async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
         return await run.run(client, content, retries=transfers.retries, passes=transfers.passes)

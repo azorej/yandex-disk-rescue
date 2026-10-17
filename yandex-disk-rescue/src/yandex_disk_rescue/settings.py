@@ -112,6 +112,12 @@ DOWNLOAD_PASSES = Setting(
     'transiently (a stall, a connection error, a 5xx); 0 passes until every file is done.',
     _in_range(0, 1000),
 )
+DOWNLOAD_CONNECTIONS = Setting(
+    'download_connections',
+    20,
+    'Maximum number of requests to the download host in flight, and so of files downloading at once.',
+    _in_range(1, 64),
+)
 SCAN_MAX_AGE = Setting(
     'scan_max_age',
     60,
@@ -137,6 +143,7 @@ SETTINGS: dict[str, Setting[Any]] = {
         DOWNLOAD_TIMEOUT,
         DOWNLOAD_RETRIES,
         DOWNLOAD_PASSES,
+        DOWNLOAD_CONNECTIONS,
         SCAN_MAX_AGE,
         CLIENT_ID,
     )
@@ -150,6 +157,7 @@ ApiUrl = Annotated[str, API_URL.typer_option()]
 DownloadTimeout = Annotated[int, DOWNLOAD_TIMEOUT.typer_option()]
 DownloadRetries = Annotated[int, DOWNLOAD_RETRIES.typer_option()]
 DownloadPasses = Annotated[int, DOWNLOAD_PASSES.typer_option()]
+DownloadConnections = Annotated[int, DOWNLOAD_CONNECTIONS.typer_option()]
 ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 

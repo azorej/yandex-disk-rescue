@@ -174,11 +174,14 @@ yandex-disk-rescue download disk:/Photos ~/Photos    # one folder
 `download [REMOTE_PATH] DEST` first scans REMOTE_PATH (default `disk:/`)
 exactly as [`scan`](#scanning-a-folder) does and prints the scan summary,
 unless a recent scan covers it (below). It then mirrors that folder into
-DEST, one file at a time: the folder structure is kept, empty folders are
-created, and every file gets the modification time it has on the Disk. It
-takes the `--api-*` options, `--download-timeout`, `--download-retries`,
-`--download-passes` and `--scan-max-age` (see [Configuration](#configuration)),
-and `--no-scan`.
+DEST, with up to `download_connections` files (default 20) downloading at
+once, started in path order: the folder structure is kept, each folder is
+created before anything inside it, empty folders are created, and every file
+gets the modification time it has on the Disk. It takes the `--api-*`
+options, `--download-timeout`, `--download-retries`, `--download-passes`,
+`--download-connections` and `--scan-max-age` (see
+[Configuration](#configuration)), and `--no-scan`. A file whose download host
+never answers holds one connection until it stalls and delays no other file.
 
 **When it scans.** `download` reuses the last completed scan of the account
 covering REMOTE_PATH — a scan of REMOTE_PATH itself or of a folder above it,
@@ -238,9 +241,9 @@ kept.
   arrives (a stall before the first byte, a refused connection, `408`, `429`
   or `5xx`) is not retried at once.
 - **Passes.** Files whose download failed that way, or ran out of retries,
-  are resumed in another pass over the files still to download, each with a
-  new download link, after a 5 s pause (longer when the host sent
-  `Retry-After`, up to 300 s). A run makes at most `download_passes` passes
+  are resumed in another pass over the files still to download, again up to
+  `download_connections` at once, each with a new download link, after a 5 s
+  pause (longer when the host sent `Retry-After`, up to 300 s). A run makes at most `download_passes` passes
   (`0`: until every file is done or Ctrl+C); a file still failing after the
   last one is reported with its last reason and `(after N passes)`. Once a
   file needed another pass, the summary shows `Passes: <used> of <limit>`. A
@@ -271,7 +274,8 @@ Failed: 1
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 ```
 
-Each list shows at most 20 entries, then `… and N more`. When anything
+Every list is in path order, whatever the order the files finished in, and
+shows at most 20 entries, then `… and N more`. When anything
 failed, the run ends with `Error: N failed; see the list above.` and exit
 code `1`; a rerun retries exactly what is not verified yet.
 
@@ -326,8 +330,9 @@ read, write or search permission — fails only the entries it affects, with
 as it was.
 
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
-that persists past the API retries (an outage), stop the run; files already
-verified stay verified, and a rerun picks up where it stopped. Ctrl+C prints
+that persists past the API retries (an outage), stop the run: the files still
+in progress stop too, only the first error is shown, files already verified
+stay verified, and a rerun picks up where it stopped. Ctrl+C prints
 `Interrupted; rerun to continue the download.` and exits with 130; partial
 files are kept, and the next run resumes them.
 
@@ -368,6 +373,16 @@ entry whose local name differs from its Disk name.
 Paths have no length limit: every folder and file is created and opened
 relative to its parent folder's descriptor, one name at a time, so a tree
 deeper than the filesystem's `PATH_MAX` is mirrored like any other.
+
+### Tuning
+
+`download_connections` caps the requests to the download host in flight, and
+so the files downloading at once (one connection each). Link requests and
+look-ups go to the Disk API and are paced separately, by `api_interval_ms`
+and `api_concurrency` (see [Rate limiting](#rate-limiting)).
+
+Many files written at once make a hard disk seek between them. On a USB hard
+disk, start around 8 connections and raise them while the throughput grows.
 
 ## Exit codes
 
@@ -422,6 +437,7 @@ first one that sets it wins:
 | `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `15` | 1 to 600 (s); a download with no data from the host for this long has stalled |
 | `download_retries` | `--download-retries` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | `5` | 0 to 20; immediate resumes of a download that failed after new data |
 | `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until all are done |
+| `download_connections` | `--download-connections` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | `20` | 1 to 64; requests to the download host in flight, and so files downloading at once |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 

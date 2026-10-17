@@ -61,7 +61,7 @@ async def _fetch(
     fake_disk_api, partial: PartialFile, *, start: int = 0, end: int = SIZE, size: int = SIZE, timeout: float = 5
 ) -> str:
     href = await _link(fake_disk_api)
-    async with api.ContentClient(timeout=timeout) as content:
+    async with api.ContentClient(timeout=timeout, connections=1) as content:
         await content.fetch(href, start=start, end=end, size=size, write=partial.write)
     return href
 
@@ -104,7 +104,7 @@ async def test_an_empty_file_is_fetched_without_a_range(fake_disk_api, partial):
     fake_disk_api.add_file('disk:/empty', b'')
     href = await _link(fake_disk_api, 'disk:/empty')
 
-    async with api.ContentClient(timeout=5) as content:
+    async with api.ContentClient(timeout=5, connections=1) as content:
         await content.fetch(href, start=0, end=0, size=0, write=partial.write)
 
     assert partial.offsets == []
@@ -149,7 +149,7 @@ async def test_an_expired_link_names_its_status_and_a_new_link_works(fake_disk_a
     old = await _link(fake_disk_api)
     fake_disk_api.expire_links(status)
 
-    async with api.ContentClient(timeout=5) as content:
+    async with api.ContentClient(timeout=5, connections=1) as content:
         with pytest.raises(api.LinkExpiredError) as excinfo:
             await content.fetch(old, start=0, end=SIZE, size=SIZE, write=partial.write)
         await content.fetch(await _link(fake_disk_api), start=0, end=SIZE, size=SIZE, write=partial.write)
@@ -266,7 +266,7 @@ async def test_a_slow_but_steady_body_never_trips_the_stall_timeout(fake_disk_ap
     fake_disk_api.chunk_delay = 0.1
     href = await _link(fake_disk_api, 'disk:/slow.bin')
 
-    async with api.ContentClient(timeout=1.5) as content:
+    async with api.ContentClient(timeout=1.5, connections=1) as content:
         began = time.monotonic()
         await content.fetch(href, start=0, end=len(slow), size=len(slow), write=partial.write)
         elapsed = time.monotonic() - began
@@ -281,7 +281,7 @@ async def test_time_spent_writing_does_not_count_against_the_stall_timeout(fake_
         await partial.write(offset, chunk)
 
     href = await _link(fake_disk_api)
-    async with api.ContentClient(timeout=0.2) as content:
+    async with api.ContentClient(timeout=0.2, connections=1) as content:
         await content.fetch(href, start=0, end=SIZE, size=SIZE, write=slow_write)
 
     assert partial.read() == CONTENT
@@ -298,7 +298,7 @@ async def test_an_error_from_write_propagates_and_no_further_chunk_is_written(fa
         await partial.write(offset, chunk)
 
     href = await _link(fake_disk_api)
-    async with api.ContentClient(timeout=5) as content:
+    async with api.ContentClient(timeout=5, connections=1) as content:
         with pytest.raises(DiskFull):
             await content.fetch(href, start=0, end=SIZE, size=SIZE, write=write_once)
 
@@ -310,7 +310,7 @@ async def test_an_error_from_write_propagates_and_no_further_chunk_is_written(fa
 async def test_an_unreachable_host_is_transient_and_hides_the_link(closed_port_url, partial):
     href = f'{closed_port_url}/disk/s3cr3t-signature?tknv=s3cr3t-query'
 
-    async with api.ContentClient(timeout=5) as content:
+    async with api.ContentClient(timeout=5, connections=1) as content:
         with pytest.raises(api.TransientTransferError) as excinfo:
             await content.fetch(href, start=0, end=10, size=10, write=partial.write)
 
@@ -332,10 +332,36 @@ def test_the_download_host_refuses_a_token(fake_disk_api):
 
 @pytest.mark.parametrize(('start', 'end', 'size'), [(-1, 10, 10), (5, 5, 10), (5, 11, 10), (6, 5, 10), (0, 0, 10)])
 async def test_an_invalid_range_is_a_programming_error(fake_disk_api, partial, start, end, size):
-    async with api.ContentClient(timeout=5) as content:
+    async with api.ContentClient(timeout=5, connections=1) as content:
         with pytest.raises(ValueError, match='invalid range'):
             await content.fetch(
                 f'{fake_disk_api.base_url}/download', start=start, end=end, size=size, write=partial.write
             )
 
     assert fake_disk_api.requests == []
+
+
+async def test_fetches_over_the_connection_cap_wait_for_a_free_one_without_stalling(fake_disk_api, tmp_path):
+    fake_disk_api.token = TOKEN
+    bodies = {f'disk:/f{n}.bin': random.Random(n).randbytes(16 * 64 * 1024) for n in range(5)}
+    for path, body in bodies.items():
+        fake_disk_api.add_file(path, body)
+    links = {path: await _link(fake_disk_api, path) for path in bodies}
+    targets = {path: PartialFile(tmp_path / path.removeprefix('disk:/')) for path in bodies}
+    fake_disk_api.chunk_delay = 0.1
+
+    try:
+        async with api.ContentClient(timeout=1, connections=2) as content, asyncio.TaskGroup() as group:
+            for path, body in bodies.items():
+                group.create_task(
+                    content.fetch(links[path], start=0, end=len(body), size=len(body), write=targets[path].write)
+                )
+    finally:
+        for target in targets.values():
+            target.close()
+
+    assert content.connections == 2
+    assert all(targets[path].read() == body for path, body in bodies.items())
+    assert fake_disk_api.peak_content_in_flight == 2
+    requests = sorted(_content_requests(fake_disk_api), key=lambda r: r.started)
+    assert requests[-1].started - requests[0].started > 1

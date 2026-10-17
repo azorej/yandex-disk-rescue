@@ -690,6 +690,34 @@ def test_a_hard_link_to_another_verified_file_is_never_replaced(disk, dest):
         assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
+def test_hard_linked_untracked_copies_handled_at_once_adopt_only_one(disk, tmp_path, monkeypatch):
+    disk.add_file('disk:/Pair/a.bin', b'same bytes')
+    disk.add_file('disk:/Pair/b.bin', b'same bytes')
+
+    for attempt in range(20):
+        monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / f'state-{attempt}'))
+        dest = tmp_path / f'dest-{attempt}'
+        dest.mkdir()
+        (dest / 'a.bin').write_bytes(b'same bytes')
+        os.link(dest / 'a.bin', dest / 'b.bin')
+
+        result = _download('disk:/Pair', str(dest))
+
+        assert result.exit_code == 1, result.output
+        match = re.search(r'Already on disk and verified: 1\n  disk:/Pair/(\w)\.bin\n', result.stdout)
+        assert match is not None, result.stdout
+        adopted, other = match[1], {'a': 'b', 'b': 'a'}[match[1]]
+        assert (
+            f'Failed: 1\n  disk:/Pair/{other}.bin: {other}.bin is the same file as disk:/Pair/{adopted}.bin on this '
+            'filesystem; it was left untouched\n'
+        ) in result.stdout
+        assert ', 1 skipped, 1 failed\n' in result.stdout
+        assert (dest / 'a.bin').stat().st_ino == (dest / 'b.bin').stat().st_ino
+        assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+        with closing(sqlite3.connect(manifest_path())) as connection:
+            assert connection.execute("SELECT count(*) FROM downloads WHERE state = 'verified'").fetchone() == (1,)
+
+
 @pytest.mark.parametrize(
     ('status', 'reason'),
     [
@@ -921,6 +949,8 @@ def test_a_destination_mirrors_one_remote_folder(disk, dest):
         ('--download-timeout', '0', '1 to 600'),
         ('--download-retries', '99', '0 to 20'),
         ('--download-passes', '1001', '0 to 1000'),
+        ('--download-connections', '0', '1 to 64'),
+        ('--download-connections', '65', '1 to 64'),
     ],
 )
 def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, flag, value, valid):
@@ -987,14 +1017,16 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
     assert result.exit_code == 1
     assert result.stderr == f'Error: Could not write {dest / "top.txt"}: {os.strerror(code)}.\n'
     assert 'Mirrored' not in result.stdout
-    assert _others_verified(dest, 'disk:/top.txt')
     assert not (dest / 'top.txt').exists()
 
     monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
     rerun = _download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
-    assert f'Mirrored disk:/ to {dest}: 1 downloaded (0 B), 5 skipped, 0 failed\n' in rerun.stdout
+    assert re.search(
+        rf'Mirrored disk:/ to {re.escape(str(dest))}: \d+ downloaded \(.+\), \d+ skipped, 0 failed\n', rerun.stdout
+    )
+    assert _others_verified(dest, failed='')
 
 
 def _refuse(monkeypatch, call: str, code: int, refused: Callable[[str | int], bool]) -> None:
@@ -1017,8 +1049,8 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
     result = _download(str(dest))
 
     assert result.exit_code == 1
-    [partial] = _partials(dest)
-    assert result.stderr == f'Error: Could not write {partial}: {os.strerror(code)}.\n'
+    partials = _partials(dest)
+    assert result.stderr in {f'Error: Could not write {partial}: {os.strerror(code)}.\n' for partial in partials}
     assert 'Mirrored' not in result.stdout
 
 
@@ -1067,6 +1099,47 @@ def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(dis
     assert f'Failed: 1\n  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' in result.stdout
     assert _fetches(disk, path) == [None]
     assert _others_verified(dest, path)
+
+
+def test_dead_files_do_not_hold_up_the_healthy_ones(disk, dest):
+    dead = [f'disk:/Mixed/a-dead{n}.bin' for n in range(3)]
+    healthy = [f'disk:/Mixed/b-healthy{n:02}.bin' for n in range(12)]
+    for path in dead + healthy:
+        disk.add_file(path, path.encode() * 100)
+    for path in dead:
+        disk.inject('GET', '/download', STALL, where={'path': path})
+
+    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', 'disk:/Mixed', str(dest))
+
+    assert result.exit_code == 1
+    stalled = ''.join(f'  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' for path in dead)
+    assert f'12 downloaded ({format_size(sum(len(p) * 100 for p in healthy))}), 0 skipped, 3 failed\n' in result.stdout
+    assert f'Passes: 1 of 1\nFailed: 3\n{stalled}' in result.stdout
+    assert all(_local(dest, path.replace('Mixed/', '')).read_bytes() == path.encode() * 100 for path in healthy)
+    started = {r.params['path']: r.started for r in disk.requests if r.path == '/download'}
+    first_dead = min(started[path] for path in dead)
+    assert max(started[path] for path in healthy) - first_dead < float(STALL_TIMEOUT)
+
+
+def test_throughput_scales_with_the_connection_cap_and_never_passes_it(disk, tmp_path):
+    for n in range(8):
+        disk.add_file(f'disk:/Load/f{n}.bin', random.Random(n).randbytes(10 * 64 * 1024))
+    disk.chunk_delay = 0.05
+    spans = {}
+
+    for cap in (1, 4):
+        disk.peak_content_in_flight = 0
+        earlier = len(disk.requests)
+
+        result = _download('--download-connections', str(cap), 'disk:/Load', str(tmp_path / f'dest-{cap}'))
+
+        assert result.exit_code == 0, result.output
+        assert disk.peak_content_in_flight == cap
+        content = [r for r in disk.requests[earlier:] if r.path == '/download']
+        assert len(content) == 8
+        spans[cap] = max(r.finished for r in content) - min(r.started for r in content)
+
+    assert spans[4] < spans[1] / 2
 
 
 def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, dest):
@@ -1322,7 +1395,7 @@ async def _mirror_run(fake, root: str, dest) -> AsyncIterator[Callable[[], Await
     real clients, the real manifest and a real destination."""
     async with (
         api.DiskClient(TOKEN, base_url=fake.base_url, limits=FAST_API) as client,
-        api.ContentClient(timeout=5) as content,
+        api.ContentClient(timeout=5, connections=20) as content,
     ):
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
@@ -1409,3 +1482,32 @@ async def test_the_event_loop_keeps_running_while_a_local_copy_is_hashed(disk, d
     assert len(reads) > 8
     wakeups = [began, *ticks, ended]
     assert max(later - earlier for earlier, later in itertools.pairwise(wakeups)) < 0.2
+
+
+@pytest.mark.anyio
+async def test_a_file_downloads_while_another_ones_local_copy_is_hashed(disk, dest, monkeypatch):
+    copy = random.Random(13).randbytes(8 * 1024 * 1024)
+    disk.add_file('disk:/Overlap/a-copy.bin', copy, modified=MODIFIED)
+    disk.add_file('disk:/Overlap/b-fetched.bin', b'fetched meanwhile', modified=MODIFIED)
+    dest.mkdir()
+    (dest / 'a-copy.bin').write_bytes(copy)
+    reads: list[tuple[float, float]] = []
+    read = localfs.read
+
+    def slow_read(fd, size, offset):
+        began = time.monotonic()
+        time.sleep(0.1)
+        chunk = read(fd, size, offset)
+        reads.append((began, time.monotonic()))
+        return chunk
+
+    monkeypatch.setattr(localfs, 'read', slow_read)
+    async with _mirror_run(disk, 'disk:/Overlap', dest) as run:
+        report = await run()
+
+    assert report.adopted == ['disk:/Overlap/a-copy.bin']
+    assert report.downloaded == 1
+    assert (dest / 'b-fetched.bin').read_bytes() == b'fetched meanwhile'
+    [fetch] = [r for r in disk.requests if r.path == '/download']
+    assert reads[0][0] < fetch.started
+    assert fetch.finished < reads[-1][1]

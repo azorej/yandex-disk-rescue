@@ -17,7 +17,7 @@ runner = CliRunner()
 TOKEN = 'y0_AgAAAAB-config-sentinel-token'
 OPTIONS = (
     'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, download_retries, '
-    'download_passes, scan_max_age, client_id'
+    'download_passes, download_connections, scan_max_age, client_id'
 )
 
 
@@ -147,6 +147,7 @@ def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, ag
         ('download_timeout = 0\n', 'download_timeout: must be an integer from 1 to 600.'),
         ('download_retries = 21\n', 'download_retries: must be an integer from 0 to 20.'),
         ('download_passes = -1\n', 'download_passes: must be an integer from 0 to 1000.'),
+        ('download_connections = 65\n', 'download_connections: must be an integer from 1 to 64.'),
         ('scan_max_age = 10081\n', 'scan_max_age: must be an integer from 0 to 10080.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
@@ -185,3 +186,16 @@ def test_a_config_path_that_is_a_directory_is_a_usage_error(tmp_path):
 
     assert result.exit_code == 2
     assert result.stderr == f'Error: config file {tmp_path}: cannot be read: Is a directory.\n'
+
+
+def test_download_reads_its_connection_cap_from_the_config_file(disk, tmp_path):
+    _write_default_config('download_connections = 1\n')
+    for name in 'ABCD':
+        disk.add_file(f'disk:/{name}/file.txt', name.encode() * 3 * 64 * 1024)
+    disk.chunk_delay = 0.05
+
+    result = runner.invoke(app, ['download', str(tmp_path / 'dest')])
+
+    assert result.exit_code == 0, result.output
+    assert len([r for r in disk.requests if r.path == '/download']) == 4
+    assert disk.peak_content_in_flight == 1

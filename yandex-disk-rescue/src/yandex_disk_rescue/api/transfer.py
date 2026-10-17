@@ -4,6 +4,7 @@ It owns no file I/O: bytes go to an async `write(offset, chunk)` callback. It ne
 error reasons never include a link's path or query string, which carry the link's signature.
 """
 
+import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -60,11 +61,26 @@ class ContentClient:
     `timeout` (seconds) is a stall timeout: a fetch fails when connecting, or any wait for data (the response
     headers or the next piece of the body), takes longer. A slow but steady transfer never trips it, and time spent
     in the `write` callback does not count.
+
+    At most `connections` fetches are in flight, each from its first request (redirects included) until its body
+    ends or fails; a fetch over the cap waits for a free one, and that wait does not count toward the stall timeout
+    either. The connection pool itself never makes a request wait.
     """
 
-    def __init__(self, *, timeout: float) -> None:
+    def __init__(self, *, timeout: float, connections: int) -> None:
         self._timeout = timeout
-        self._http = httpx.AsyncClient(follow_redirects=True, timeout=timeout, headers={'Accept-Encoding': 'identity'})
+        self._connections = connections
+        self._slots = asyncio.Semaphore(connections)
+        self._http = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            limits=httpx.Limits(max_connections=None, max_keepalive_connections=connections),
+            headers={'Accept-Encoding': 'identity'},
+        )
+
+    @property
+    def connections(self) -> int:
+        return self._connections
 
     async def __aenter__(self) -> Self:
         return self
@@ -88,7 +104,7 @@ class ContentClient:
             raise ValueError(f'invalid range [{start}, {end}) of a {size}-byte file')
         headers = {} if whole else {'Range': f'bytes={start}-{end - 1}'}
         try:
-            async with self._http.stream('GET', href, headers=headers) as response:
+            async with self._slots, self._http.stream('GET', href, headers=headers) as response:
                 _check_response(response, start=start, end=end, size=size, ranged=not whole)
                 await _write_body(response, start=start, end=end, write=write)
         except httpx.TimeoutException:

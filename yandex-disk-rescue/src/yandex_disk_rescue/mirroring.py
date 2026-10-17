@@ -15,6 +15,10 @@ that fails transiently otherwise waits for the next pass over the files still to
 A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
 conversion, which is then recorded as its local name.
 
+Files are in progress concurrently, as many as the content client has connections. Everything that looks at a
+final path and changes or records it runs under one placement lock, so two files never act on the same path or
+inode at once.
+
 Disk work that scales with a file's size or waits for the disk (hashing, reading back, writing with the digest
 updates, fsync, moving aside and placing, creating folders, setting an mtime) runs in the run's worker threads, one
 bounded call at a time: at most one chunk, one fsync, one rename. The manifest and the local names stay on the
@@ -26,11 +30,13 @@ import hashlib
 import os
 import stat
 from collections import defaultdict
-from collections.abc import Awaitable, Callable, Iterable, Iterator
+from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from types import TracebackType
+from typing import Self
 
 from yandex_disk_rescue import api
 from yandex_disk_rescue.destination import FATAL_ERRNOS, NAME_ERRNOS, Destination, DestinationError, PartialFile
@@ -49,9 +55,8 @@ from yandex_disk_rescue.scanning import display_path, listed
 from yandex_disk_rescue.units import format_size
 
 PASS_PAUSE_SECONDS = 5.0
-# A write happens only while its fetch is in flight, so each fetch needs one thread; the spare ones hash, fsync and
-# place.
-_STREAMS = 1
+# A write happens only while its fetch holds one of the content client's connections, so each connection needs one
+# thread; the spare ones hash, fsync and place.
 _SPARE_THREADS = 4
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
@@ -192,6 +197,98 @@ class Digest:
         return _method(identity)
 
 
+@dataclass(frozen=True)
+class _RunTools:
+    """What every turn of a run shares: the clients, the worker threads, the placement lock, the report and the
+    immediate retries of a file per pass."""
+
+    client: api.DiskClient
+    content: api.ContentClient
+    threads: DiskThreads
+    placement: asyncio.Lock
+    report: MirrorReport
+    retries: int
+
+
+class _FileTurns:
+    """The turns of files running as tasks, at most `limit` at once, used as an async context manager around the walk
+    that starts them; leaving it waits for every turn to end.
+
+    The first exception a turn raises stops the run: the other turns and the walk are cancelled, and leaving the
+    context raises that exception itself, with what the cancelled turns raised meanwhile added as notes. An exception
+    the walk raises stops the turns the same way. A cancellation of the walk from outside (Ctrl+C) wins over both.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self._slots = asyncio.Semaphore(limit)
+        self._running: set[asyncio.Task[None]] = set()
+        self._error: BaseException | None = None
+        self._walk: asyncio.Task[object] | None = None
+        self._walk_cancelled = False
+        self._leaving = False
+
+    async def __aenter__(self) -> Self:
+        self._walk = asyncio.current_task()
+        return self
+
+    async def start(self, turn: Coroutine[object, object, None]) -> None:
+        """Wait for a free slot, then run `turn` as a task."""
+        try:
+            await self._slots.acquire()
+        except BaseException:
+            turn.close()
+            raise
+        task = asyncio.create_task(turn)
+        self._running.add(task)
+        task.add_done_callback(self._ended)
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        self._leaving = True
+        if exc is not None and not isinstance(exc, asyncio.CancelledError):
+            self._stop(exc)
+        elif exc is not None and not self._walk_cancelled:
+            self._cancel_running()
+        while self._running:
+            try:
+                await asyncio.wait(set(self._running))
+            except asyncio.CancelledError:
+                self._cancel_running()
+        walk = self._walk
+        if walk is None:
+            raise RuntimeError('the file turns were left without being entered')
+        if self._walk_cancelled:
+            walk.uncancel()
+        if walk.cancelling():
+            if isinstance(exc, asyncio.CancelledError):
+                return
+            raise asyncio.CancelledError
+        if self._error is not None and self._error is not exc:
+            raise self._error from None
+
+    def _ended(self, task: asyncio.Task[None]) -> None:
+        self._running.discard(task)
+        self._slots.release()
+        if not task.cancelled() and (exc := task.exception()) is not None:
+            self._stop(exc)
+
+    def _stop(self, exc: BaseException) -> None:
+        if self._error is not None:
+            if exc is not self._error:
+                self._error.add_note(f'Also raised while the run was stopping: {type(exc).__name__}: {exc}')
+            return
+        self._error = exc
+        self._cancel_running()
+        if not self._leaving and self._walk is not None:
+            self._walk.cancel()
+            self._walk_cancelled = True
+
+    def _cancel_running(self) -> None:
+        for task in self._running:
+            task.cancel()
+
+
 class MirrorRun:
     """One run over a mirror: names are assigned, stray partial files deleted and the files still to download
     counted on construction; `run` then walks the entries in path order.
@@ -204,6 +301,7 @@ class MirrorRun:
         self._mirror = mirror
         self._destination = destination
         self._entries = _assign_local_names(mirror)
+        self._positions = {entry.entry_id: position for position, entry in enumerate(self._entries)}
         self._names = LocalNames(mirror, self._entries)
         with _fatal_errors(destination.path):
             destination.keep_partials(
@@ -217,16 +315,36 @@ class MirrorRun:
     async def run(
         self, client: api.DiskClient, content: api.ContentClient, *, retries: int, passes: int
     ) -> MirrorReport:
-        """Walk the entries, then resume the files deferred by a transient failure in later passes, at most `passes`
-        in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait the download
-        host asked for. `retries` bounds the immediate retries of each file in each pass.
+        """Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
+        most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
+        the download host asked for. `retries` bounds the immediate retries of each file in each pass.
+
+        In every pass up to `content.connections` files are in progress at once, started in path order as slots free
+        up; a folder is made before any entry below it starts. Each final path is checked, cleared, placed and
+        recorded under one placement lock, so files in progress never race for a path or an inode. The report lists
+        everything in path order, whatever the order the files ended in.
+
+        The first error that stops the run (`DestinationError`, `TokenRejectedError`, `DiskApiError`) cancels the
+        files in progress and is raised as itself once they have ended.
 
         The disk work goes to worker threads of this run's own, shut down when the run ends, also on cancellation,
         once every file's turn has ended."""
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
+        with DiskThreads(content.connections + _SPARE_THREADS) as threads:
+            tools = _RunTools(client, content, threads, asyncio.Lock(), report, retries)
+            deferred = await self._first_pass(tools)
+            if deferred:
+                await self._later_passes(deferred, tools, passes=passes)
+        report.replaced_folder = self._destination.replaced_folder
+        report.failed += [Failure(display_path(e.path), _unencodable_reason(e)) for e in self._mirror.unencodable()]
+        self._in_path_order(report)
+        return report
+
+    async def _first_pass(self, tools: _RunTools) -> list[tuple[MirrorEntry, FileDeferred]]:
+        report = tools.report
         blocked: dict[PurePosixPath, str] = {}
         deferred: list[tuple[MirrorEntry, FileDeferred]] = []
-        with DiskThreads(_STREAMS + _SPARE_THREADS) as threads:
+        async with _FileTurns(tools.content.connections) as turns:
             for listed_entry in self._entries:
                 local = self._names[listed_entry.entry_id]
                 entry = replace(listed_entry, local_path=local)
@@ -235,44 +353,34 @@ class MirrorRun:
                 if reason := _blocked_by(local, blocked):
                     report.failed.append(Failure(entry.resource.path, reason))
                 elif entry.resource.kind == 'dir':
-                    await self._make_folder(entry, local, blocked, report, threads)
+                    await self._make_folder(entry, local, blocked, tools)
                 elif entry.entry_id in self._current:
                     report.skipped += 1
                     _note_verified(report, entry, _recorded_method(entry))
-                elif (later := await self._download(entry, client, content, threads, report, retries)) is not None:
-                    deferred.append((entry, later))
-            if deferred:
-                await self._later_passes(deferred, client, content, threads, report, retries=retries, passes=passes)
-        report.replaced_folder = self._destination.replaced_folder
-        report.failed += [Failure(display_path(e.path), _unencodable_reason(e)) for e in self._mirror.unencodable()]
-        report.failed.sort(key=lambda failure: failure.path)
-        report.renamed.sort()
-        return report
+                else:
+                    await turns.start(self._turn(entry, tools, deferred))
+        return self._sorted(deferred)
 
     async def _make_folder(
-        self,
-        entry: MirrorEntry,
-        local: PurePosixPath,
-        blocked: dict[PurePosixPath, str],
-        report: MirrorReport,
-        threads: DiskThreads,
+        self, entry: MirrorEntry, local: PurePosixPath, blocked: dict[PurePosixPath, str], tools: _RunTools
     ) -> None:
-        destination = self._destination
+        destination, report, threads = self._destination, tools.report, tools.threads
 
         def make_folder(path: PurePosixPath) -> Awaitable[bool]:
             return threads.run(destination.make_folder, path)
 
         try:
-            with _local_errors(destination, local, 'write'):
-                made, local = await _create(entry, local, make_folder, self._names, destination)
-                if local != entry.local_path:
-                    report.renamed.append((entry.resource.path, local))
-                if made:
-                    return
-                await threads.run(destination.move_aside, local)
-                report.moved_aside.append(local)
-                if await make_folder(local):
-                    return
+            async with tools.placement:
+                with _local_errors(destination, local, 'write'):
+                    made, local = await _create(entry, local, make_folder, self._names, destination)
+                    if local != entry.local_path:
+                        report.renamed.append((entry.resource.path, local))
+                    if made:
+                        return
+                    await threads.run(destination.move_aside, local)
+                    report.moved_aside.append(local)
+                    if await make_folder(local):
+                        return
             reason = f'{local} was created again as something other than a folder while it was being moved aside'
         except FileFailed as failed:
             reason = failed.reason
@@ -280,52 +388,57 @@ class MirrorRun:
         report.failed.append(Failure(entry.resource.path, reason))
 
     async def _later_passes(
-        self,
-        deferred: list[tuple[MirrorEntry, FileDeferred]],
-        client: api.DiskClient,
-        content: api.ContentClient,
-        threads: DiskThreads,
-        report: MirrorReport,
-        *,
-        retries: int,
-        passes: int,
+        self, deferred: list[tuple[MirrorEntry, FileDeferred]], tools: _RunTools, *, passes: int
     ) -> None:
         used = 1
         while deferred and (passes == 0 or used < passes):
             waits = [failure.retry_after for _, failure in deferred if failure.retry_after is not None]
             await asyncio.sleep(max([PASS_PAUSE_SECONDS, *waits]))
             used += 1
-            remaining = []
-            for entry, _ in deferred:
-                identity = RemoteIdentity.of(entry.resource)
-                resumed = replace(entry, download=DownloadRecord('partial', identity, verified_by=None, local=None))
-                if (later := await self._download(resumed, client, content, threads, report, retries)) is not None:
-                    remaining.append((entry, later))
-            deferred = remaining
+            remaining: list[tuple[MirrorEntry, FileDeferred]] = []
+            async with _FileTurns(tools.content.connections) as turns:
+                for entry, _ in deferred:
+                    identity = RemoteIdentity.of(entry.resource)
+                    resumed = replace(entry, download=DownloadRecord('partial', identity, verified_by=None, local=None))
+                    await turns.start(self._turn(resumed, tools, remaining))
+            deferred = self._sorted(remaining)
         suffix = f' (after {used} passes)' if used > 1 else ''
-        report.failed += [Failure(entry.resource.path, failure.reason + suffix) for entry, failure in deferred]
-        report.passes = (used, passes)
+        tools.report.failed += [Failure(entry.resource.path, failure.reason + suffix) for entry, failure in deferred]
+        tools.report.passes = (used, passes)
 
-    async def _download(
-        self,
-        entry: MirrorEntry,
-        client: api.DiskClient,
-        content: api.ContentClient,
-        threads: DiskThreads,
-        report: MirrorReport,
-        retries: int,
-    ) -> FileDeferred | None:
-        """Mirror one file into `report`; the failure when it is deferred to a later pass instead."""
+    async def _turn(
+        self, entry: MirrorEntry, tools: _RunTools, deferred: list[tuple[MirrorEntry, FileDeferred]]
+    ) -> None:
+        """One file's turn in a pass; a deferred file is added to `deferred`."""
+        if (later := await self._download(entry, tools)) is not None:
+            deferred.append((entry, later))
+
+    def _sorted(self, deferred: list[tuple[MirrorEntry, FileDeferred]]) -> list[tuple[MirrorEntry, FileDeferred]]:
+        return sorted(deferred, key=lambda item: self._positions[item[0].entry_id])
+
+    def _in_path_order(self, report: MirrorReport) -> None:
+        by_path = {entry.resource.path: position for position, entry in enumerate(self._entries)}
+        by_local = {self._names[entry.entry_id]: position for position, entry in enumerate(self._entries)}
+        report.adopted.sort(key=by_path.__getitem__)
+        report.size_only.sort(key=by_path.__getitem__)
+        report.moved_aside.sort(key=by_local.__getitem__)
+        report.failed.sort(key=lambda failure: failure.path)
+        report.renamed.sort()
+
+    async def _download(self, entry: MirrorEntry, tools: _RunTools) -> FileDeferred | None:
+        """Mirror one file into the report; the failure when it is deferred to a later pass instead."""
+        report = tools.report
         try:
             outcome = await download_file(
                 entry,
-                client=client,
-                content=content,
-                threads=threads,
+                client=tools.client,
+                content=tools.content,
+                threads=tools.threads,
+                placement=tools.placement,
                 mirror=self._mirror,
                 destination=self._destination,
                 names=self._names,
-                retries=retries,
+                retries=tools.retries,
             )
         except FileDeferred as deferred:
             return deferred
@@ -351,6 +464,7 @@ async def download_file(
     client: api.DiskClient,
     content: api.ContentClient,
     threads: DiskThreads,
+    placement: asyncio.Lock,
     mirror: Mirror,
     destination: Destination,
     names: LocalNames,
@@ -358,6 +472,10 @@ async def download_file(
 ) -> FileOutcome:
     """Make the file `entry` verified at its local path and record it; the only state it touches is the mirror's
     records, the destination and `names`. Its disk work runs in `threads`.
+
+    The steps that decide the final path, from re-checking what is there to recording the file adopted or placed,
+    hold `placement` in one acquisition, so no other file of the run sees the path or the inode in between. The
+    first look at the path, hashing a local copy and fetching run outside it.
 
     A file already at the local path is adopted when its content matches the cloud. Otherwise the file is
     downloaded and verified first, and only then is whatever stands at the local path moved aside and the new file
@@ -380,7 +498,7 @@ async def download_file(
         if existing is not None:
             if reason := _alias(entry, local, existing, mirror, destination):
                 raise FileFailed(reason)
-            verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads)
+            verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads, placement)
             if verified_by is not None:
                 return FileOutcome(local, verified_by, adopted=True, moved_aside=False)
         verified_by = await _fetch_verified(
@@ -402,8 +520,9 @@ async def download_file(
                 _discard(entry, mirror, destination)
                 raise FileFailed(f'something else was created at {path} while the file was being placed') from None
 
-        (placed, moved_aside), local = await _create(entry, local, place, names, destination)
-        mirror.record_verified(entry.entry_id, identity, verified_by, placed)
+        async with placement:
+            (placed, moved_aside), local = await _create(entry, local, place, names, destination)
+            mirror.record_verified(entry.entry_id, identity, verified_by, placed)
     return FileOutcome(local, verified_by, adopted=False, moved_aside=moved_aside)
 
 
@@ -449,9 +568,15 @@ async def _adopt(
     mirror: Mirror,
     destination: Destination,
     threads: DiskThreads,
+    placement: asyncio.Lock,
 ) -> VerifiedBy | None:
     """Hash the regular file `existing` at `local` and, when it matches `identity`, give it the cloud mtime and
-    record it as verified; `None` when it is not such a file or does not match."""
+    record it as verified; `None` when it is not such a file or does not match.
+
+    The hash runs outside `placement`. Under it, the file at `local` must still be the one hashed (same inode, size
+    and mtime) and must not have become another entry's verified copy meanwhile; otherwise it is not adopted, or the
+    entry fails as an alias. Only then is its mtime set and the record written.
+    """
     if not stat.S_ISREG(existing.st_mode) or existing.st_size != identity.size:
         return None
     digest = Digest()
@@ -462,12 +587,18 @@ async def _adopt(
         await _hash(digest, file.chunks(), threads)
         if digest.mismatch(identity) is not None:
             return None
-        with _local_errors(destination, local, 'set the modification time of'):
-            await threads.run(file.set_mtime, _mtime_ns(identity.modified))
-        adopted = file.stat()
-    verified_by = _method(identity)
-    mirror.record_verified(entry.entry_id, identity, verified_by, adopted)
-    destination.remove_partial(entry.entry_id)
+        async with placement:
+            now = destination.lstat(local)
+            if now is None or LocalFingerprint.of(now) != LocalFingerprint.of(opened):
+                return None
+            if reason := _alias(entry, local, now, mirror, destination):
+                raise FileFailed(reason)
+            with _local_errors(destination, local, 'set the modification time of'):
+                await threads.run(file.set_mtime, _mtime_ns(identity.modified))
+            verified_by = _method(identity)
+            mirror.record_verified(entry.entry_id, identity, verified_by, file.stat())
+            with _local_errors(destination, local, 'write'):
+                destination.remove_partial(entry.entry_id)
     return verified_by
 
 
