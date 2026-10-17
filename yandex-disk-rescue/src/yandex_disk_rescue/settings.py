@@ -118,6 +118,13 @@ DOWNLOAD_CONNECTIONS = Setting(
     'Maximum number of requests to the download host in flight, and so of files downloading at once.',
     _in_range(1, 64),
 )
+DOWNLOAD_CHECKPOINT_MIB = Setting(
+    'download_checkpoint_mib',
+    32,
+    'Checkpoint interval: a download records the bytes it has fsynced after every this many MiB received, so a crash '
+    'or a power cut costs at most this much fetched again.',
+    _in_range(1, 1024),
+)
 SCAN_MAX_AGE = Setting(
     'scan_max_age',
     60,
@@ -144,6 +151,7 @@ SETTINGS: dict[str, Setting[Any]] = {
         DOWNLOAD_RETRIES,
         DOWNLOAD_PASSES,
         DOWNLOAD_CONNECTIONS,
+        DOWNLOAD_CHECKPOINT_MIB,
         SCAN_MAX_AGE,
         CLIENT_ID,
     )
@@ -158,6 +166,7 @@ DownloadTimeout = Annotated[int, DOWNLOAD_TIMEOUT.typer_option()]
 DownloadRetries = Annotated[int, DOWNLOAD_RETRIES.typer_option()]
 DownloadPasses = Annotated[int, DOWNLOAD_PASSES.typer_option()]
 DownloadConnections = Annotated[int, DOWNLOAD_CONNECTIONS.typer_option()]
+DownloadCheckpointMib = Annotated[int, DOWNLOAD_CHECKPOINT_MIB.typer_option()]
 ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 

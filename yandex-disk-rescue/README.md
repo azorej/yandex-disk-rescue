@@ -29,6 +29,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | Immediate resumes of a download that failed after receiving new data, 0 to 20 (default 5). Same as `--download-retries`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | Passes over the files still to download, resuming those that failed transiently, 0 to 1000 (default 7; 0 until every file is done). Same as `--download-passes`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | Requests to the download host in flight, and so files downloading at once, 1 to 64 (default 20). Same as `--download-connections`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | MiB a download receives between two checkpoints, 1 to 1024 (default 32). Same as `--download-checkpoint-mib`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
@@ -55,6 +56,12 @@ recorded for another folder or account (`MirrorMismatchError`, exit code 2).
   caller decides what to do with it. A verified record also stores how the file was verified and the `lstat`
   fingerprint of the placed file (size, mtime in ns, inode number; no device number, which changes when a disk is
   re-plugged). `Mirror.verified_owner` finds the entry whose verified copy is a given inode.
+- A partial record carries the checkpoint journal of its download (`download_segments`): segments tiling
+  `[0, size)` in order (none for a zero-byte file), each with the offset up to which its bytes were fsynced before
+  the row was committed and the SHA-256 of those bytes. `Mirror.record_partial` starts a journal,
+  `Mirror.checkpoint` moves its confirmed offsets, `Mirror.download` reads the record as it is now; verifying or
+  forgetting the download deletes its journal. A partial record from schema version 3 or older gets one segment
+  confirming nothing on the upgrade, so its file is downloaded again from byte 0.
 - A rescan never touches names or records; removing an entry from the manifest deletes its name and record.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
@@ -91,9 +98,10 @@ yandex-disk-rescue/
 │   │                 #   the way, hard-link aliases) with up to `download_connections` files in progress at once
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
-│   │                 #   pipeline (adopt a matching local copy, or resume a partial file once the cloud file is
-│   │                 #   confirmed unchanged, link, fetch while hashing with immediate retries after new data and
-│   │                 #   one link refresh, verify, move aside what is in the way, place, record), the
+│   │                 #   pipeline (adopt a matching local copy, or resume a partial file from its checkpoint
+│   │                 #   journal once the cloud file is confirmed unchanged and the confirmed bytes re-hashed,
+│   │                 #   link, fetch while hashing with checkpoints, immediate retries after new data and one
+│   │                 #   link refresh, verify, move aside what is in the way, place, record), the
 │   │                 #   rejected-name conversion of a folder or file
 │   │                 #   name the destination refuses, later passes over transiently failed files, the summary
 │   │                 #   lines; disk work (hashing, writes, fsync, placement) runs in the run's worker threads,
@@ -111,7 +119,8 @@ yandex-disk-rescue/
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest path
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
-│   │                 #   completion time, mirrors (local names and download records per destination)
+│   │                 #   completion time, mirrors (local names, download records and their checkpoint journals
+│   │                 #   per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry
@@ -130,7 +139,8 @@ yandex-disk-rescue/
 │                       #   with a stall (silence) timeout; its errors (expired link, transient, range not
 │                       #   honoured, refused, too many bytes) never quote the link
 └── tests/
-    ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of the migration test
+    ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of a migration test
+    ├── data/manifest-v3.sql # A schema-v3 manifest dump with download records, the input of a migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures
     ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
@@ -138,8 +148,8 @@ yandex-disk-rescue/
     │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
     │                       #   (`corrupt` and `repair`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
     │                       #   `inject`ed faults (statuses, delays, `Truncate`); a `routes` override table; the
-    │                       #   request log (start and finish times); peaks of requests and of content requests
-    │                       #   in flight
+    │                       #   request log (start and finish times, body bytes sent); peaks of requests and of
+    │                       #   content requests in flight
     ├── test_api_client.py
     ├── test_auth.py
     ├── test_cli.py

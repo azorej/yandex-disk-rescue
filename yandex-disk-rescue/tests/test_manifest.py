@@ -22,6 +22,7 @@ from yandex_disk_rescue.manifest import (
     MirrorMismatchError,
     RemoteIdentity,
     ScanTime,
+    Segment,
     UnencodableEntry,
 )
 from yandex_disk_rescue.paths import state_dir
@@ -52,6 +53,11 @@ def _scan(path: Path, resources: list[Resource], root: str = 'disk:/', uid: str 
         session = manifest.begin_scan(uid, root)
         session.add(resources)
         return session.commit(unencodable=())
+
+
+def _unconfirmed(resource: Resource) -> tuple[Segment, ...]:
+    """The journal of a download of `resource` that has confirmed nothing yet."""
+    return (Segment(0, resource.size, 0, None),) if resource.size else ()
 
 
 def _entries(path: Path, root: str = 'disk:/', uid: str = UID) -> list[Resource]:
@@ -331,9 +337,31 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 3
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 4
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
+
+
+V3_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v3.sql'
+
+
+def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte_0(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    with closing(sqlite3.connect(db)) as connection:
+        connection.executescript(V3_FIXTURE.read_text())
+
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
+        records = {e.resource.path: e.download for e in mirror.entries() if e.download is not None}
+
+    assert {path: (record.state, record.segments) for path, record in records.items()} == {
+        'disk:/Photos/a.jpg': ('verified', ()),
+        'disk:/Photos/big.bin': ('partial', (Segment(0, 5000, 0, None),)),
+        'disk:/empty.txt': ('partial', ()),
+    }
+    assert records['disk:/Photos/a.jpg'].local is not None
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 4
 
 
 def test_a_mirror_is_found_again_by_its_destination(tmp_path):
@@ -405,8 +433,9 @@ def test_names_and_download_records_survive_rescans_and_go_with_removed_entries(
         keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
         edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
         mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
-        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit))
-        mirror.record_partial(ids['disk:/A/gone.txt'], RemoteIdentity.of(_file('disk:/A/gone.txt')))
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), [Segment(0, 10, 4, 'ab')])
+        gone = _file('disk:/A/gone.txt')
+        mirror.record_partial(ids[gone.path], RemoteIdentity.of(gone), _unconfirmed(gone))
         before = _view(mirror)
 
     _scan(db, TREE)
@@ -430,6 +459,9 @@ def test_names_and_download_records_survive_rescans_and_go_with_removed_entries(
         ).fetchone() == (0,)
         assert connection.execute(
             'SELECT count(*) FROM downloads WHERE entry_id = ?', (ids['disk:/A/gone.txt'],)
+        ).fetchone() == (0,)
+        assert connection.execute(
+            'SELECT count(*) FROM download_segments WHERE entry_id = ?', (ids['disk:/A/gone.txt'],)
         ).fetchone() == (0,)
 
 
@@ -495,7 +527,9 @@ def test_records_and_names_are_refused_for_entries_outside_the_mirror(tmp_path):
 
         for outside in (ids['disk:/top.bin'], other_account):
             with pytest.raises(ValueError, match='is not a committed entry below disk:/A'):
-                mirror.record_partial(outside, RemoteIdentity.of(_file('disk:/top.bin')))
+                mirror.record_partial(
+                    outside, RemoteIdentity.of(_file('disk:/top.bin')), _unconfirmed(_file('disk:/top.bin'))
+                )
             with pytest.raises(ValueError, match='is not a committed entry below disk:/A'):
                 mirror.assign_names({ids['disk:/A/keep.txt']: PurePosixPath('keep'), outside: PurePosixPath('x')})
 
@@ -546,7 +580,7 @@ def test_a_verified_record_round_trips_the_placed_files_fingerprint_and_names_it
         mirror = manifest.mirror(UID, 'disk:/', tmp_path / 'dest')
         other = manifest.mirror(UID, 'disk:/', tmp_path / 'other-dest')
         ids = _entry_ids(mirror)
-        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep))
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), _unconfirmed(keep))
         mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5+sha256', local)
 
         (entry,) = [e for e in mirror.entries() if e.download is not None]
@@ -554,7 +588,7 @@ def test_a_verified_record_round_trips_the_placed_files_fingerprint_and_names_it
         assert other.verified_owner(local.st_ino) is None
         assert mirror.verified_owner(local.st_ino + 1) is None
 
-        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep))
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), _unconfirmed(keep))
         assert mirror.verified_owner(local.st_ino) is None
         mirror.forget(ids[keep.path])
         assert all(e.download is None for e in mirror.entries())
@@ -565,6 +599,118 @@ def test_a_verified_record_round_trips_the_placed_files_fingerprint_and_names_it
     assert entry.download.identity == RemoteIdentity.of(keep)
     assert entry.download.local == LocalFingerprint(size=10, mtime_ns=1_700_000_000_123_456_789, ino=local.st_ino)
     assert owner == entry
+
+
+def _segment_rows(db: Path) -> list[tuple[int, int, int, int, str | None]]:
+    with closing(sqlite3.connect(db)) as connection:
+        return connection.execute(
+            'SELECT entry_id, start, end, confirmed, digest FROM download_segments ORDER BY entry_id, start'
+        ).fetchall()
+
+
+def _journaled(tmp_path: Path):
+    """A manifest holding `TREE` scanned, the mirror of disk:/ at /dest, and the entry ids by path."""
+    db = tmp_path / 'manifest.sqlite3'
+    _scan(db, TREE)
+    manifest = Manifest.open(db)
+    mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
+    return db, manifest, mirror, _entry_ids(mirror)
+
+
+def test_a_partial_records_journal_round_trips_and_is_read_again_by_download(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    top = next(r for r in TREE if r.path == 'disk:/top.bin')
+    journal = (Segment(0, 4, 4, 'aa'), Segment(4, 10, 4, None))
+    with manifest:
+        assert mirror.download(ids[edit.path]) is None
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), journal)
+        mirror.record_partial(ids[top.path], RemoteIdentity.of(top), ())
+        listed = {e.resource.path: e.download for e in mirror.entries()}
+
+        mirror.checkpoint(ids[edit.path], [Segment(0, 4, 4, 'aa'), Segment(4, 10, 7, 'bb')])
+        read_now = mirror.download(ids[edit.path])
+
+    assert listed[edit.path] == DownloadRecord('partial', RemoteIdentity.of(edit), None, None, journal)
+    assert listed[top.path] == DownloadRecord('partial', RemoteIdentity.of(top), None, None, ())
+    assert read_now == DownloadRecord(
+        'partial', RemoteIdentity.of(edit), None, None, (Segment(0, 4, 4, 'aa'), Segment(4, 10, 7, 'bb'))
+    )
+    assert _segment_rows(db) == [(ids[edit.path], 0, 4, 4, 'aa'), (ids[edit.path], 4, 10, 7, 'bb')]
+
+
+@pytest.mark.parametrize(
+    'segments',
+    [[], [Segment(0, 9, 0, None)], [Segment(0, 5, 0, None), Segment(6, 10, 6, None)], [Segment(5, 10, 5, None)]],
+    ids=['none', 'short', 'gap', 'not-from-0'],
+)
+def test_a_journal_that_does_not_tile_the_file_is_refused(tmp_path, segments):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    with manifest, pytest.raises(ValueError, match='do not tile'):
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), segments)
+
+    assert _segment_rows(db) == []
+
+
+@pytest.mark.parametrize('case', ['other-boundaries', 'fewer-segments', 'verified', 'no-record'])
+def test_a_checkpoint_of_other_segments_or_of_no_partial_record_is_refused_and_writes_nothing(tmp_path, case):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    checkpoint = {
+        'other-boundaries': [Segment(0, 5, 5, 'aa'), Segment(5, 10, 5, None)],
+        'fewer-segments': [Segment(0, 10, 3, 'aa')],
+        'verified': [Segment(0, 10, 10, 'aa')],
+        'no-record': [Segment(0, 10, 10, 'aa')],
+    }[case]
+    with manifest:
+        if case == 'verified':
+            mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        elif case != 'no-record':
+            mirror.record_partial(
+                ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 4, 0, None), Segment(4, 10, 4, None)]
+            )
+        before = _segment_rows(db)
+        with pytest.raises(ValueError):
+            mirror.checkpoint(ids[keep.path], checkpoint)
+
+    assert _segment_rows(db) == before
+
+
+@pytest.mark.parametrize(
+    'segment',
+    [Segment(0, 10, 11, 'aa'), Segment(0, 10, 3, None), Segment(0, 10, 0, 'aa')],
+    ids=['beyond-end', 'no-digest', 'digest-of-nothing'],
+)
+def test_a_checkpoint_breaking_the_journals_invariant_is_refused(tmp_path, segment):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    with manifest:
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), _unconfirmed(keep))
+        with pytest.raises(ManifestError, match='CHECK constraint failed'):
+            mirror.checkpoint(ids[keep.path], [segment])
+
+    assert _segment_rows(db) == [(ids[keep.path], 0, 10, 0, None)]
+
+
+def test_verifying_or_forgetting_a_download_deletes_its_journal(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    with manifest:
+        for resource in (keep, edit):
+            mirror.record_partial(ids[resource.path], RemoteIdentity.of(resource), [Segment(0, 10, 6, 'aa')])
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        mirror.forget(ids[edit.path])
+        verified = mirror.download(ids[keep.path])
+
+    assert verified is not None
+    assert (verified.state, verified.segments) == ('verified', ())
+    assert _segment_rows(db) == []
 
 
 def _stat(ino: int, size: int = 1) -> os.stat_result:

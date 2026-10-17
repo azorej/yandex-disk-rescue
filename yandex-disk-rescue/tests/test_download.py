@@ -27,7 +27,7 @@ from yandex_disk_rescue import api, localfs, mirroring
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import Destination, PartialFile
-from yandex_disk_rescue.manifest import Manifest
+from yandex_disk_rescue.manifest import Manifest, Segment
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
 from yandex_disk_rescue.paths import manifest_path
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
@@ -156,7 +156,24 @@ def _leave_partial(fake, dest, *, after_bytes: int = 300_000):
     assert result.exit_code == 1
     [partial] = _partials(dest)
     assert partial.stat().st_size == after_bytes
+    assert _journal() == [(0, len(BIG), after_bytes, hashlib.sha256(BIG[:after_bytes]).hexdigest())]
     return partial
+
+
+def _journal() -> list[tuple[int, int, int, str | None]]:
+    """The segments of every download journal in the manifest (start, end, confirmed, digest), read with a connection
+    of its own; none while the manifest or its journal table does not exist yet."""
+    try:
+        with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+            return connection.execute(
+                'SELECT start, end, confirmed, digest FROM download_segments ORDER BY entry_id, start'
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _confirmed() -> int:
+    return sum(confirmed - start for start, _, confirmed, _ in _journal())
 
 
 def _others_verified(dest, failed: str) -> bool:
@@ -951,9 +968,12 @@ def test_a_destination_mirrors_one_remote_folder(disk, dest):
         ('--download-passes', '1001', '0 to 1000'),
         ('--download-connections', '0', '1 to 64'),
         ('--download-connections', '65', '1 to 64'),
+        ('--download-checkpoint-mib', '0', '1 to 1024'),
+        ('--download-checkpoint-mib', '1025', '1 to 1024'),
     ],
 )
-def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, flag, value, valid):
+def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, monkeypatch, flag, value, valid):
+    monkeypatch.setenv('COLUMNS', '200')
     result = _download(flag, value, str(dest))
 
     assert result.exit_code == 2
@@ -1302,10 +1322,17 @@ def test_a_partial_file_of_a_file_changed_in_the_cloud_is_never_resumed(big, des
     assert not (dest / 'big.bin').exists()
 
 
-@pytest.mark.parametrize('held', ['complete', 'longer'])
-def test_a_partial_file_holding_the_whole_file_is_not_fetched_again(big, dest, held):
+@pytest.mark.parametrize('held', ['confirmed', 'unconfirmed-tail'])
+def test_a_partial_file_keeps_only_what_its_journal_confirms(big, dest, held):
     partial = _leave_partial(big, dest)
-    partial.write_bytes(BIG if held == 'complete' else BIG + b'extra')
+    if held == 'confirmed':
+        partial.write_bytes(BIG)
+        with Manifest.open(manifest_path()) as manifest:
+            mirror = manifest.mirror('1', 'disk:/Big', dest.resolve())
+            mirror.checkpoint(int(partial.name), [Segment(0, len(BIG), len(BIG), hashlib.sha256(BIG).hexdigest())])
+    else:
+        with partial.open('ab') as file:
+            file.write(b'never confirmed' * 1000)
     earlier = len(big.requests)
 
     result = _download('disk:/Big', str(dest))
@@ -1313,8 +1340,110 @@ def test_a_partial_file_holding_the_whole_file_is_not_fetched_again(big, dest, h
     assert result.exit_code == 0, result.output
     assert f'1 downloaded ({format_size(len(BIG))}), ' in result.stdout
     assert (dest / 'big.bin').read_bytes() == BIG
-    assert _fetches(big, BIG_PATH, earlier) == ([] if held == 'complete' else [None])
-    assert _linked(big).count(BIG_PATH) == (1 if held == 'complete' else 2)
+    assert _fetches(big, BIG_PATH, earlier) == ([] if held == 'confirmed' else [_tail(300_000)])
+    assert _linked(big).count(BIG_PATH) == (1 if held == 'confirmed' else 2)
+    assert _journal() == []
+
+
+@pytest.mark.parametrize('change', ['tampered', 'shortened', 'deleted'])
+def test_a_partial_file_whose_confirmed_bytes_changed_on_disk_is_fetched_again_from_byte_0(big, dest, change):
+    partial = _leave_partial(big, dest)
+    if change == 'tampered':
+        held = bytearray(partial.read_bytes())
+        held[123_456] ^= 0xFF
+        partial.write_bytes(held)
+    elif change == 'shortened':
+        os.truncate(partial, 299_999)
+    else:
+        partial.unlink()
+    earlier = len(big.requests)
+
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(big, BIG_PATH, earlier) == [None]
+    assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_a_file_deferred_after_new_bytes_resumes_in_the_next_pass_from_its_journal(big, dest):
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+
+    result = _download('--download-retries', '0', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'Passes: 2 of 7\n' in result.stdout
+    assert _fetches(big, BIG_PATH) == [None, _tail(300_000)]
+    assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_a_slow_download_takes_a_checkpoint_every_checkpoint_seconds(big, dest, monkeypatch):
+    monkeypatch.setattr(mirroring, 'CHECKPOINT_SECONDS', 0.3)
+    big.chunk_delay = 0.2
+    results = []
+    # `asyncio.run` installs no signal handler outside the main thread, so the command runs as it would there.
+    worker = threading.Thread(target=lambda: results.append(_download('disk:/Big', str(dest))))
+    worker.start()
+    while_running: set[int] = set()
+    try:
+        while worker.is_alive():
+            fetches = [r for r in big.requests if r.path == '/download']
+            confirmed = _confirmed()
+            if fetches and fetches[0].finished is None:
+                while_running.add(confirmed)
+            time.sleep(0.02)
+    finally:
+        worker.join()
+
+    [result] = results
+    assert result.exit_code == 0, result.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert len({confirmed for confirmed in while_running if 0 < confirmed < len(BIG)}) >= 2
+
+
+def _fail_fsync(monkeypatch) -> tuple[threading.Event, list[int]]:
+    """Make `os.fsync` fail with EIO once the returned event is set; the list collects the descriptors it failed."""
+    failing, failed = threading.Event(), []
+    fsync = os.fsync
+
+    def maybe_failing(fd):
+        if failing.is_set():
+            failed.append(fd)
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        fsync(fd)
+
+    monkeypatch.setattr(os, 'fsync', maybe_failing)
+    return failing, failed
+
+
+def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_line(disk, dest, monkeypatch):
+    slow = [f'disk:/Stop/slow{n}.bin' for n in range(3)]
+    for n, path in enumerate(slow):
+        disk.add_file(path, random.Random(n).randbytes(1024 * 1024))
+    disk.add_file('disk:/Stop/z.txt', b'placed last')
+    disk.chunk_delay = 0.2
+    failing, failed = _fail_fsync(monkeypatch)
+    rename_noreplace = localfs.rename_noreplace
+
+    def failing_once_the_others_have_bytes(src, dst, *, src_dir_fd, dst_dir_fd):
+        if dst == 'z.txt':
+            deadline = time.monotonic() + 10
+            while sum(p.stat().st_size >= 64 * 1024 for p in _partials(dest)) < len(slow):
+                assert time.monotonic() < deadline, 'the slow files never received a chunk'
+                time.sleep(0.01)
+            failing.set()
+            raise OSError(errno.EIO, os.strerror(errno.EIO), dst)
+        rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(localfs, 'rename_noreplace', failing_once_the_others_have_bytes)
+
+    result = _download('disk:/Stop', str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.\n'
+    assert 'Mirrored' not in result.stdout
+    assert len(failed) == len(slow)
+    assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, 1024 * 1024, 0, None)] * len(slow)
+    assert len(_partials(dest)) == len(slow) + 1
 
 
 def _start_download(*args: str) -> subprocess.Popen[str]:
@@ -1337,25 +1466,22 @@ def _wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
         time.sleep(0.01)
 
 
-@pytest.mark.parametrize('stop', [signal.SIGINT, signal.SIGKILL], ids=['sigint', 'sigkill'])
-def test_a_download_stopped_mid_file_resumes_from_its_partial_file(big, dest, stop):
+def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_there(big, dest):
     big.chunk_delay = 0.2
     child = _start_download('disk:/Big', str(dest))
     try:
         _wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
-        child.send_signal(stop)
+        child.send_signal(signal.SIGINT)
         _, stderr = child.communicate(timeout=60)
     finally:
         child.kill()
         child.communicate()
 
-    if stop == signal.SIGINT:
-        assert child.returncode == 130, stderr
-        assert stderr == 'Interrupted; rerun to continue the download.\n'
-    else:
-        assert child.returncode == -signal.SIGKILL
+    assert child.returncode == 130, stderr
+    assert stderr == 'Interrupted; rerun to continue the download.\n'
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
+    assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
 
     big.chunk_delay = 0
     earlier = len(big.requests)
@@ -1364,6 +1490,39 @@ def test_a_download_stopped_mid_file_resumes_from_its_partial_file(big, dest, st
     assert result.exit_code == 0, result.output
     assert _fetches(big, BIG_PATH, earlier) == [_tail(held)]
     assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_a_download_killed_mid_file_fetches_at_most_one_checkpoint_interval_again(disk, dest):
+    path, content = 'disk:/Kill/k.bin', random.Random(5).randbytes(4 * 1024 * 1024)
+    disk.add_file(path, content, modified=MODIFIED)
+    disk.chunk_delay = 0.25
+    child = _start_download('--download-checkpoint-mib', '1', 'disk:/Kill', str(dest))
+    try:
+        _wait_until(lambda: _confirmed() >= 1024 * 1024, child, 'confirmed 1 MiB')
+        child.kill()
+        child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    [(_, _, confirmed, digest)] = _journal()
+    assert digest == hashlib.sha256(content[:confirmed]).hexdigest()
+    [served] = [r for r in disk.requests if r.path == '/download']
+    deadline = time.monotonic() + 10
+    while served.finished is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert served.finished is not None
+    # The interval itself, plus one chunk crossing it, one received but not yet written when the fsync began, and two
+    # sent but not yet read by the client.
+    assert served.sent - confirmed <= 1024 * 1024 + 4 * 64 * 1024
+
+    disk.chunk_delay = 0
+    earlier = len(disk.requests)
+    result = _download('disk:/Kill', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(disk, path, earlier) == [f'bytes={confirmed}-{len(content) - 1}']
+    assert (dest / 'k.bin').read_bytes() == content
 
 
 def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_file(big, dest, monkeypatch):
@@ -1402,7 +1561,7 @@ async def _mirror_run(fake, root: str, dest) -> AsyncIterator[Callable[[], Await
         with Manifest.open(manifest_path()) as manifest, Destination.open(dest) as destination:
             await scan_tree(client, manifest, account, scan_root)
             run = MirrorRun(manifest.mirror(account.uid, scan_root.path, destination.path), destination)
-            yield lambda: run.run(client, content, retries=0, passes=1)
+            yield lambda: run.run(client, content, retries=0, passes=1, checkpoint_bytes=32 * 2**20)
 
 
 async def _until(condition: Callable[[], bool], what: str) -> None:

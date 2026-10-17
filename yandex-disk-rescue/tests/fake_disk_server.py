@@ -68,7 +68,7 @@ class Truncate:
 @dataclass
 class RecordedRequest:
     """One request as received; `finished` is when its response ended (its last byte written or its connection
-    broken), `None` while it is being answered."""
+    broken), `None` while it is being answered, and `sent` the body bytes written to the socket so far."""
 
     method: str
     path: str
@@ -76,6 +76,7 @@ class RecordedRequest:
     headers: dict[str, str]
     started: float
     finished: float | None = None
+    sent: int = 0
 
     @property
     def params(self) -> dict[str, str]:
@@ -405,20 +406,24 @@ def _handler_for(api: FakeDiskApi) -> type[BaseHTTPRequestHandler]:
                 if not body:
                     content_ends()
                 self.end_headers()
-                self._send_body(response, body, before_last=content_ends)
+                self._send_body(request, response, body, before_last=content_ends)
             finally:
                 content_ends()
                 request.finished = time.monotonic()
                 api._leave()
 
-        def _send_body(self, response: FakeResponse, body: bytes, *, before_last: Callable[[], None]) -> None:
+        def _send_body(
+            self, request: RecordedRequest, response: FakeResponse, body: bytes, *, before_last: Callable[[], None]
+        ) -> None:
             try:
                 for start in range(0, len(body), _CHUNK):
                     if start:
                         time.sleep(api.chunk_delay)
                     if start + _CHUNK >= len(body):
                         before_last()
-                    self.wfile.write(body[start : start + _CHUNK])
+                    chunk = body[start : start + _CHUNK]
+                    self.wfile.write(chunk)
+                    request.sent += len(chunk)
             except BrokenPipeError, ConnectionResetError:
                 self.close_connection = True
             if response.truncate_after is not None:

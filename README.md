@@ -179,7 +179,7 @@ once, started in path order: the folder structure is kept, each folder is
 created before anything inside it, empty folders are created, and every file
 gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
-`--download-connections` and `--scan-max-age` (see
+`--download-connections`, `--download-checkpoint-mib` and `--scan-max-age` (see
 [Configuration](#configuration)), and `--no-scan`. A file whose download host
 never answers holds one connection until it stalls and delays no other file.
 
@@ -216,16 +216,25 @@ again when its Disk metadata is unchanged and the local file still has the
 recorded size, modification time and inode. A file changed on the Disk, or
 edited or touched locally, is handled like any file already in DEST (below).
 
-**Interruptions, stalls and retries.** A download that stops part-way — Ctrl+C,
-a kill, a crash, a dropped connection — keeps the bytes received so far in
-its partial file. The next attempt, in the same run or a later one, asks the
-Disk for the file again and, when its size, checksums and modification time
-are unchanged, fetches only the rest with an HTTP `Range` request. When the
-file changed, the partial file is deleted and the file fails with `changed in
-the cloud since the scan; rerun with --scan-max-age 0 to fetch the new
-version` (after a rescan, the new version is downloaded from the start). A
-partial file larger than the file, or one left for an older version, is
-deleted and the file is downloaded from the start; when the download host
+**Interruptions, stalls and retries.** Every download keeps a checkpoint
+journal in the manifest: how many bytes of its partial file were flushed to
+the disk, and their SHA-256. A checkpoint is taken every
+`download_checkpoint_mib` MiB received (default 32), every 15 s while bytes
+arrive, and whenever a download attempt ends — a dropped connection, a stall,
+Ctrl+C. After a kill, a crash or a power cut, at most one checkpoint interval
+is fetched again.
+
+A later pass or a later run asks the Disk for the file again and, when its
+size, checksums and modification time are unchanged, re-reads the confirmed
+bytes and checks them against their SHA-256. When they match, only the rest
+is fetched, with an HTTP `Range` request; bytes past the last checkpoint are
+dropped and fetched again, never trusted. Confirmed bytes that changed on
+disk, or a partial file deleted or cut short, make the file start again from
+byte 0. When the file changed in the cloud, the partial file is deleted and
+the file fails with `changed in the cloud since the scan; rerun with
+--scan-max-age 0 to fetch the new version` (after a rescan, the new version
+is downloaded from the start). A partial file left for an older version is
+discarded and the file is downloaded from the start; when the download host
 ignores `Range`, the whole file is fetched again, never appended to the bytes
 kept.
 
@@ -333,8 +342,8 @@ as it was.
 that persists past the API retries (an outage), stop the run: the files still
 in progress stop too, only the first error is shown, files already verified
 stay verified, and a rerun picks up where it stopped. Ctrl+C prints
-`Interrupted; rerun to continue the download.` and exits with 130; partial
-files are kept, and the next run resumes them.
+`Interrupted; rerun to continue the download.` and exits with 130; every file
+in progress takes a checkpoint first, and the next run resumes it from there.
 
 ### Local file names
 
@@ -383,6 +392,10 @@ and `api_concurrency` (see [Rate limiting](#rate-limiting)).
 
 Many files written at once make a hard disk seek between them. On a USB hard
 disk, start around 8 connections and raise them while the throughput grows.
+
+A smaller `download_checkpoint_mib` means less fetched again after a crash or
+a power cut, at the cost of more flushes to the disk and more manifest
+writes.
 
 ## Exit codes
 
@@ -438,6 +451,7 @@ first one that sets it wins:
 | `download_retries` | `--download-retries` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | `5` | 0 to 20; immediate resumes of a download that failed after new data |
 | `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until all are done |
 | `download_connections` | `--download-connections` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | `20` | 1 to 64; requests to the download host in flight, and so files downloading at once |
+| `download_checkpoint_mib` | `--download-checkpoint-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | `32` | 1 to 1024 (MiB); bytes received between two checkpoints of a download |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 

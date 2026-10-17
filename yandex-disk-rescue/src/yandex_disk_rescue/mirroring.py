@@ -8,9 +8,13 @@ without being read. Any other file already at a final path is hashed: one matchi
 and anything else there is moved aside once the new version is verified. Paths with no cloud counterpart are never
 looked at.
 
-A partial file left by an interrupted run or an earlier pass is resumed with an HTTP range once the cloud file is
-confirmed unchanged. A transfer that fails after receiving new data is resumed at once, within a retry budget; one
-that fails transiently otherwise waits for the next pass over the files still to download.
+Every download keeps a checkpoint journal in the manifest: the offset up to which its partial file was fsynced and
+the SHA-256 of those bytes. A checkpoint is taken every `checkpoint_bytes` received, `CHECKPOINT_SECONDS` after the
+last one while bytes arrive, and whenever a transfer attempt ends with new bytes, cancellation included. A later
+turn of the file (a later pass or a later run) resumes from the confirmed offset with an HTTP range once the cloud
+file is confirmed unchanged and the confirmed bytes on disk hash to the recorded digest; bytes past it are dropped.
+A transfer that fails after receiving new data is resumed at once, within a retry budget, from the bytes this turn
+wrote; one that fails transiently otherwise waits for the next pass over the files still to download.
 
 A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
 conversion, which is then recorded as its local name.
@@ -29,6 +33,7 @@ import asyncio
 import hashlib
 import os
 import stat
+import time
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Coroutine, Iterable, Iterator
 from contextlib import contextmanager
@@ -43,11 +48,11 @@ from yandex_disk_rescue.destination import FATAL_ERRNOS, NAME_ERRNOS, Destinatio
 from yandex_disk_rescue.disk_threads import DiskThreads
 from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
-    DownloadRecord,
     LocalFingerprint,
     Mirror,
     MirrorEntry,
     RemoteIdentity,
+    Segment,
     UnencodableEntry,
     VerifiedBy,
 )
@@ -55,6 +60,7 @@ from yandex_disk_rescue.scanning import display_path, listed
 from yandex_disk_rescue.units import format_size
 
 PASS_PAUSE_SECONDS = 5.0
+CHECKPOINT_SECONDS = 15.0
 # A write happens only while its fetch holds one of the content client's connections, so each connection needs one
 # thread; the spare ones hash, fsync and place.
 _SPARE_THREADS = 4
@@ -178,6 +184,10 @@ class Digest:
         self._sha256.update(chunk)
         self.size += len(chunk)
 
+    def sha256(self) -> str:
+        """The SHA-256 hex of the bytes hashed so far, from a copy of the running hash taken now."""
+        return self._sha256.copy().hexdigest()
+
     def mismatch(self, identity: RemoteIdentity) -> str | None:
         """How the bytes differ from `identity`: the size, then the MD5 and the SHA-256 the cloud provides."""
         if self.size != identity.size:
@@ -199,8 +209,8 @@ class Digest:
 
 @dataclass(frozen=True)
 class _RunTools:
-    """What every turn of a run shares: the clients, the worker threads, the placement lock, the report and the
-    immediate retries of a file per pass."""
+    """What every turn of a run shares: the clients, the worker threads, the placement lock, the report, the
+    immediate retries of a file per pass and the bytes between two checkpoints."""
 
     client: api.DiskClient
     content: api.ContentClient
@@ -208,6 +218,7 @@ class _RunTools:
     placement: asyncio.Lock
     report: MirrorReport
     retries: int
+    checkpoint_bytes: int
 
 
 class _FileTurns:
@@ -313,11 +324,12 @@ class MirrorRun:
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
     async def run(
-        self, client: api.DiskClient, content: api.ContentClient, *, retries: int, passes: int
+        self, client: api.DiskClient, content: api.ContentClient, *, retries: int, passes: int, checkpoint_bytes: int
     ) -> MirrorReport:
         """Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
         most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
-        the download host asked for. `retries` bounds the immediate retries of each file in each pass.
+        the download host asked for. `retries` bounds the immediate retries of each file in each pass, and a
+        download takes a checkpoint after every `checkpoint_bytes` received.
 
         In every pass up to `content.connections` files are in progress at once, started in path order as slots free
         up; a folder is made before any entry below it starts. Each final path is checked, cleared, placed and
@@ -331,7 +343,7 @@ class MirrorRun:
         once every file's turn has ended."""
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         with DiskThreads(content.connections + _SPARE_THREADS) as threads:
-            tools = _RunTools(client, content, threads, asyncio.Lock(), report, retries)
+            tools = _RunTools(client, content, threads, asyncio.Lock(), report, retries, checkpoint_bytes)
             deferred = await self._first_pass(tools)
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes)
@@ -398,9 +410,7 @@ class MirrorRun:
             remaining: list[tuple[MirrorEntry, FileDeferred]] = []
             async with _FileTurns(tools.content.connections) as turns:
                 for entry, _ in deferred:
-                    identity = RemoteIdentity.of(entry.resource)
-                    resumed = replace(entry, download=DownloadRecord('partial', identity, verified_by=None, local=None))
-                    await turns.start(self._turn(resumed, tools, remaining))
+                    await turns.start(self._turn(entry, tools, remaining))
             deferred = self._sorted(remaining)
         suffix = f' (after {used} passes)' if used > 1 else ''
         tools.report.failed += [Failure(entry.resource.path, failure.reason + suffix) for entry, failure in deferred]
@@ -439,6 +449,7 @@ class MirrorRun:
                 destination=self._destination,
                 names=self._names,
                 retries=tools.retries,
+                checkpoint_bytes=tools.checkpoint_bytes,
             )
         except FileDeferred as deferred:
             return deferred
@@ -469,6 +480,7 @@ async def download_file(
     destination: Destination,
     names: LocalNames,
     retries: int,
+    checkpoint_bytes: int,
 ) -> FileOutcome:
     """Make the file `entry` verified at its local path and record it; the only state it touches is the mirror's
     records, the destination and `names`. Its disk work runs in `threads`.
@@ -482,9 +494,11 @@ async def download_file(
     placed. A path that is the same file as another entry's verified copy is never adopted, moved or replaced. A name
     the destination refuses is converted, and the file placed under the converted name.
 
-    A partial file whose `partial` record is for the entry's identity is resumed after `client.resource` confirms
-    the cloud file still has it; any other partial file is discarded. A transfer that fails after new data is
-    resumed at once, up to `retries` times.
+    The entry's download record is read from `mirror` when the turn starts. A partial file whose `partial` record
+    is for the entry's identity is resumed from its journal's confirmed offset after `client.resource` confirms the
+    cloud file still has it and the confirmed bytes hash to the recorded digest; any other partial file is started
+    again from byte 0. A checkpoint is taken after every `checkpoint_bytes` received, and as described in the
+    module. A transfer that fails after new data is resumed at once, up to `retries` times.
 
     Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileFailed` when
     this file cannot be mirrored, `DestinationError` when the destination cannot be written at all, and the API
@@ -510,6 +524,7 @@ async def download_file(
             mirror=mirror,
             destination=destination,
             retries=retries,
+            checkpoint_bytes=checkpoint_bytes,
         )
 
         async def place(path: PurePosixPath) -> tuple[os.stat_result, bool]:
@@ -641,25 +656,36 @@ async def _fetch_verified(
     mirror: Mirror,
     destination: Destination,
     retries: int,
+    checkpoint_bytes: int,
 ) -> VerifiedBy:
-    """Fetch the file into its partial file while hashing it, keeping the bytes already there when they can be
-    resumed, verify it, and give it the cloud mtime, durably.
+    """Fetch the file into its partial file while hashing it, keeping the confirmed bytes already there when they can
+    be resumed, verify it, and give it the cloud mtime, durably.
 
     A partial file that fails verification is deleted and its record dropped; one cut short by a transfer error is
-    kept. The partial file is closed only once no thread call on it is running, also when the task is cancelled.
+    kept with its journal. The partial file is closed only once no thread call on it is running, also when the task
+    is cancelled.
     """
     with destination.partial(entry.entry_id) as partial:
-        start = await _resume_point(entry, identity, partial, client=client, mirror=mirror, destination=destination)
+        start, digest = await _resume_point(
+            entry, identity, partial, client=client, mirror=mirror, destination=destination, threads=threads
+        )
         await threads.run(partial.truncate, start)
-        mirror.record_partial(entry.entry_id, identity)
-        digest = Digest()
-        await _hash(digest, partial.chunks(start), threads)
         if start == 0 or start < identity.size:
+            journal = _Journal(
+                entry.entry_id,
+                identity.size,
+                start,
+                mirror=mirror,
+                partial=partial,
+                threads=threads,
+                interval=checkpoint_bytes,
+            )
             digest = await _transfer(
                 entry.resource.path,
                 identity,
                 partial,
                 digest,
+                journal,
                 client=client,
                 content=content,
                 threads=threads,
@@ -682,18 +708,24 @@ async def _resume_point(
     client: api.DiskClient,
     mirror: Mirror,
     destination: Destination,
-) -> int:
-    """How many bytes of the partial file to keep: all of them when its record is for `identity`, it holds no more
-    than the file, and the cloud file still has that identity; otherwise none.
+    threads: DiskThreads,
+) -> tuple[int, Digest]:
+    """How many bytes of the partial file to keep, with their digest, after making the entry's record a `partial`
+    one for `identity`.
+
+    A `partial` record for `identity` in the manifest now is kept once the cloud file is confirmed to still have that
+    identity; the bytes its journal confirms are kept when the partial file holds them and they hash to the
+    recorded digest, and otherwise the journal is reset to byte 0. Any other record is replaced by a new `partial`
+    one starting at byte 0.
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
-    check runs for an empty partial file too: an earlier attempt that received nothing usable may have met the
-    changed file.
+    check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
+    the changed file.
     """
-    held = partial.size()
-    record = entry.download
-    if held > identity.size or record is None or record.state != 'partial' or record.identity != identity:
-        return 0
+    record = mirror.download(entry.entry_id)
+    if record is None or record.state != 'partial' or record.identity != identity:
+        mirror.record_partial(entry.entry_id, identity, _whole_file(identity.size))
+        return 0, Digest()
     try:
         live = await client.resource(entry.resource.path)
     except api.RemotePathNotFoundError:
@@ -702,7 +734,77 @@ async def _resume_point(
     if live.kind != 'file' or RemoteIdentity.of(live) != identity:
         _discard(entry, mirror, destination)
         raise FileFailed(_CHANGED)
-    return held
+    if not record.segments:
+        return 0, Digest()
+    [segment] = record.segments
+    if segment.confirmed == segment.start:
+        return 0, Digest()
+    digest = Digest()
+    if partial.size() >= segment.confirmed:
+        await _hash(digest, partial.chunks(segment.confirmed), threads)
+        if digest.sha256() == segment.digest:
+            return segment.confirmed, digest
+    mirror.checkpoint(entry.entry_id, [replace(segment, confirmed=segment.start, digest=None)])
+    return 0, Digest()
+
+
+def _whole_file(size: int) -> tuple[Segment, ...]:
+    """The journal of a download of a `size`-byte file starting from byte 0: one segment, none for an empty file."""
+    return (Segment(0, size, 0, None),) if size else ()
+
+
+class _Journal:
+    """The checkpoint journal of one file's turn: its single segment `[0, size)` and the offset the manifest confirms.
+
+    A checkpoint fsyncs the partial file in a worker thread, then records the bytes a digest covered when the fsync
+    began, with their SHA-256. When the fsync or the commit fails, the journal stays at its previous checkpoint.
+    """
+
+    def __init__(
+        self,
+        entry_id: int,
+        size: int,
+        confirmed: int,
+        *,
+        mirror: Mirror,
+        partial: PartialFile,
+        threads: DiskThreads,
+        interval: int,
+    ) -> None:
+        self._entry_id = entry_id
+        self._size = size
+        self._confirmed = confirmed
+        self._mirror = mirror
+        self._partial = partial
+        self._threads = threads
+        self._interval = interval
+        self._taken = time.monotonic()
+
+    async def written(self, digest: Digest) -> None:
+        """Take a checkpoint once `interval` bytes arrived since the last one, or `CHECKPOINT_SECONDS` passed since
+        it and new bytes arrived."""
+        new = digest.size - self._confirmed
+        if new >= self._interval or (new > 0 and time.monotonic() - self._taken >= CHECKPOINT_SECONDS):
+            await self.take(digest)
+
+    async def take(self, digest: Digest) -> None:
+        """Make the bytes `digest` covers confirmed; nothing when they are the confirmed ones already.
+
+        No write of the file may be in flight: the bytes `digest` covers must be the ones written.
+        """
+        confirmed, sha256 = digest.size, digest.sha256()
+        if confirmed == self._confirmed:
+            return
+        await self._threads.run(self._partial.sync)
+        self._mirror.checkpoint(self._entry_id, [Segment(0, self._size, confirmed, sha256 if confirmed else None)])
+        self._confirmed = confirmed
+        self._taken = time.monotonic()
+
+    def reset(self) -> None:
+        """Confirm nothing, before the partial file is cut back to byte 0."""
+        self._mirror.checkpoint(self._entry_id, [Segment(0, self._size, 0, None)])
+        self._confirmed = 0
+        self._taken = time.monotonic()
 
 
 async def _transfer(
@@ -710,17 +812,19 @@ async def _transfer(
     identity: RemoteIdentity,
     partial: PartialFile,
     digest: Digest,
+    journal: _Journal,
     *,
     client: api.DiskClient,
     content: api.ContentClient,
     threads: DiskThreads,
     retries: int,
 ) -> Digest:
-    """Fetch the rest of the file after the `digest.size` bytes already in the partial file, and return the digest
-    of the whole file.
+    """Fetch the rest of the file after the `digest.size` bytes already in the partial file, taking the checkpoints of
+    `journal`, and return the digest of the whole file.
 
     A failure after new data is resumed at once from where it stopped, up to `retries` times. An expired link is
-    refreshed once without spending a retry. A host ignoring the range restarts the file from byte 0.
+    refreshed once without spending a retry. A host ignoring the range restarts the file from byte 0. An attempt
+    that ends with a transfer error or a cancellation takes a checkpoint first.
 
     Raises `FileDeferred` for a transient failure that received no new data or spent the retries, and `FileFailed`
     for any other failure.
@@ -729,14 +833,22 @@ async def _transfer(
     # `digest` is looked up at call time, so the fresh digest of a restart from byte 0 takes over.
     async def write(offset: int, chunk: bytes) -> None:
         await threads.run(_write_hashed, digest, partial, offset, chunk)
+        await journal.written(digest)
+
+    async def attempt(start: int) -> None:
+        try:
+            await content.fetch(href, start=start, end=identity.size, size=identity.size, write=write)
+        except api.TransferError, asyncio.CancelledError:
+            await journal.take(digest)
+            raise
 
     href = await _download_link(client, path)
     refreshed = False
-    attempt = 1
+    attempt_number = 1
     while True:
         before = digest.size
         try:
-            await content.fetch(href, start=before, end=identity.size, size=identity.size, write=write)
+            await attempt(before)
         except api.LinkExpiredError as exc:
             if refreshed:
                 raise FileFailed(f'download link rejected again after a refresh (HTTP {exc.status})') from None
@@ -745,15 +857,16 @@ async def _transfer(
         except api.RangeNotHonouredError as exc:
             if before == 0:
                 raise FileFailed(exc.reason) from None
+            journal.reset()
             await threads.run(partial.truncate, 0)
             digest = Digest()
         except api.TransientTransferError as exc:
             if digest.size == identity.size:
                 return digest
-            if digest.size == before or attempt > retries:
-                reason = exc.reason if attempt == 1 else f'{exc.reason} (after {attempt} attempts)'
+            if digest.size == before or attempt_number > retries:
+                reason = exc.reason if attempt_number == 1 else f'{exc.reason} (after {attempt_number} attempts)'
                 raise FileDeferred(reason, retry_after=exc.retry_after) from None
-            attempt += 1
+            attempt_number += 1
         except api.TransferError as exc:
             raise FileFailed(exc.reason) from None
         else:
@@ -761,8 +874,10 @@ async def _transfer(
 
 
 def _write_hashed(digest: Digest, partial: PartialFile, offset: int, chunk: bytes) -> None:
-    digest.update(offset, chunk)
+    """Write `chunk` at `offset`, then add it to `digest`, so the digest never covers a byte the write did not
+    return."""
     partial.write(offset, chunk)
+    digest.update(offset, chunk)
 
 
 def mirror_summary(report: MirrorReport) -> list[str]:

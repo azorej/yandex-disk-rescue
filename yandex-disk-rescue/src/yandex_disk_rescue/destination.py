@@ -292,8 +292,8 @@ class ExistingFile:
 
 
 class PartialFile:
-    """An open partial file at `path`: its size, reading back and cutting what it holds, positional writes, then the
-    final mtime and an fsync."""
+    """An open partial file at `path`: its size, reading back and cutting what it holds, positional writes, fsyncs of
+    the content written so far, then the final mtime and an fsync."""
 
     def __init__(self, fd: int, path: Path) -> None:
         self._fd = fd
@@ -325,6 +325,11 @@ class PartialFile:
                 written = os.pwrite(self._fd, view, offset)
                 view = view[written:]
                 offset += written
+
+    def sync(self) -> None:
+        """Flush the content written so far to the disk."""
+        with _work_errors(self._path):
+            os.fsync(self._fd)
 
     def finish(self, mtime_ns: int) -> None:
         """Set the modification time and flush the content and metadata to the disk."""
