@@ -25,7 +25,9 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_API_CONCURRENCY` | Maximum Disk API requests in flight, 1 to 30 (default 7). Same as `--api-concurrency`. |
 | `YANDEX_DISK_RESCUE_API_TIMEOUT` | Timeout of one Disk API request, 1 to 300 s (default 30). Same as `--api-timeout`. |
 | `YANDEX_DISK_RESCUE_API_RETRIES` | Retries after a transport error or a throttling status, 0 to 20 (default 5). Same as `--api-retries`. |
-| `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | Timeout of connecting to the download host and of each read from it, 1 to 600 s (default 60). Same as `--download-timeout`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | Stall timeout: a download with no data from the download host for this long fails as stalled, 1 to 600 s (default 15). Same as `--download-timeout`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | Immediate resumes of a download that failed after receiving new data, 0 to 20 (default 5). Same as `--download-retries`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | Passes over the files still to download, resuming those that failed transiently, 0 to 1000 (default 7; 0 until every file is done). Same as `--download-passes`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
@@ -85,9 +87,11 @@ yandex-disk-rescue/
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries (skip, folders, things in
-│   │                 #   the way, hard-link aliases), the per-file pipeline (adopt a matching local copy, or link,
-│   │                 #   fetch into a partial file while hashing, verify, move aside what is in the way, place,
-│   │                 #   record), the summary lines
+│   │                 #   the way, hard-link aliases), the per-file pipeline (adopt a matching local copy, or
+│   │                 #   resume a partial file once the cloud file is confirmed unchanged, link, fetch while
+│   │                 #   hashing with immediate retries after new data and one link refresh, verify, move aside
+│   │                 #   what is in the way, place, record), later passes over transiently failed files, the
+│   │                 #   summary lines
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
 │   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
 │   │                 #   aside into the run's `replaced/` folder and placement, never through a link
@@ -111,8 +115,8 @@ yandex-disk-rescue/
 │       ├── remote_paths.py # `disk:/` path normalization
 │       ├── errors.py # The RescueError subclasses of failed API requests
 │       └── transfer.py # ContentClient — fetches byte ranges from the download host into a write callback, with
-│                       #   no token, following redirects; its errors (expired link, transient, range not
-│                       #   honoured, refused, too many bytes) never quote the link
+│                       #   no token, following redirects, with a stall (silence) timeout; its errors (expired
+│                       #   link, transient, range not honoured, refused, too many bytes) never quote the link
 └── tests/
     ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of the migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures

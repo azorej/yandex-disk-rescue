@@ -5,16 +5,20 @@ import errno
 import fcntl
 import hashlib
 import os
+import random
 import re
+import signal
 import sqlite3
+import subprocess
+import time
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 import pytest
-from fake_disk_server import Truncate
+from fake_disk_server import Delay, FakeResponse, Truncate
 from typer.testing import CliRunner
-from yandex_disk_rescue import localfs
+from yandex_disk_rescue import localfs, mirroring
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.paths import manifest_path
 from yandex_disk_rescue.units import format_size
@@ -33,6 +37,9 @@ FILES = {
     'disk:/top.txt': b'',
 }
 SIZE_ONLY = 'disk:/Photos/old.bmp'
+BIG_PATH = 'disk:/Big/big.bin'
+BIG = random.Random(3).randbytes(1024 * 1024)
+CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
 _STAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z')
 
 
@@ -96,6 +103,51 @@ def _overwrite_keeping_mtime(local, content: bytes) -> None:
 
 def _mtime_ns(moment: datetime) -> int:
     return int(moment.timestamp()) * 10**9 + moment.microsecond * 1000
+
+
+@pytest.fixture(autouse=True)
+def no_pass_pause(monkeypatch):
+    """Later passes start at once; the Ctrl+C test, which runs the command in a subprocess, keeps the real pause."""
+    monkeypatch.setattr(mirroring, 'PASS_PAUSE_SECONDS', 0)
+
+
+@pytest.fixture
+def big(disk):
+    """The `disk` tree plus a 1 MiB file, sent in 16 chunks."""
+    disk.add_file(BIG_PATH, BIG, modified=MODIFIED)
+    return disk
+
+
+def _partials(dest) -> list:
+    folder = dest / '.yandex-disk-rescue' / 'partial'
+    return sorted(folder.iterdir()) if folder.is_dir() else []
+
+
+def _partial_size(dest) -> int:
+    return sum(partial.stat().st_size for partial in _partials(dest))
+
+
+def _fetches(fake, path: str, since: int = 0) -> list[str | None]:
+    """The `Range` header (`None` when absent) of each content request for `path` after the first `since` requests."""
+    return [r.headers.get('range') for r in fake.requests[since:] if r.path == '/download' and r.params['path'] == path]
+
+
+def _tail(start: int) -> str:
+    return f'bytes={start}-{len(BIG) - 1}'
+
+
+def _leave_partial(fake, dest, *, after_bytes: int = 300_000):
+    """Run a download of `disk:/Big` cut short with no retry and no later pass, which keeps its partial file."""
+    fake.inject('GET', '/download', Truncate(after_bytes=after_bytes), where={'path': BIG_PATH})
+    result = _download('--download-retries', '0', '--download-passes', '1', 'disk:/Big', str(dest))
+    assert result.exit_code == 1
+    [partial] = _partials(dest)
+    assert partial.stat().st_size == after_bytes
+    return partial
+
+
+def _others_verified(dest, failed: str) -> bool:
+    return all(_local(dest, path).read_bytes() == content for path, content in FILES.items() if path != failed)
 
 
 @pytest.mark.parametrize('redirect', [False, True], ids=['direct', 'redirected'])
@@ -181,12 +233,13 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
     disk.add_file('disk:/Checks/short.bin', b'0123456789', md5=None, sha256=None)
     disk.inject('GET', '/download', Truncate(after_bytes=4), where={'path': 'disk:/Checks/short.bin'})
 
-    result = _download('disk:/Checks', str(dest))
+    result = _download('--download-retries', '0', '--download-passes', '1', 'disk:/Checks', str(dest))
 
     assert result.exit_code == 1
     actual = hashlib.sha256(content).hexdigest()
     assert (
         f'Mirrored disk:/Checks to {dest}: 1 downloaded (9 B), 0 skipped, 2 failed\n'
+        'Passes: 1 of 1\n'
         'Verified by size only (no cloud checksum): 1\n'
         '  disk:/Checks/size-only.bin\n'
         'Failed: 2\n'
@@ -601,14 +654,14 @@ def test_a_scan_max_age_out_of_range_is_a_usage_error(disk, dest):
 
 
 @pytest.mark.parametrize(
-    ('edited', 'reason'),
+    ('edited', 'reason', 'rerun_reason'),
     [
-        (b'READ ME', f'MD5 mismatch (expected {hashlib.md5(b"read me").hexdigest()}, got '),
-        (b'read me, edited after the scan', 'the download host sent more than the 7 bytes requested'),
+        (b'READ ME', f'MD5 mismatch (expected {hashlib.md5(b"read me").hexdigest()}, got ', 'MD5 mismatch'),
+        (b'read me, edited after the scan', 'the download host sent more than the 7 bytes requested', CHANGED),
     ],
     ids=['same-size', 'longer'],
 )
-def test_a_file_changed_after_the_reused_scan_fails_instead_of_being_kept(disk, dest, edited, reason):
+def test_a_file_changed_after_the_reused_scan_fails_instead_of_being_kept(disk, dest, edited, reason, rerun_reason):
     path = 'disk:/Docs/readme.txt'
     assert runner.invoke(app, ['scan']).exit_code == 0
     disk.add_file(path, edited, modified=MODIFIED)
@@ -619,6 +672,13 @@ def test_a_file_changed_after_the_reused_scan_fails_instead_of_being_kept(disk, 
     assert _reused_scan(result)[0] == 'disk:/'
     assert f'Failed: 1\n  {path}: {reason}' in result.stdout
     assert not _local(dest, path).exists()
+
+    rerun = _download(str(dest))
+
+    assert rerun.exit_code == 1
+    assert f'Failed: 1\n  {path}: {rerun_reason}' in rerun.stdout
+    assert not _local(dest, path).exists()
+    assert _partials(dest) == []
 
 
 @pytest.mark.parametrize('args', [[], ['a', 'b', 'c']], ids=['none', 'three'])
@@ -667,11 +727,19 @@ def test_a_destination_mirrors_one_remote_folder(disk, dest):
     assert not (dest / 'readme.txt').exists()
 
 
-def test_an_invalid_download_timeout_is_a_usage_error(disk, dest):
-    result = _download('--download-timeout', '0', str(dest))
+@pytest.mark.parametrize(
+    ('flag', 'value', 'valid'),
+    [
+        ('--download-timeout', '0', '1 to 600'),
+        ('--download-retries', '99', '0 to 20'),
+        ('--download-passes', '1001', '0 to 1000'),
+    ],
+)
+def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, flag, value, valid):
+    result = _download(flag, value, str(dest))
 
     assert result.exit_code == 2
-    assert 'must be an integer from 1 to 600' in result.stderr
+    assert f'must be an integer from {valid}' in result.stderr
     assert disk.requests == []
 
 
@@ -714,3 +782,269 @@ def test_a_filesystem_without_the_no_replace_rename_stops_the_run_before_any_dow
     )
     assert _transfers(disk) == []
     assert sorted(p.name for p in dest.iterdir()) == ['.yandex-disk-rescue']
+
+
+def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(disk, dest):
+    path = 'disk:/Photos/2024/a.jpg'
+    disk.inject('GET', '/download', Delay(2), Delay(2), where={'path': path})
+
+    result = _download('--download-timeout', '1', '--download-passes', '1', str(dest))
+
+    assert result.exit_code == 1
+    assert 'Passes: 1 of 1\n' in result.stdout
+    assert f'Failed: 1\n  {path}: the download stalled: no data for 1 s\n' in result.stdout
+    assert _fetches(disk, path) == [None]
+    assert _others_verified(dest, path)
+
+
+def test_a_slow_but_steady_download_never_stalls(disk, dest):
+    content = random.Random(5).randbytes(4 * 64 * 1024 + 1)
+    disk.add_file('disk:/Slow/slow.bin', content)
+    disk.chunk_delay = 0.4
+
+    began = time.monotonic()
+    result = _download('--download-timeout', '1', 'disk:/Slow', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert time.monotonic() - began > 1.5
+    assert (dest / 'slow.bin').read_bytes() == content
+    assert _fetches(disk, 'disk:/Slow/slow.bin') == [None]
+
+
+def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, dest):
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), Delay(2), where={'path': BIG_PATH})
+
+    result = _download('--download-timeout', '1', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f'Mirrored disk:/Big to {dest}: 1 downloaded ({format_size(len(BIG))}), 0 skipped, 0 failed\nPasses: 2 of 7\n'
+    ) in result.stdout
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _fetches(big, BIG_PATH) == [None, _tail(300_000), _tail(300_000)]
+    assert _linked(big).count(BIG_PATH) == 2
+    assert _partials(dest) == []
+
+
+def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succeed(big, dest):
+    big.inject('GET', '/download', Delay(2), Delay(2), where={'path': BIG_PATH})
+
+    result = _download('--download-timeout', '1', '--download-passes', '2', str(dest))
+
+    assert result.exit_code == 1
+    assert ', 1 failed\nPasses: 2 of 2\n' in result.stdout
+    assert f'Failed: 1\n  {BIG_PATH}: the download stalled: no data for 1 s (after 2 passes)\n' in result.stdout
+    assert _fetches(big, BIG_PATH) == [None, None]
+    assert _others_verified(dest, BIG_PATH)
+
+
+def test_a_corrupt_file_is_not_retried_in_a_later_pass(disk, dest):
+    corrupt, deferred = 'disk:/Photos/2024/a.jpg', 'disk:/Docs/readme.txt'
+    disk.corrupt(corrupt, offset=0)
+    disk.inject('GET', '/download', 503, where={'path': deferred})
+
+    result = _download(str(dest))
+
+    assert result.exit_code == 1
+    assert 'Passes: 2 of 7\n' in result.stdout
+    [failure] = [line for line in result.stdout.splitlines() if line.startswith(f'  {corrupt}: ')]
+    assert failure.startswith(f'  {corrupt}: MD5 mismatch (expected ')
+    assert '(after' not in failure
+    assert _linked(disk).count(corrupt) == 1
+    assert _fetches(disk, deferred) == [None, None]
+    assert _others_verified(dest, corrupt)
+
+
+def test_unlimited_passes_go_on_until_the_file_is_done(big, dest):
+    big.inject('GET', '/download', 503, 503, 503, where={'path': BIG_PATH})
+
+    result = _download('--download-passes', '0', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert ', 0 failed\nPasses: 4 of unlimited\n' in result.stdout
+    assert _fetches(big, BIG_PATH) == [None] * 4
+    assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_the_next_pass_waits_as_long_as_the_download_host_asks(big, dest):
+    big.inject('GET', '/download', FakeResponse.error(503, {'Retry-After': '1'}), where={'path': BIG_PATH})
+
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'Passes: 2 of 7\n' in result.stdout
+    first, second = [r.started for r in big.requests if r.path == '/download']
+    assert second - first >= 0.9
+
+
+def test_a_download_cut_short_resumes_at_once_from_the_bytes_received(big, dest):
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'Passes' not in result.stdout
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _fetches(big, BIG_PATH) == [None, _tail(300_000)]
+    assert _linked(big).count(BIG_PATH) == 1
+
+
+@pytest.mark.parametrize(('cuts', 'requests'), [(2, 3), (6, 6)], ids=['within-budget', 'budget-spent'])
+def test_retries_after_new_data_are_bounded_by_download_retries(big, dest, cuts, requests):
+    big.inject('GET', '/download', *[Truncate(after_bytes=1000)] * cuts, where={'path': BIG_PATH})
+
+    result = _download('--download-passes', '1', 'disk:/Big', str(dest))
+
+    assert _fetches(big, BIG_PATH) == [None] + [_tail(1000 * n) for n in range(1, requests)]
+    if requests > cuts:
+        assert result.exit_code == 0, result.output
+        assert (dest / 'big.bin').read_bytes() == BIG
+    else:
+        assert result.exit_code == 1
+        [failure] = [line for line in result.stdout.splitlines() if line.startswith(f'  {BIG_PATH}: ')]
+        assert failure.startswith(f'  {BIG_PATH}: the download failed: ')
+        assert failure.endswith(' (after 6 attempts)')
+        assert _partial_size(dest) == 6000
+
+
+@pytest.mark.parametrize('expiries', [1, 2])
+def test_an_expired_link_is_refreshed_once(big, dest, expiries):
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), *[410] * expiries, where={'path': BIG_PATH})
+
+    result = _download(str(dest))
+
+    assert _linked(big).count(BIG_PATH) == 2
+    assert _fetches(big, BIG_PATH) == [None, _tail(300_000), _tail(300_000)]
+    assert 'Passes' not in result.stdout
+    assert _others_verified(dest, BIG_PATH)
+    if expiries == 1:
+        assert result.exit_code == 0, result.output
+        assert (dest / 'Big' / 'big.bin').read_bytes() == BIG
+    else:
+        assert result.exit_code == 1
+        assert f'Failed: 1\n  {BIG_PATH}: download link rejected again after a refresh (HTTP 410)\n' in result.stdout
+
+
+@pytest.mark.parametrize('ignore_range', [False, True], ids=['ranged', 'range-ignored'])
+def test_a_partial_file_is_resumed_by_the_next_run_once_the_cloud_file_is_confirmed(big, dest, ignore_range):
+    _leave_partial(big, dest)
+    big.ignore_range = ignore_range
+    earlier = len(big.requests)
+
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    lookups = [r for r in big.requests[earlier:] if r.path == '/v1/disk/resources' and r.params['path'] == BIG_PATH]
+    assert len(lookups) == 1
+    assert _fetches(big, BIG_PATH, earlier) == ([_tail(300_000), None] if ignore_range else [_tail(300_000)])
+    assert _partials(dest) == []
+
+
+@pytest.mark.parametrize('change', ['rescanned', 'changed', 'removed'])
+def test_a_partial_file_of_a_file_changed_in_the_cloud_is_never_resumed(big, dest, change):
+    _leave_partial(big, dest)
+    edited = random.Random(9).randbytes(len(BIG))
+    if change == 'removed':
+        big.remove(BIG_PATH)
+    else:
+        big.add_file(BIG_PATH, edited, modified=MODIFIED)
+    earlier = len(big.requests)
+
+    result = _download(*(['--scan-max-age', '0'] if change == 'rescanned' else []), 'disk:/Big', str(dest))
+
+    assert _partials(dest) == []
+    if change == 'rescanned':
+        assert result.exit_code == 0, result.output
+        assert _fetches(big, BIG_PATH, earlier) == [None]
+        assert (dest / 'big.bin').read_bytes() == edited
+        return
+    reason = CHANGED if change == 'changed' else 'removed from the Disk after the scan'
+    assert result.exit_code == 1
+    assert f'Failed: 1\n  {BIG_PATH}: {reason}\n' in result.stdout
+    assert _transfers(big, earlier) == []
+    assert not (dest / 'big.bin').exists()
+
+
+@pytest.mark.parametrize('held', ['complete', 'longer'])
+def test_a_partial_file_holding_the_whole_file_is_not_fetched_again(big, dest, held):
+    partial = _leave_partial(big, dest)
+    partial.write_bytes(BIG if held == 'complete' else BIG + b'extra')
+    earlier = len(big.requests)
+
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert f'1 downloaded ({format_size(len(BIG))}), ' in result.stdout
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _fetches(big, BIG_PATH, earlier) == ([] if held == 'complete' else [None])
+    assert _linked(big).count(BIG_PATH) == (1 if held == 'complete' else 2)
+
+
+def _start_download(*args: str) -> subprocess.Popen[str]:
+    return subprocess.Popen(
+        ['yandex-disk-rescue', 'download', *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+
+def _wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
+    deadline = time.monotonic() + 60
+    while not condition():
+        if child.poll() is not None:
+            pytest.fail(f'download exited with {child.returncode} before it {what}: {child.communicate()}')
+        if time.monotonic() > deadline:
+            pytest.fail(f'download never {what}')
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize('stop', [signal.SIGINT, signal.SIGKILL], ids=['sigint', 'sigkill'])
+def test_a_download_stopped_mid_file_resumes_from_its_partial_file(big, dest, stop):
+    big.chunk_delay = 0.2
+    child = _start_download('disk:/Big', str(dest))
+    try:
+        _wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
+        child.send_signal(stop)
+        _, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    if stop == signal.SIGINT:
+        assert child.returncode == 130, stderr
+        assert stderr == 'Interrupted; rerun to continue the download.\n'
+    else:
+        assert child.returncode == -signal.SIGKILL
+    held = _partial_size(dest)
+    assert 256 * 1024 < held < len(BIG)
+
+    big.chunk_delay = 0
+    earlier = len(big.requests)
+    result = _download('disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(held)]
+    assert (dest / 'big.bin').read_bytes() == BIG
+
+
+def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_file(big, dest, monkeypatch):
+    monkeypatch.setenv('YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT', '1')
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), Delay(30), where={'path': BIG_PATH})
+    child = _start_download('disk:/Big', str(dest))
+    try:
+        _wait_until(lambda: len(_fetches(big, BIG_PATH)) == 2, child, 'resumed the file')
+        resumed = [r.started for r in big.requests if r.path == '/download'][-1]
+        time.sleep(max(0.0, resumed + 2.5 - time.monotonic()))
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    assert child.returncode == 130, stderr
+    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert len(_fetches(big, BIG_PATH)) == 2
+    assert _partial_size(dest) == 300_000

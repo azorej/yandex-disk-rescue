@@ -7,8 +7,13 @@ place without replacing anything. A verified file whose record and `lstat` finge
 without being read. Any other file already at a final path is hashed: one matching the cloud is adopted as it is,
 and anything else there is moved aside once the new version is verified. Paths with no cloud counterpart are never
 looked at.
+
+A partial file left by an interrupted run or an earlier pass is resumed with an HTTP range once the cloud file is
+confirmed unchanged. A transfer that fails after receiving new data is resumed at once, within a retry budget; one
+that fails transiently otherwise waits for the next pass over the files still to download.
 """
 
+import asyncio
 import errno
 import hashlib
 import os
@@ -20,9 +25,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 from yandex_disk_rescue import api
-from yandex_disk_rescue.destination import FATAL_ERRNOS, Destination, DestinationError
+from yandex_disk_rescue.destination import FATAL_ERRNOS, Destination, DestinationError, PartialFile
 from yandex_disk_rescue.local_names import map_local_names
 from yandex_disk_rescue.manifest import (
+    DownloadRecord,
     LocalFingerprint,
     Mirror,
     MirrorEntry,
@@ -33,8 +39,10 @@ from yandex_disk_rescue.manifest import (
 from yandex_disk_rescue.scanning import display_path, listed
 from yandex_disk_rescue.units import format_size
 
+PASS_PAUSE_SECONDS = 5.0
 _NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+_CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
 
 
 class FileFailed(Exception):
@@ -43,6 +51,16 @@ class FileFailed(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class FileDeferred(FileFailed):
+    """The file's transfer failed transiently (a stall, a connection error, 408, 429 or 5xx, the retries spent); its
+    partial file and record are kept so a later pass resumes it. `retry_after` is the wait the download host asked
+    for, if any."""
+
+    def __init__(self, reason: str, *, retry_after: float | None) -> None:
+        super().__init__(reason)
+        self.retry_after = retry_after
 
 
 @dataclass(frozen=True)
@@ -66,6 +84,7 @@ class MirrorReport:
     moved_aside: list[PurePosixPath] = field(default_factory=list)
     replaced_folder: PurePosixPath | None = None
     failed: list[Failure] = field(default_factory=list)
+    passes: tuple[int, int] | None = None  # (used, limit; 0 is no limit) once a transient failure deferred a file
 
 
 @dataclass(frozen=True)
@@ -133,9 +152,15 @@ class MirrorRun:
         self.pending_files = len(pending)
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
-    async def run(self, client: api.DiskClient, content: api.ContentClient) -> MirrorReport:
+    async def run(
+        self, client: api.DiskClient, content: api.ContentClient, *, retries: int, passes: int
+    ) -> MirrorReport:
+        """Walk the entries, then resume the files deferred by a transient failure in later passes, at most `passes`
+        in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait the download
+        host asked for. `retries` bounds the immediate retries of each file in each pass."""
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         blocked: dict[PurePosixPath, str] = {}
+        deferred: list[tuple[MirrorEntry, FileDeferred]] = []
         for entry in self._entries:
             local = _local_path(entry)
             if local.name != entry.resource.path.rpartition('/')[2]:
@@ -147,8 +172,10 @@ class MirrorRun:
             elif entry.entry_id in self._current:
                 report.skipped += 1
                 _note_verified(report, entry, _recorded_method(entry))
-            else:
-                await self._download(entry, client, content, report)
+            elif (later := await self._download(entry, client, content, report, retries)) is not None:
+                deferred.append((entry, later))
+        if deferred:
+            await self._later_passes(deferred, client, content, report, retries=retries, passes=passes)
         report.replaced_folder = self._destination.replaced_folder
         report.failed += [Failure(display_path(e.path), _unencodable_reason(e)) for e in self._mirror.unencodable()]
         report.failed.sort(key=lambda failure: failure.path)
@@ -171,16 +198,55 @@ class MirrorRun:
         blocked[local] = reason
         report.failed.append(Failure(entry.resource.path, reason))
 
-    async def _download(
-        self, entry: MirrorEntry, client: api.DiskClient, content: api.ContentClient, report: MirrorReport
+    async def _later_passes(
+        self,
+        deferred: list[tuple[MirrorEntry, FileDeferred]],
+        client: api.DiskClient,
+        content: api.ContentClient,
+        report: MirrorReport,
+        *,
+        retries: int,
+        passes: int,
     ) -> None:
+        used = 1
+        while deferred and (passes == 0 or used < passes):
+            waits = [failure.retry_after for _, failure in deferred if failure.retry_after is not None]
+            await asyncio.sleep(max([PASS_PAUSE_SECONDS, *waits]))
+            used += 1
+            remaining = []
+            for entry, _ in deferred:
+                identity = RemoteIdentity.of(entry.resource)
+                resumed = replace(entry, download=DownloadRecord('partial', identity, verified_by=None, local=None))
+                if (later := await self._download(resumed, client, content, report, retries)) is not None:
+                    remaining.append((entry, later))
+            deferred = remaining
+        suffix = f' (after {used} passes)' if used > 1 else ''
+        report.failed += [Failure(entry.resource.path, failure.reason + suffix) for entry, failure in deferred]
+        report.passes = (used, passes)
+
+    async def _download(
+        self,
+        entry: MirrorEntry,
+        client: api.DiskClient,
+        content: api.ContentClient,
+        report: MirrorReport,
+        retries: int,
+    ) -> FileDeferred | None:
+        """Mirror one file into `report`; the failure when it is deferred to a later pass instead."""
         try:
             outcome = await download_file(
-                entry, client=client, content=content, mirror=self._mirror, destination=self._destination
+                entry,
+                client=client,
+                content=content,
+                mirror=self._mirror,
+                destination=self._destination,
+                retries=retries,
             )
+        except FileDeferred as deferred:
+            return deferred
         except FileFailed as failed:
             report.failed.append(Failure(entry.resource.path, failed.reason))
-            return
+            return None
         if outcome.adopted:
             report.skipped += 1
             report.adopted.append(entry.resource.path)
@@ -199,6 +265,7 @@ async def download_file(
     content: api.ContentClient,
     mirror: Mirror,
     destination: Destination,
+    retries: int,
 ) -> FileOutcome:
     """Make the file `entry` verified at its local path and record it; the only state it touches is the mirror's
     records and the destination.
@@ -207,8 +274,13 @@ async def download_file(
     downloaded and verified first, and only then is whatever stands at the local path moved aside and the new file
     placed. A path that is the same file as another entry's verified copy is never adopted, moved or replaced.
 
-    Raises `FileFailed` when this file cannot be mirrored, `DestinationError` when the destination cannot be
-    written at all, and the API errors that stop the run (`TokenRejectedError`, `DiskApiError`).
+    A partial file whose `partial` record is for the entry's identity is resumed after `client.resource` confirms
+    the cloud file still has it; any other partial file is discarded. A transfer that fails after new data is
+    resumed at once, up to `retries` times.
+
+    Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileFailed` when
+    this file cannot be mirrored, `DestinationError` when the destination cannot be written at all, and the API
+    errors that stop the run (`TokenRejectedError`, `DiskApiError`).
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
@@ -219,10 +291,8 @@ async def download_file(
                 raise FileFailed(reason)
             if (verified_by := _adopt(entry, local, identity, existing, mirror, destination)) is not None:
                 return FileOutcome(verified_by, adopted=True, moved_aside=False)
-        mirror.record_partial(entry.entry_id, identity)
-        href = await _download_link(client, entry.resource.path)
         verified_by = await _fetch_verified(
-            entry, identity, href, content=content, mirror=mirror, destination=destination
+            entry, identity, client=client, content=content, mirror=mirror, destination=destination, retries=retries
         )
         moved_aside = _clear_the_way(entry, local, mirror, destination)
         try:
@@ -279,28 +349,30 @@ def _clear_the_way(entry: MirrorEntry, local: PurePosixPath, mirror: Mirror, des
 async def _fetch_verified(
     entry: MirrorEntry,
     identity: RemoteIdentity,
-    href: str,
     *,
+    client: api.DiskClient,
     content: api.ContentClient,
     mirror: Mirror,
     destination: Destination,
+    retries: int,
 ) -> VerifiedBy:
-    """Fetch the file into its partial file while hashing it, verify it, and give it the cloud mtime, durably.
+    """Fetch the file into its partial file while hashing it, keeping the bytes already there when they can be
+    resumed, verify it, and give it the cloud mtime, durably.
 
     A partial file that fails verification is deleted and its record dropped; one cut short by a transfer error is
     kept.
     """
-    digest = Digest()
     with destination.partial(entry.entry_id) as partial:
-
-        def write(offset: int, chunk: bytes) -> None:
-            digest.update(offset, chunk)
-            partial.write(offset, chunk)
-
-        try:
-            await content.fetch(href, start=0, end=identity.size, size=identity.size, write=write)
-        except api.TransferError as exc:
-            raise FileFailed(exc.reason) from None
+        start = await _resume_point(entry, identity, partial, client=client, mirror=mirror, destination=destination)
+        partial.truncate(start)
+        mirror.record_partial(entry.entry_id, identity)
+        digest = Digest()
+        for chunk in partial.chunks(start):
+            digest.update(digest.size, chunk)
+        if start == 0 or start < identity.size:
+            digest = await _transfer(
+                entry.resource.path, identity, partial, digest, client=client, content=content, retries=retries
+            )
         try:
             verified_by = digest.verify(identity)
         except FileFailed:
@@ -310,13 +382,102 @@ async def _fetch_verified(
     return verified_by
 
 
+async def _resume_point(
+    entry: MirrorEntry,
+    identity: RemoteIdentity,
+    partial: PartialFile,
+    *,
+    client: api.DiskClient,
+    mirror: Mirror,
+    destination: Destination,
+) -> int:
+    """How many bytes of the partial file to keep: all of them when its record is for `identity`, it holds no more
+    than the file, and the cloud file still has that identity; otherwise none.
+
+    Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
+    check runs for an empty partial file too: an earlier attempt that received nothing usable may have met the
+    changed file.
+    """
+    held = partial.size()
+    record = entry.download
+    if held > identity.size or record is None or record.state != 'partial' or record.identity != identity:
+        return 0
+    try:
+        live = await client.resource(entry.resource.path)
+    except api.RemotePathNotFoundError:
+        _discard(entry, mirror, destination)
+        raise FileFailed('removed from the Disk after the scan') from None
+    if live.kind != 'file' or RemoteIdentity.of(live) != identity:
+        _discard(entry, mirror, destination)
+        raise FileFailed(_CHANGED)
+    return held
+
+
+async def _transfer(
+    path: str,
+    identity: RemoteIdentity,
+    partial: PartialFile,
+    digest: Digest,
+    *,
+    client: api.DiskClient,
+    content: api.ContentClient,
+    retries: int,
+) -> Digest:
+    """Fetch the rest of the file after the `digest.size` bytes already in the partial file, and return the digest
+    of the whole file.
+
+    A failure after new data is resumed at once from where it stopped, up to `retries` times. An expired link is
+    refreshed once without spending a retry. A host ignoring the range restarts the file from byte 0.
+
+    Raises `FileDeferred` for a transient failure that received no new data or spent the retries, and `FileFailed`
+    for any other failure.
+    """
+
+    # `digest` is looked up at call time, so the fresh digest of a restart from byte 0 takes over.
+    def write(offset: int, chunk: bytes) -> None:
+        digest.update(offset, chunk)
+        partial.write(offset, chunk)
+
+    href = await _download_link(client, path)
+    refreshed = False
+    attempt = 1
+    while True:
+        before = digest.size
+        try:
+            await content.fetch(href, start=before, end=identity.size, size=identity.size, write=write)
+        except api.LinkExpiredError as exc:
+            if refreshed:
+                raise FileFailed(f'download link rejected again after a refresh (HTTP {exc.status})') from None
+            refreshed = True
+            href = await _download_link(client, path)
+        except api.RangeNotHonouredError as exc:
+            if before == 0:
+                raise FileFailed(exc.reason) from None
+            partial.truncate(0)
+            digest = Digest()
+        except api.TransientTransferError as exc:
+            if digest.size == identity.size:
+                return digest
+            if digest.size == before or attempt > retries:
+                reason = exc.reason if attempt == 1 else f'{exc.reason} (after {attempt} attempts)'
+                raise FileDeferred(reason, retry_after=exc.retry_after) from None
+            attempt += 1
+        except api.TransferError as exc:
+            raise FileFailed(exc.reason) from None
+        else:
+            return digest
+
+
 def mirror_summary(report: MirrorReport) -> list[str]:
-    """The lines reporting a run: the counts, adopted and size-only files, renamed entries, what was moved aside,
-    and failures with their reasons."""
+    """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
+    files, renamed entries, what was moved aside, and failures with their reasons."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.failed)} failed'
     ]
+    if report.passes is not None:
+        used, limit = report.passes
+        lines.append(f'Passes: {used} of {limit or "unlimited"}')
     if report.adopted:
         lines.append(f'Already on disk and verified: {len(report.adopted)}')
         lines += listed('', report.adopted, len(report.adopted), '')

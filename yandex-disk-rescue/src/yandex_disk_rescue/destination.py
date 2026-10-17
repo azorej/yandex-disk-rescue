@@ -148,10 +148,11 @@ class Destination:
 
     @contextmanager
     def partial(self, entry_id: int) -> Iterator[PartialFile]:
-        """Open the partial file of `entry_id`, emptied, for writing."""
+        """Open the partial file of `entry_id` for reading and writing, keeping its content; a missing one is created
+        empty."""
         fd = os.open(
             str(entry_id),
-            os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW | os.O_CLOEXEC,
+            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
             0o666,
             dir_fd=self._partial_fd,
         )
@@ -260,10 +261,27 @@ class ExistingFile:
 
 
 class PartialFile:
-    """An open partial file: positional writes, then the final mtime and an fsync."""
+    """An open partial file: its size, reading back and cutting what it holds, positional writes, then the final mtime
+    and an fsync."""
 
     def __init__(self, fd: int) -> None:
         self._fd = fd
+
+    def size(self) -> int:
+        return os.fstat(self._fd).st_size
+
+    def chunks(self, end: int) -> Iterator[bytes]:
+        """The bytes `[0, end)` in order; the file must hold at least `end` bytes."""
+        offset = 0
+        while offset < end:
+            chunk = os.pread(self._fd, min(_READ_SIZE, end - offset), offset)
+            if not chunk:
+                raise ValueError(f'the partial file ends at {offset} bytes, before {end}')
+            yield chunk
+            offset += len(chunk)
+
+    def truncate(self, length: int) -> None:
+        os.ftruncate(self._fd, length)
 
     def write(self, offset: int, chunk: bytes) -> None:
         view = memoryview(chunk)

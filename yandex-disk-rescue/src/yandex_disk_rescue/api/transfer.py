@@ -57,7 +57,9 @@ class TooManyBytesError(TransferError):
 class ContentClient:
     """An async context manager that owns one tokenless `httpx.AsyncClient` following redirects.
 
-    `timeout` (seconds) bounds connecting and each read, not the whole transfer.
+    `timeout` (seconds) is a stall timeout: a fetch fails when connecting, or any wait for data (the response
+    headers or the next piece of the body), takes longer. A slow but steady transfer never trips it, and time spent
+    in the `write` callback does not count.
     """
 
     def __init__(self, *, timeout: float) -> None:
@@ -87,6 +89,8 @@ class ContentClient:
             async with self._http.stream('GET', href, headers=headers) as response:
                 _check_response(response, start=start, end=end, size=size, ranged=not whole)
                 await _write_body(response, start=start, end=end, write=write)
+        except httpx.TimeoutException:
+            raise TransientTransferError(f'the download stalled: no data for {self._timeout:g} s') from None
         except httpx.TransportError as exc:
             raise TransientTransferError(
                 f'the download failed: {describe_transport_error(exc, timeout=self._timeout)}'

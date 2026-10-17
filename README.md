@@ -176,8 +176,9 @@ exactly as [`scan`](#scanning-a-folder) does and prints the scan summary,
 unless a recent scan covers it (below). It then mirrors that folder into
 DEST, one file at a time: the folder structure is kept, empty folders are
 created, and every file gets the modification time it has on the Disk. It
-takes the `--api-*` options, `--download-timeout` and `--scan-max-age` (see
-[Configuration](#configuration)), and `--no-scan`.
+takes the `--api-*` options, `--download-timeout`, `--download-retries`,
+`--download-passes` and `--scan-max-age` (see [Configuration](#configuration)),
+and `--no-scan`.
 
 **When it scans.** `download` reuses the last completed scan of the account
 covering REMOTE_PATH — a scan of REMOTE_PATH itself or of a folder above it,
@@ -211,13 +212,51 @@ files. Placing a file never replaces anything at its final path.
 again when its Disk metadata is unchanged and the local file still has the
 recorded size, modification time and inode. A file changed on the Disk, or
 edited or touched locally, is handled like any file already in DEST (below).
-A transfer error fails that file; rerun to fetch it.
+
+**Interruptions, stalls and retries.** A download that stops part-way — Ctrl+C,
+a kill, a crash, a dropped connection — keeps the bytes received so far in
+its partial file. The next attempt, in the same run or a later one, asks the
+Disk for the file again and, when its size, checksums and modification time
+are unchanged, fetches only the rest with an HTTP `Range` request. When the
+file changed, the partial file is deleted and the file fails with `changed in
+the cloud since the scan; rerun with --scan-max-age 0 to fetch the new
+version` (after a rescan, the new version is downloaded from the start). A
+partial file larger than the file, or one left for an older version, is
+deleted and the file is downloaded from the start; when the download host
+ignores `Range`, the whole file is fetched again, never appended to the bytes
+kept.
+
+- **Stalls.** A download fails as stalled (`the download stalled: no data for
+  15 s`) when the download host sends nothing for `download_timeout` seconds,
+  whether it is slow to answer or pauses mid-file. Only silence counts: a
+  slow but steady download never stalls, and time spent writing to DEST does
+  not count.
+- **Retries.** A download that fails after receiving new data (a cut
+  connection, a stall after some data) is resumed at once from where it
+  stopped, up to `download_retries` times; past that the file's last reason
+  gets `(after N attempts)`. A download that fails before any new data
+  arrives (a stall before the first byte, a refused connection, `408`, `429`
+  or `5xx`) is not retried at once.
+- **Passes.** Files whose download failed that way, or ran out of retries,
+  are resumed in another pass over the files still to download, each with a
+  new download link, after a 5 s pause (longer when the host sent
+  `Retry-After`, up to 300 s). A run makes at most `download_passes` passes
+  (`0`: until every file is done or Ctrl+C); a file still failing after the
+  last one is reported with its last reason and `(after N passes)`. Once a
+  file needed another pass, the summary shows `Passes: <used> of <limit>`. A
+  checksum mismatch, a refused download, a file changed in the cloud and a
+  local write error fail the file at once; no later pass retries it.
+- **Expired links.** A download link the host rejects (`401`, `403` or
+  `410`) is replaced by a new one once per pass, and the download continues
+  from the bytes received; when the new link is rejected too, the file fails
+  with `download link rejected again after a refresh (HTTP <n>)`.
 
 **Summary.**
 
 ```
 Downloading 120 files (1.2 GiB) to /mnt/backup/Photos
 Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 1 failed
+Passes: 2 of 7
 Already on disk and verified: 40
   disk:/Photos/2023/beach.jpg
   …
@@ -281,7 +320,8 @@ read-only filesystem or a permission error stops the run with
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run; files already
 verified stay verified, and a rerun picks up where it stopped. Ctrl+C prints
-`Interrupted; rerun to continue the download.` and exits with 130.
+`Interrupted; rerun to continue the download.` and exits with 130; partial
+files are kept, and the next run resumes them.
 
 ### Local file names
 
@@ -354,13 +394,15 @@ first one that sets it wins:
 | `api_timeout` | `--api-timeout` | `YANDEX_DISK_RESCUE_API_TIMEOUT` | `30` | 1 to 300 (s) |
 | `api_retries` | `--api-retries` | `YANDEX_DISK_RESCUE_API_RETRIES` | `5` | 0 to 20 |
 | `api_url` | `--api-url` (hidden) | `YANDEX_DISK_RESCUE_API_URL` | `https://cloud-api.yandex.net` | an `http://` or `https://` URL |
-| `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `60` | 1 to 600 (s); bounds connecting to the download host and each read |
+| `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `15` | 1 to 600 (s); a download with no data from the host for this long has stalled |
+| `download_retries` | `--download-retries` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | `5` | 0 to 20; immediate resumes of a download that failed after new data |
+| `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until all are done |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
-(`auth login`, `auth status`, `scan`, `download`); `download_timeout` and
-`scan_max_age` apply to `download` and `client_id` to `auth login`.
+(`auth login`, `auth status`, `scan`, `download`); the `download_*` options
+and `scan_max_age` apply to `download` and `client_id` to `auth login`.
 
 The config file is `$XDG_CONFIG_HOME/yandex-disk-rescue/config.toml`
 (`~/.config/yandex-disk-rescue/config.toml` when `XDG_CONFIG_HOME` is unset

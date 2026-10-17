@@ -255,7 +255,32 @@ async def test_a_response_that_stalls_past_the_timeout_is_transient(fake_disk_ap
     with pytest.raises(api.TransientTransferError) as excinfo:
         await _fetch(fake_disk_api, partial, timeout=0.2)
 
-    assert excinfo.value.reason == 'the download failed: the request timed out after 0.2 s (ReadTimeout)'
+    assert excinfo.value.reason == 'the download stalled: no data for 0.2 s'
+
+
+async def test_a_slow_but_steady_body_never_trips_the_stall_timeout(fake_disk_api, remote_file, partial):
+    fake_disk_api.chunk_delay = 0.15
+    href = await _link(fake_disk_api)
+
+    async with api.ContentClient(timeout=0.4) as content:
+        began = time.monotonic()
+        await content.fetch(href, start=0, end=SIZE, size=SIZE, write=partial.write)
+        elapsed = time.monotonic() - began
+
+    assert partial.read() == CONTENT
+    assert elapsed > 0.4
+
+
+async def test_time_spent_writing_does_not_count_against_the_stall_timeout(fake_disk_api, remote_file, partial):
+    def slow_write(offset: int, chunk: bytes) -> None:
+        time.sleep(0.3)
+        partial.write(offset, chunk)
+
+    href = await _link(fake_disk_api)
+    async with api.ContentClient(timeout=0.2) as content:
+        await content.fetch(href, start=0, end=SIZE, size=SIZE, write=slow_write)
+
+    assert partial.read() == CONTENT
 
 
 async def test_an_unreachable_host_is_transient_and_hides_the_link(closed_port_url, partial):
