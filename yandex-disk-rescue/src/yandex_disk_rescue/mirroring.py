@@ -3,7 +3,10 @@ summarizing a run.
 
 A file is verified before it reaches its final path: the bytes go to a partial file while their MD5 and SHA-256
 are computed, the size and every checksum the cloud provides are checked, and only then is the file moved into
-place without replacing anything. A downloaded file that fails the check is moved, never deleted, to the run's
+place without replacing anything. With the destination's partial files in a separate folder, a finished partial file
+is copied to a staged copy in the destination as one sequential stream, one copy of the whole run at a time, and the
+digest of the bytes copied is the check; the staged copy is what is placed or quarantined, and the partial file is
+deleted once that is recorded. A downloaded file that fails the check is moved, never deleted, to the run's
 quarantine folder and recorded; while the cloud file keeps that identity, only `--retry-failed` downloads it again. A
 verified file whose record and `lstat` fingerprint still match is skipped without being read, unless `verify` found
 the file at its path broken: such a file is downloaded again without its copy there being read, and that copy is
@@ -12,9 +15,9 @@ adopted as it is, and anything else there is moved aside once the new version is
 counterpart are never looked at.
 
 A file larger than the policy's segment threshold is downloaded as several segments, ranged fetches running in
-parallel into one partial file, which is preallocated to the file's size first and read back in full to be verified
-once every segment is in; any other file is one stream, verified by the digest computed as it arrives. The segments
-are fixed when the download starts and kept by every later turn of it.
+parallel into one partial file, which is preallocated to the file's size first and, with partial files in the
+destination, read back in full to be verified once every segment is in; any other file is one stream, there verified
+by the digest computed as it arrives. The segments are fixed when the download starts and kept by every later turn of it.
 
 Every download keeps a checkpoint journal in the manifest: for each segment, the offset up to which its bytes were
 fsynced and the SHA-256 of those bytes. A checkpoint is taken every `checkpoint_bytes` a segment receives,
@@ -266,13 +269,14 @@ def segment_plan(size: int, *, segments: int, threshold: int) -> tuple[Segment, 
 
 @dataclass(frozen=True)
 class _RunTools:
-    """What every turn of a run shares: the clients, the worker threads, the placement lock, the report and the
-    transfer policy."""
+    """What every turn of a run shares: the clients, the worker threads, the placement lock, the copy lock, the report
+    and the transfer policy."""
 
     client: api.DiskClient
     content: api.ContentClient
     threads: DiskThreads
     placement: asyncio.Lock
+    copying: asyncio.Lock
     report: MirrorReport
     policy: TransferPolicy
 
@@ -415,7 +419,7 @@ class MirrorRun:
         once every file's turn has ended."""
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         with DiskThreads(content.connections + _SPARE_THREADS) as threads:
-            tools = _RunTools(client, content, threads, asyncio.Lock(), report, policy)
+            tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), report, policy)
             deferred = await self._first_pass(tools)
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes)
@@ -545,6 +549,7 @@ class MirrorRun:
                 content=tools.content,
                 threads=tools.threads,
                 placement=tools.placement,
+                copying=tools.copying,
                 mirror=self._mirror,
                 destination=self._destination,
                 names=self._names,
@@ -578,6 +583,7 @@ async def download_file(
     content: api.ContentClient,
     threads: DiskThreads,
     placement: asyncio.Lock,
+    copying: asyncio.Lock,
     mirror: Mirror,
     destination: Destination,
     names: LocalNames,
@@ -626,6 +632,7 @@ async def download_file(
             content=content,
             threads=threads,
             placement=placement,
+            copying=copying,
             mirror=mirror,
             destination=destination,
             policy=policy,
@@ -642,6 +649,8 @@ async def download_file(
         async with placement:
             (placed, moved_aside), local = await _create(entry, local, place, names, destination)
             mirror.record_verified(entry.entry_id, identity, verified_by, placed)
+        if destination.separate_partials:
+            await threads.run(destination.remove_partial, entry.entry_id)
     return FileOutcome(local, verified_by, adopted=False, moved_aside=moved_aside)
 
 
@@ -779,6 +788,7 @@ async def _fetch_verified(
     content: api.ContentClient,
     threads: DiskThreads,
     placement: asyncio.Lock,
+    copying: asyncio.Lock,
     mirror: Mirror,
     destination: Destination,
     policy: TransferPolicy,
@@ -786,13 +796,16 @@ async def _fetch_verified(
     """Fetch the file into its partial file, keeping the confirmed bytes already there when they can be resumed, give
     it the cloud mtime, durably, and verify it.
 
-    A file fetched as one stream is cut to its confirmed bytes and verified by the digest computed as it arrives. A
-    segmented file is preallocated to its size first, and read back in full once every segment is in.
+    A file fetched as one stream is cut to its confirmed bytes first, a segmented file preallocated to its size. With
+    partial files in the destination, a file fetched as one stream is verified by the digest computed as it arrives,
+    and a segmented file is read back in full once every segment is in. With separate partials, a checkpoint then
+    confirms every byte, and the file is copied to its staged copy in the destination under `copying`, one copy of the
+    run at a time, and verified by the digest of the bytes copied; the cloud mtime goes to the copy.
 
-    A partial file that fails verification is moved to the run's quarantine folder under `placement`, then recorded as
-    quarantined, which drops its download record, and `FileQuarantined` is raised. One cut short by a transfer error is
-    kept with its journal. The partial file is closed only once no thread call on it is running, also when the task
-    is cancelled.
+    A file that fails verification is moved to the run's quarantine folder under `placement`, then recorded as
+    quarantined, which drops its download record, and `FileQuarantined` is raised; a separate partial file is deleted
+    after the record. One cut short by a transfer error is kept with its journal. The partial file is closed only once
+    no thread call on it is running, also when the task is cancelled.
     """
     with destination.partial(entry.entry_id) as partial:
         streams = await _resume(
@@ -829,14 +842,47 @@ async def _fetch_verified(
             retries=policy.retries,
         )
         await fetch.run()
-        digest = await _file_digest(journal, partial, threads, identity.size)
-        await threads.run(partial.finish, _mtime_ns(identity.modified))
+        if destination.separate_partials:
+            await journal.take()
+            digest = await _copy_to_destination(entry.entry_id, identity, partial, destination, threads, copying)
+        else:
+            digest = await _file_digest(journal, partial, threads, identity.size)
+            await threads.run(partial.finish, _mtime_ns(identity.modified))
     if (reason := digest.mismatch(identity)) is None:
         return _method(identity)
     async with placement:
         copy = await threads.run(destination.quarantine, entry.entry_id, _local_path(entry))
     mirror.record_quarantined(entry.entry_id, identity, copy, reason)
+    if destination.separate_partials:
+        await threads.run(destination.remove_partial, entry.entry_id)
     raise FileQuarantined(reason, copy)
+
+
+async def _copy_to_destination(
+    entry_id: int,
+    identity: RemoteIdentity,
+    partial: PartialFile,
+    destination: Destination,
+    threads: DiskThreads,
+    copying: asyncio.Lock,
+) -> Digest:
+    """Copy the finished partial file to its staged copy in the destination, in order, one chunk per thread call,
+    under `copying`; then give the copy the cloud mtime, durably. The digest of the bytes copied."""
+    digest = Digest()
+    async with copying:
+        with destination.copy_target(entry_id) as target:
+            await _hash(digest, _copied(partial.chunks(0, identity.size), target), threads, 0)
+            await threads.run(target.finish, _mtime_ns(identity.modified))
+    return digest
+
+
+def _copied(chunks: Iterator[bytes], target: PartialFile) -> Iterator[bytes]:
+    """`chunks`, the bytes from offset 0 on, each written to `target` at its offset before it is passed on."""
+    offset = 0
+    for chunk in chunks:
+        target.write(offset, chunk)
+        yield chunk
+        offset += len(chunk)
 
 
 async def _resume(

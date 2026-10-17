@@ -141,11 +141,26 @@ def _intact_lines(dest, intact: int, *, missing=0, modified=0, corrupt=0, quaran
     )
 
 
-def test_a_complete_mirror_is_intact_with_no_token_and_no_network(disk, dest, monkeypatch, closed_port_url):
-    assert run_download(str(dest)).exit_code == 0
+@pytest.mark.parametrize('partials', ['in-dest', 'separate'])
+def test_a_complete_mirror_is_intact_with_no_token_and_no_network(
+    disk, dest, monkeypatch, closed_port_url, partials, request
+):
+    partial_root = request.getfixturevalue('partial_root') if partials == 'separate' else None
+    args = [] if partial_root is None else ['--partial-dir', str(partial_root)]
+    assert run_download(*args, str(dest)).exit_code == 0
     monkeypatch.delenv('YANDEX_DISK_RESCUE_TOKEN')
     monkeypatch.setenv('YANDEX_DISK_RESCUE_API_URL', closed_port_url)
     earlier = len(disk.requests)
+    separate = [] if partial_root is None else [partial_root, *partial_root.rglob('*')]
+    mtimes = [folder.stat().st_mtime_ns for folder in separate]
+    opened: list[str] = []
+    os_open = os.open
+
+    def logged_open(path, *args, **kwargs):
+        opened.append(os.fspath(path))
+        return os_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', logged_open)
 
     result = _verify(str(dest))
 
@@ -156,6 +171,10 @@ def test_a_complete_mirror_is_intact_with_no_token_and_no_network(disk, dest, mo
     assert result.stderr == ''
     assert len(disk.requests) == earlier
     assert _findings() == []
+    assert [folder.stat().st_mtime_ns for folder in separate] == mtimes
+    if partial_root is not None:
+        assert str(dest) in opened
+        assert [path for path in opened if path.startswith(str(partial_root))] == []
 
 
 def test_each_kind_of_damage_is_reported_and_recorded_and_a_link_is_never_followed(disk, dest, tmp_path):

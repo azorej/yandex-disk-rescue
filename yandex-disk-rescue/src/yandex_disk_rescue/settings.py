@@ -6,6 +6,7 @@ Validation runs on the value from every source; a violation is a usage error (ex
 values it accepts.
 """
 
+import os
 import re
 import urllib.parse
 from collections.abc import Callable
@@ -75,6 +76,12 @@ def _http_url(value: str) -> str | None:
     return 'must be an http:// or https:// URL.'
 
 
+def _absolute_or_empty(value: str) -> str | None:
+    if value == '' or os.path.isabs(value):
+        return None
+    return 'must be an absolute path, or empty to keep partial files in DEST.'
+
+
 def _client_id(value: str) -> str | None:
     if re.fullmatch(r'[0-9a-f]{32}', value):
         return None
@@ -138,6 +145,14 @@ DOWNLOAD_SEGMENT_THRESHOLD_MIB = Setting(
     'Size above which a file is downloaded as several segments, in MiB.',
     _in_range(1, 65536),
 )
+PARTIAL_DIR = Setting(
+    'partial_dir',
+    '',
+    'Existing folder, outside DEST and best on a fast local disk, to keep the partial files of downloads in (in a '
+    "folder of DEST's own below it); each finished file is then copied to DEST, one at a time. Empty keeps them in "
+    'DEST.',
+    _absolute_or_empty,
+)
 SCAN_MAX_AGE = Setting(
     'scan_max_age',
     60,
@@ -167,6 +182,7 @@ SETTINGS: dict[str, Setting[Any]] = {
         DOWNLOAD_CHECKPOINT_MIB,
         DOWNLOAD_SEGMENTS,
         DOWNLOAD_SEGMENT_THRESHOLD_MIB,
+        PARTIAL_DIR,
         SCAN_MAX_AGE,
         CLIENT_ID,
     )
@@ -184,6 +200,7 @@ DownloadConnections = Annotated[int, DOWNLOAD_CONNECTIONS.typer_option()]
 DownloadCheckpointMib = Annotated[int, DOWNLOAD_CHECKPOINT_MIB.typer_option()]
 DownloadSegments = Annotated[int, DOWNLOAD_SEGMENTS.typer_option()]
 DownloadSegmentThresholdMib = Annotated[int, DOWNLOAD_SEGMENT_THRESHOLD_MIB.typer_option()]
+PartialDir = Annotated[str, PARTIAL_DIR.typer_option()]
 ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 

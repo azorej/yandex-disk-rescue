@@ -35,6 +35,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | MiB a segment of a download receives between two checkpoints, 1 to 1024 (default 32). Same as `--download-checkpoint-mib`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | Segments a file above the segment threshold is downloaded as, in parallel, 1 to 8 (default 4; 1 never splits). Same as `--download-segments`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | Size above which a file is downloaded as segments, 1 to 65536 MiB (default 256). Same as `--download-segment-threshold-mib`. |
+| `YANDEX_DISK_RESCUE_PARTIAL_DIR` | Existing folder, an absolute path outside DEST, below which `download` keeps DEST's partial files (in `<folder>/<key>/`) and copies each finished one to DEST; empty counts as unset (default: partial files in DEST). Same as `--partial-dir`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
@@ -116,8 +117,9 @@ yandex-disk-rescue/
 │   ├── commands/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
-│   │   │             #   destination, mirror run of every entry or of the retry set (`--retry-failed`), its
-│   │   │             #   start line, summary, exit code
+│   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
+│   │   │             #   retry set (`--retry-failed`), its start line, the partial-folder line, summary,
+│   │   │             #   exit code
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, exit code
 │   │                 #   and Ctrl+C message; no token, no network
@@ -139,7 +141,9 @@ yandex-disk-rescue/
 │   │                 #   a segmented file, parallel ranged fetches of its segments while hashing with
 │   │                 #   checkpoints, immediate retries after new data and one link refresh per pass, the
 │   │                 #   fallback to one stream when the host ignores a range;
-│   │                 #   verify, by reading a segmented file back, quarantining a file that fails; move aside
+│   │                 #   verify, by reading a segmented file back, or with separate partial files by
+│   │                 #   copying the finished file to its staged copy in DEST, one copy of the run at a time,
+│   │                 #   hashing the bytes copied; quarantining a file that fails; move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
 │   │                 #   failure records written as entries fail and dropped as they succeed, the summary
@@ -155,10 +159,13 @@ yandex-disk-rescue/
 │   │                 #   it while the report covers the whole pass; the summary lines
 │   ├── disk_threads.py # DiskThreads — the run's dedicated worker threads; a cancelled caller waits for its call
 │   │                 #   in flight, so no descriptor is closed under a running call
-│   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
-│   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
-│   │                 #   aside into the run's `replaced/` folder, moving a partial file into the run's
-│   │                 #   `quarantine/` folder, and placement, never through a link; which errors stop the run;
+│   ├── destination.py # The destination folder: argument checks (DEST and `--partial-dir`), the run lock and
+│   │                 #   work directory, the RENAME_NOREPLACE probe, partial files in DEST's `partial/` or in
+│   │                 #   DEST's own folder below `--partial-dir` (`<key>/`, created on open), the staged copy
+│   │                 #   `partial/<id>.copy` a separate partial file is copied to, reading existing files,
+│   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
+│   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
+│   │                 #   link; which errors stop the run;
 │   │                 #   the read-only destination `verify` opens (lookups, reading files, the run lock when a
 │   │                 #   lock file exists, whether the destination itself is still readable)
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
@@ -194,7 +201,8 @@ yandex-disk-rescue/
     ├── data/manifest-v4.sql # A schema-v4 manifest dump with a verified and a partial record, the input of a
     │                        #   migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures; `disk`
-    │                       #   (the fake serving `mirror_tree.FILES`) and `dest`
+    │                       #   (the fake serving `mirror_tree.FILES`), `dest`, and `partial_root` (a folder on
+    │                       #   `/dev/shm`, another filesystem than `dest`'s)
     ├── mirror_tree.py      # The tree the download and verify tests mirror; running `download`, running a command
     │                       #   in a child process and waiting on it, the local path of a Disk file, the replaced
     │                       #   and quarantine run folders, a corrupted copy of bytes
