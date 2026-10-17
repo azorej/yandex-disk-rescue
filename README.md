@@ -5,8 +5,9 @@ account to local storage. It is a headless analogue of the Windows app
 [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
 > **Status: early development.** The CLI skeleton exists
-> (`yandex-disk-rescue --help`, `--version`). Download features are being
-> built. Planned work is tracked in GitHub issues.
+> (`yandex-disk-rescue --help`, `--version`) with OAuth token handling under
+> `yandex-disk-rescue auth`. Download features are being built. Planned work
+> is tracked in GitHub issues.
 
 ## Goals
 
@@ -23,6 +24,24 @@ account to local storage. It is a headless analogue of the Windows app
 - **CLI only.** Scriptable, cron- and systemd-friendly, no GUI.
 
 This is an independent, unofficial tool. It is not affiliated with Yandex.
+
+## Authentication
+
+The tool talks to Yandex Disk with an OAuth token. It looks for the token in
+this order:
+
+1. The `YANDEX_DISK_RESCUE_TOKEN` environment variable. If it is set but
+   blank, that is an error; the stored file is not used as a fallback.
+2. The token file `$XDG_CONFIG_HOME/yandex-disk-rescue/token`
+   (`~/.config/yandex-disk-rescue/token` when `XDG_CONFIG_HOME` is unset or
+   not an absolute path). The file is mode `0600` inside a `0700`
+   directory. A token file readable by group or others is refused, as ssh
+   does; fix it with `chmod 600 <file>`.
+
+`yandex-disk-rescue auth logout` deletes the stored token file. It succeeds
+when there is no file, and warns if `YANDEX_DISK_RESCUE_TOKEN` still provides
+a token. Deleting the file does not revoke the token at Yandex: revoke the
+app's access in Yandex ID at <https://id.yandex.com/personal/data-access>.
 
 ## Quick start
 

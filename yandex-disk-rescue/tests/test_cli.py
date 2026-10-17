@@ -24,3 +24,10 @@ def test_help_describes_the_tool():
 def test_installed_console_script_runs():
     result = subprocess.run(['yandex-disk-rescue', '--version'], capture_output=True, text=True, check=True)
     assert result.stdout.strip() == f'yandex-disk-rescue {__version__}'
+
+
+def test_auth_help_lists_logout():
+    result = runner.invoke(app, ['auth', '--help'])
+    assert result.exit_code == 0
+    assert 'Manage the Yandex OAuth token.' in result.stdout
+    assert 'logout' in result.stdout
