@@ -59,9 +59,8 @@ register one at <https://oauth.yandex.com/client/new> with:
 - both Disk permissions: read all of Disk (`cloud_api:disk.read`) and
   access information about Disk (`cloud_api:disk.info`).
 
-Then pass its ClientID with `--client-id ID` or the
-`YANDEX_DISK_RESCUE_CLIENT_ID` environment variable (the option wins). A
-value that is not 32 lowercase hex characters is a usage error (exit `2`).
+Then set its ClientID with the `client_id` option (`--client-id ID`, see
+[Configuration](#configuration)).
 
 ### Automation
 
@@ -160,7 +159,7 @@ Paths outside `disk:/` (such as `trash:/`) are refused.
 |---|---|
 | `0` | Success |
 | `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run |
-| `2` | Invalid input: a usage error, an option value out of range, a remote path outside `disk:/` |
+| `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/` |
 | `130` | Interrupted with Ctrl+C |
 
 ## Rate limiting
@@ -168,8 +167,8 @@ Paths outside `disk:/` (such as `trash:/`) are refused.
 Every Disk API request of a command goes through one shared limiter:
 
 - Request starts are at least the current interval apart (base:
-  `--api-interval-ms`, default 50, 25 to 1000), and at most
-  `--api-concurrency` requests (default 7, 1 to 30) are in flight.
+  `api_interval_ms`), and at most `api_concurrency` requests are in
+  flight.
 - A throttling response is `429`, `408` or any `5xx`. Each one doubles the
   current interval, up to 2 s or 8 times the base, whichever is larger.
   Every 10 consecutive successful responses halve it again, never below the
@@ -178,18 +177,60 @@ Every Disk API request of a command goes through one shared limiter:
   date), every request start pauses until then, for at most 300 s.
 
 A request that fails with a transport error (including a timeout,
-`--api-timeout`, default 30 s, 1 to 300) or a throttling response is retried
-up to `--api-retries` times (default 5, 0 to 20). Each retry waits
+`api_timeout`) or a throttling response is retried up to `api_retries`
+times. Each retry waits
 `Retry-After` when the server sent one, otherwise an exponential backoff with
 jitter from 0.5 s up to 30 s. Other `4xx` responses are not retried. When
 the retries run out, the error names the last failure and ends with
 `(after N attempts)`.
 
-Each option can also be set with an environment variable named after it:
-`YANDEX_DISK_RESCUE_API_INTERVAL_MS`, `YANDEX_DISK_RESCUE_API_CONCURRENCY`,
-`YANDEX_DISK_RESCUE_API_TIMEOUT` and `YANDEX_DISK_RESCUE_API_RETRIES`; the
-option wins. A value outside its range, from either source, is a usage
-error (exit `2`).
+The defaults, valid values, flags and environment variables of these
+options are in [Configuration](#configuration).
+
+## Configuration
+
+Every option can be set in three places besides its built-in default. The
+first one that sets it wins:
+
+1. the command-line flag, for example `--api-interval-ms 100`;
+2. the environment variable, for example `YANDEX_DISK_RESCUE_API_INTERVAL_MS=100`;
+3. the config file, for example `api_interval_ms = 100`.
+
+| Option | Flag | Environment variable | Default | Valid values |
+|---|---|---|---|---|
+| `api_interval_ms` | `--api-interval-ms` | `YANDEX_DISK_RESCUE_API_INTERVAL_MS` | `50` | 25 to 1000 (ms) |
+| `api_concurrency` | `--api-concurrency` | `YANDEX_DISK_RESCUE_API_CONCURRENCY` | `7` | 1 to 30 |
+| `api_timeout` | `--api-timeout` | `YANDEX_DISK_RESCUE_API_TIMEOUT` | `30` | 1 to 300 (s) |
+| `api_retries` | `--api-retries` | `YANDEX_DISK_RESCUE_API_RETRIES` | `5` | 0 to 20 |
+| `api_url` | `--api-url` (hidden) | `YANDEX_DISK_RESCUE_API_URL` | `https://cloud-api.yandex.net` | an `http://` or `https://` URL |
+| `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
+
+The `api_*` options apply to every command that talks to the Disk API
+(`auth login`, `auth status`, `scan`); `client_id` applies to `auth login`.
+
+The config file is `$XDG_CONFIG_HOME/yandex-disk-rescue/config.toml`
+(`~/.config/yandex-disk-rescue/config.toml` when `XDG_CONFIG_HOME` is unset
+or not an absolute path). Another file can be named with the global
+`--config PATH` option (`yandex-disk-rescue --config PATH scan`) or the
+`YANDEX_DISK_RESCUE_CONFIG` environment variable. It is TOML with flat
+top-level keys named after the options:
+
+```toml
+api_interval_ms = 100
+api_concurrency = 4
+client_id = "0123456789abcdef0123456789abcdef"
+```
+
+The token is never read from the config file; see
+[Where the token comes from](#where-the-token-comes-from).
+
+Every value is validated, whatever its source. A flag or environment
+variable value outside its range is a usage error (exit `2`). So is a
+problem with the config file, reported as
+`Error: config file <path>: <key>: <reason>` before any command runs: a
+named file that does not exist, a file that is not valid TOML, an unknown
+key, a value of the wrong type or an invalid value. A missing file at the
+default location means no values.
 
 ## Quick start
 

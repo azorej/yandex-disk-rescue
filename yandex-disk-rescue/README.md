@@ -16,13 +16,14 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | Variable | Meaning |
 |---|---|
 | `YANDEX_DISK_RESCUE_TOKEN` | Yandex OAuth token; takes precedence over the stored token file. Blank is an error. |
+| `YANDEX_DISK_RESCUE_CONFIG` | Config file with option values (default `$XDG_CONFIG_HOME/yandex-disk-rescue/config.toml`). Same as the global `--config`. |
 | `YANDEX_DISK_RESCUE_CLIENT_ID` | ClientID of the OAuth app `auth login` authorizes (default: the built-in app). Same as `--client-id`. |
 | `YANDEX_DISK_RESCUE_API_URL` | Base URL of the Disk REST API (default `https://cloud-api.yandex.net`). Same as the hidden `--api-url`. |
 | `YANDEX_DISK_RESCUE_API_INTERVAL_MS` | Base gap between Disk API request starts, 25 to 1000 ms (default 50). Same as `--api-interval-ms`. |
 | `YANDEX_DISK_RESCUE_API_CONCURRENCY` | Maximum Disk API requests in flight, 1 to 30 (default 7). Same as `--api-concurrency`. |
 | `YANDEX_DISK_RESCUE_API_TIMEOUT` | Timeout of one Disk API request, 1 to 300 s (default 30). Same as `--api-timeout`. |
 | `YANDEX_DISK_RESCUE_API_RETRIES` | Retries after a transport error or a throttling status, 0 to 20 (default 5). Same as `--api-retries`. |
-| `XDG_CONFIG_HOME` | Parent of the config directory holding the token file (default `~/.config`). |
+| `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
 
 ## Manifest
@@ -47,8 +48,9 @@ as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `
 yandex-disk-rescue/
 ├── src/yandex_disk_rescue/
 │   ├── __init__.py   # Package version (read from installed metadata)
-│   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the `auth` commands,
-│   │                 #   registration of the commands in `commands/`
+│   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the global `--config`
+│   │                 #   (config-file values as Click's default_map), the `auth` commands, registration of
+│   │                 #   the commands in `commands/`
 │   ├── commands/
 │   │   └── scan.py   # `scan`: concurrent walk of a remote folder into the manifest, the summary
 │   ├── units.py      # format_size — binary-unit byte counts for command output
@@ -56,6 +58,7 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
+│   ├── config.py     # The config file: reading and validating `config.toml` against the registry
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
 │   └── api/          # DiskClient — every Disk API request: the account check, one resource, paged folder listing,
 │                     #   error mapping (401/403, other statuses, transport errors, malformed bodies), `disk:/` paths;
@@ -68,6 +71,7 @@ yandex-disk-rescue/
     ├── test_api_client.py
     ├── test_auth.py
     ├── test_cli.py
+    ├── test_config.py
     ├── test_manifest.py
     ├── test_rate_limiter.py
     └── test_scan.py

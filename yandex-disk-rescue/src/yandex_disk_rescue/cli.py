@@ -2,12 +2,13 @@
 
 import asyncio
 import os
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
 import typer.core
 
-from yandex_disk_rescue import __version__, api, auth, settings
+from yandex_disk_rescue import __version__, api, auth, config, settings
 from yandex_disk_rescue.commands import scan
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.units import format_size
@@ -45,12 +46,37 @@ def _print_version(value: bool) -> None:
 
 @app.callback()
 def main(
+    ctx: typer.Context,
+    config_path: Annotated[
+        Path | None,
+        typer.Option(
+            '--config',
+            envvar=config.CONFIG_ENV_VAR,
+            metavar='PATH',
+            help='Config file with option values (default: $XDG_CONFIG_HOME/yandex-disk-rescue/config.toml).',
+        ),
+    ] = None,
     version: Annotated[
         bool,
         typer.Option('--version', callback=_print_version, is_eager=True, help='Show the version and exit.'),
     ] = False,
 ) -> None:
     """Download everything from a Yandex Disk account: resumable, verified, rate-limit aware."""
+    values = config.load_config(config_path)
+    ctx.default_map = _default_map(ctx.command, {settings.SETTINGS[name].flag: value for name, value in values.items()})
+
+
+def _default_map(command: typer.core.TyperCommand | typer.core.TyperGroup, by_flag: dict[str, Any]) -> dict[str, Any]:
+    """Click's `default_map` for `command` and its subcommands: the config-file value of each registry option it takes.
+
+    Click uses a `default_map` value when neither the flag nor the env var is given, and still runs the option's
+    validating callback on it.
+    """
+    default_map = {param.name: by_flag[flag] for param in command.params for flag in param.opts if flag in by_flag}
+    if isinstance(command, typer.core.TyperGroup):
+        for name, subcommand in command.commands.items():
+            default_map[name] = _default_map(subcommand, by_flag)
+    return default_map
 
 
 @auth_app.command()

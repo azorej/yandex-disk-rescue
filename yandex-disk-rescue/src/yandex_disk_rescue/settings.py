@@ -1,8 +1,9 @@
 """The registry of options: every option's name, flag, env var, default and validation.
 
 A command takes an option by annotating a parameter with the entry's `Annotated` type and defaulting it to
-the entry's `default`. Validation runs on the value from every source; a violation is a usage error (exit 2)
-naming the option and the values it accepts.
+the entry's `default`. A value comes from the flag, else the env var, else the config file, else the default.
+Validation runs on the value from every source; a violation is a usage error (exit 2) naming the option and the
+values it accepts.
 """
 
 import re
@@ -39,6 +40,13 @@ class Setting[T]:
     def env_var(self) -> str:
         return ENV_VAR_PREFIX + self.name.upper()
 
+    def reason_invalid(self, value: object) -> str | None:
+        """Why `value`, of any type (as read from the config file), is not valid for this option, or None."""
+        expected = type(self.default)
+        if type(value) is not expected:
+            return f'must be {_TYPE_NAMES[expected]}.'
+        return self.check(value)
+
     def typer_option(self) -> Any:
         return typer.Option(
             self.flag, envvar=self.env_var, callback=self._validated, help=self.help, hidden=self.hidden
@@ -48,6 +56,9 @@ class Setting[T]:
         if (reason := self.check(value)) is not None:
             raise typer.BadParameter(reason)
         return value
+
+
+_TYPE_NAMES = {int: 'an integer', str: 'a string'}
 
 
 def _in_range(low: int, high: int) -> Callable[[int], str | None]:
@@ -88,6 +99,11 @@ CLIENT_ID = Setting(
     'ClientID of the Yandex OAuth app to authorize; the default is the built-in app.',
     _client_id,
 )
+
+SETTINGS: dict[str, Setting[Any]] = {
+    setting.name: setting
+    for setting in (API_INTERVAL_MS, API_CONCURRENCY, API_TIMEOUT, API_RETRIES, API_URL, CLIENT_ID)
+}
 
 ApiIntervalMs = Annotated[int, API_INTERVAL_MS.typer_option()]
 ApiConcurrency = Annotated[int, API_CONCURRENCY.typer_option()]
