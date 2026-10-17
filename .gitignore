@@ -220,3 +220,6 @@ CLAUDE.local.md
 
 # Devcontainer feature lock (generated per developer by the devcontainer CLI)
 .devcontainer/devcontainer-lock.json
+
+# Local scratch space (e.g. symlinks to download targets)
+/tmp/
