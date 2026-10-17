@@ -38,6 +38,21 @@ this order:
    directory. A token file readable by group or others is refused, as ssh
    does; fix it with `chmod 600 <file>`.
 
+`yandex-disk-rescue auth status` shows where the token comes from, the Yandex
+login it belongs to and the Disk usage, after checking it with one request to
+the Disk API:
+
+```
+Token: file /home/user/.config/yandex-disk-rescue/token
+Account: user.name
+Disk usage: 1.5 GiB of 10.0 GiB used (15.0%)
+```
+
+It exits `0` when Yandex accepts the token and `1` otherwise (no token, a
+token Yandex rejects, an unreachable API or an unexpected response), with an
+`Error: ...` line on stderr. Every command reports such failures the same
+way; usage errors exit `2`.
+
 `yandex-disk-rescue auth logout` deletes the stored token file. It succeeds
 when there is no file, and warns if `YANDEX_DISK_RESCUE_TOKEN` still provides
 a token. Deleting the file does not revoke the token at Yandex: revoke the
