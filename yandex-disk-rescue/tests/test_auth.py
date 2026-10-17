@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 from yandex_disk_rescue import auth
+from yandex_disk_rescue.api import DiskClient
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.paths import config_dir
 
@@ -174,9 +175,9 @@ def test_status_refuses_a_token_path_that_is_a_directory(fake_disk_api):
 
 
 @pytest.mark.parametrize('token', ['SECRETAAA\nSECRETBBB', 'SECRETöx'])
-def test_fetch_account_refuses_a_token_unfit_for_a_header_before_any_request(fake_disk_api, token):
+def test_disk_client_refuses_a_token_unfit_for_a_header_before_any_request(fake_disk_api, token):
     with pytest.raises(auth.InvalidTokenError) as excinfo:
-        auth.fetch_account(token)
+        DiskClient(token, base_url=fake_disk_api.base_url, timeout=auth.API_TIMEOUT_SECONDS)
 
     assert 'SECRET' not in str(excinfo.value)
     assert fake_disk_api.requests == []
@@ -310,6 +311,7 @@ def test_status_reports_an_unreachable_api(monkeypatch):
         (b'{"user": {"login": "a"}, "total_space": 10, "used_space": true}', 'used_space is missing'),
         (b'{"user": {"login": "a"}, "total_space": -1, "used_space": 1}', 'total_space is missing'),
         (b'{"user": {"login": "a"}, "used_space": 1}', 'total_space is missing'),
+        (b'{"user": {"login": "a"}, "total_space": 10, "used_space": 1}', 'user.uid is missing'),
     ],
 )
 def test_status_rejects_an_unexpected_success_body(fake_disk_api, body, reason):
@@ -345,7 +347,7 @@ def test_status_without_a_token_points_at_login(fake_disk_api):
 def test_status_formats_sizes_in_binary_units(fake_disk_api, used, total, usage):
     auth.save_token(TOKEN)
     fake_disk_api.route_json(
-        'GET', '/v1/disk/', 200, {'user': {'login': 'a'}, 'total_space': total, 'used_space': used}
+        'GET', '/v1/disk/', 200, {'user': {'login': 'a', 'uid': '1'}, 'total_space': total, 'used_space': used}
     )
 
     result = runner.invoke(app, ['auth', 'status'])

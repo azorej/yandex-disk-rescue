@@ -1,5 +1,6 @@
 """Command-line entry point for yandex-disk-rescue."""
 
+import asyncio
 import os
 import re
 from typing import Annotated, Any
@@ -7,7 +8,7 @@ from typing import Annotated, Any
 import typer
 import typer.core
 
-from yandex_disk_rescue import __version__, auth
+from yandex_disk_rescue import __version__, api, auth
 from yandex_disk_rescue.errors import RescueError
 
 
@@ -75,7 +76,7 @@ def login(
     typer.echo('', err=True)
     typer.echo('Yandex then shows a token. Copy it (or the whole address-bar URL) and paste it here.', err=True)
     token = auth.token_from_paste(typer.prompt('Paste the token', hide_input=True, err=True))
-    account = auth.fetch_account(token)
+    account = asyncio.run(_account_of(token))
     path = auth.save_token(token)
     typer.echo(f'Logged in as {account.login}. Token saved to {path}.')
     if auth.TOKEN_ENV_VAR in os.environ:
@@ -99,7 +100,7 @@ def logout() -> None:
 def status() -> None:
     """Show where the token comes from and the Yandex account it belongs to."""
     token = auth.resolve_token()
-    account = auth.fetch_account(token.value)
+    account = asyncio.run(_account_of(token.value))
     if token.source is auth.TokenSource.ENV:
         typer.echo(f'Token: environment variable {auth.TOKEN_ENV_VAR}')
     else:
@@ -109,6 +110,11 @@ def status() -> None:
     if account.total_space:
         usage += f' ({account.used_space / account.total_space:.1%})'
     typer.echo(usage)
+
+
+async def _account_of(token: str) -> api.Account:
+    async with api.DiskClient(token, base_url=auth.api_base_url(), timeout=auth.API_TIMEOUT_SECONDS) as client:
+        return await client.account()
 
 
 def _format_size(size: int) -> str:

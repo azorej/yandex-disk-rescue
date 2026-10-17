@@ -1,15 +1,12 @@
-"""The Yandex OAuth token: the authorization URL to obtain one, its storage and resolution, and the account check."""
+"""The Yandex OAuth token: the authorization URL to obtain one, its storage, resolution and header-safety check."""
 
 import enum
-import json
 import os
 import stat
 import tempfile
 import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
-
-import httpx
 
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.paths import config_dir
@@ -36,15 +33,7 @@ class InsecureTokenFileError(RescueError):
     pass
 
 
-class TokenRejectedError(RescueError):
-    pass
-
-
 class TokenFileError(RescueError):
-    pass
-
-
-class DiskApiError(RescueError):
     pass
 
 
@@ -57,13 +46,6 @@ class TokenSource(enum.Enum):
 class Token:
     value: str = field(repr=False)
     source: TokenSource
-
-
-@dataclass(frozen=True)
-class Account:
-    login: str
-    total_space: int
-    used_space: int
 
 
 def authorize_url(client_id: str) -> str:
@@ -90,7 +72,7 @@ def token_from_paste(pasted: str) -> str:
         if 'access_token' not in params:
             raise InvalidTokenError('The pasted URL has an empty access_token parameter.')
         text = params['access_token'][0]
-    return _validated_token(text)
+    return validate_token(text)
 
 
 def token_path() -> Path:
@@ -160,7 +142,7 @@ def save_token(value: str) -> Path:
     `InvalidTokenError` for an empty value, internal whitespace or non-ASCII characters and
     `TokenFileError` when the directory or file cannot be written; no temporary file is left behind.
     """
-    token = _validated_token(value)
+    token = validate_token(value)
     path = token_path()
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -197,7 +179,8 @@ def _token_defect(token: str) -> str | None:
     return None
 
 
-def _validated_token(value: str) -> str:
+def validate_token(value: str) -> str:
+    """Return the stripped token, or raise `InvalidTokenError` (without the value) if it cannot be sent in a header."""
     token = value.strip()
     if defect := _token_defect(token):
         raise InvalidTokenError(f'The token {defect}.')
@@ -215,88 +198,6 @@ def delete_token() -> bool:
 
 def api_base_url() -> str:
     return os.environ.get(API_URL_ENV_VAR) or DEFAULT_API_URL
-
-
-def fetch_account(token: str) -> Account:
-    """Return the account the token belongs to, with one `GET /v1/disk/` and no retries.
-
-    Raises `InvalidTokenError` before any request when the token cannot be sent in a header,
-    `TokenRejectedError` on HTTP 401/403 and `DiskApiError` on any other failure: another non-2xx
-    status, a transport error, or a success body without a valid login and space counters.
-    """
-    header_token = _validated_token(token)
-    base_url = api_base_url()
-    try:
-        response = httpx.get(
-            f'{base_url.rstrip("/")}/v1/disk/',
-            headers={'Authorization': f'OAuth {header_token}'},
-            timeout=API_TIMEOUT_SECONDS,
-        )
-    except httpx.TransportError as exc:
-        raise DiskApiError(f'Could not reach the Yandex Disk API at {base_url}: {_transport_failure(exc)}') from None
-    if response.status_code == httpx.codes.UNAUTHORIZED:
-        raise TokenRejectedError(
-            'Yandex rejected the token (invalid, expired or revoked). '
-            "Run 'yandex-disk-rescue auth login' to store a new one."
-        )
-    if response.status_code == httpx.codes.FORBIDDEN:
-        raise TokenRejectedError(
-            'Yandex accepted the token but denied access to Disk: the app it was issued for lacks Disk '
-            "permissions. Run 'yandex-disk-rescue auth login' to store a token with Disk access."
-        )
-    if not response.is_success:
-        raise DiskApiError(f'Yandex Disk API returned HTTP {response.status_code}: {_error_description(response)}')
-    return _parse_account(response.content)
-
-
-def _transport_failure(exc: httpx.TransportError) -> str:
-    """Describe a transport error without echoing the request, whose headers carry the token.
-
-    Only errors raised by the connection, the server or the URL scheme keep their text; anything else
-    (such as httpx refusing to build the request) is reported by its type alone.
-    """
-    if isinstance(
-        exc, httpx.NetworkError | httpx.TimeoutException | httpx.RemoteProtocolError | httpx.UnsupportedProtocol
-    ):
-        return str(exc)
-    return f'the request could not be sent ({type(exc).__name__})'
-
-
-def _error_description(response: httpx.Response) -> str:
-    try:
-        body = json.loads(response.content)
-    except ValueError:
-        return response.reason_phrase
-    if isinstance(body, dict) and isinstance(body.get('description'), str):
-        return body['description']
-    return response.reason_phrase
-
-
-def _parse_account(content: bytes) -> Account:
-    try:
-        body = json.loads(content)
-    except ValueError:
-        raise _unexpected_response('the body is not JSON') from None
-    if not isinstance(body, dict):
-        raise _unexpected_response('the body is not a JSON object')
-    user = body.get('user')
-    login = user.get('login') if isinstance(user, dict) else None
-    if not isinstance(login, str) or not login:
-        raise _unexpected_response('user.login is missing or not a non-empty string')
-    return Account(
-        login=login, total_space=_byte_count(body, 'total_space'), used_space=_byte_count(body, 'used_space')
-    )
-
-
-def _byte_count(body: dict[str, object], key: str) -> int:
-    value = body.get(key)
-    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise _unexpected_response(f'{key} is missing or not a non-negative integer')
-    return value
-
-
-def _unexpected_response(reason: str) -> DiskApiError:
-    return DiskApiError(f'Yandex Disk API returned an unexpected response to GET /v1/disk/: {reason}.')
 
 
 def _fsync_dir(directory: Path) -> None:

@@ -27,9 +27,15 @@ yandex-disk-rescue/
 │   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the `auth` commands
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config directory
-│   └── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the account check against the Disk API
+│   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
+│   └── api/          # DiskClient — every Disk API request: the account check, paged folder listing,
+│                     #   error mapping (401/403, other statuses, transport errors, malformed bodies), `disk:/` paths
 └── tests/
-    ├── conftest.py   # Autouse env/XDG isolation; `fake_disk_api`: a real-socket fake Disk API driven by a routes table
+    ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` fixture
+    ├── fake_disk_server.py # Real-socket fake Disk API: an in-memory tree (`add_dir`, `add_file`, `remove`) served by
+    │                       #   built-in `GET /v1/disk/` and `GET /v1/disk/resources`; `page_cap`, `account`, `token`;
+    │                       #   `inject`ed faults (statuses, delays); a `routes` override table; the request log
+    ├── test_api_client.py
     ├── test_auth.py
     └── test_cli.py
 ```
