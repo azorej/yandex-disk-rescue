@@ -1,15 +1,16 @@
 """Tests for token storage, resolution and the `auth` commands."""
 
-import socket
 import stat
 import urllib.parse
 from pathlib import Path
 
 import pytest
+from fake_disk_server import FakeResponse
 from typer.testing import CliRunner
 from yandex_disk_rescue import auth
+from yandex_disk_rescue.api import ApiLimits, DiskClient
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.paths import config_dir
+from yandex_disk_rescue.paths import config_dir, state_dir
 
 runner = CliRunner()
 
@@ -72,15 +73,19 @@ def test_save_token_rejects_empty_or_whitespace_values_without_echoing_them(valu
         assert value.strip() not in str(excinfo.value)
 
 
-@pytest.mark.parametrize('xdg_config_home', [None, '', 'relative/config'])
-def test_config_dir_falls_back_under_home(monkeypatch, tmp_path, xdg_config_home):
+@pytest.mark.parametrize(
+    ('directory', 'env_var', 'default_under_home'),
+    [(config_dir, 'XDG_CONFIG_HOME', '.config'), (state_dir, 'XDG_STATE_HOME', '.local/state')],
+)
+@pytest.mark.parametrize('xdg_value', [None, '', 'relative/dir'])
+def test_xdg_dirs_fall_back_under_home(monkeypatch, tmp_path, directory, env_var, default_under_home, xdg_value):
     monkeypatch.setenv('HOME', str(tmp_path))
-    if xdg_config_home is None:
-        monkeypatch.delenv('XDG_CONFIG_HOME')
+    if xdg_value is None:
+        monkeypatch.delenv(env_var)
     else:
-        monkeypatch.setenv('XDG_CONFIG_HOME', xdg_config_home)
+        monkeypatch.setenv(env_var, xdg_value)
 
-    assert config_dir() == tmp_path / '.config' / 'yandex-disk-rescue'
+    assert directory() == tmp_path / default_under_home / 'yandex-disk-rescue'
 
 
 def test_env_var_wins_over_the_file(monkeypatch):
@@ -174,9 +179,11 @@ def test_status_refuses_a_token_path_that_is_a_directory(fake_disk_api):
 
 
 @pytest.mark.parametrize('token', ['SECRETAAA\nSECRETBBB', 'SECRETöx'])
-def test_fetch_account_refuses_a_token_unfit_for_a_header_before_any_request(fake_disk_api, token):
+def test_disk_client_refuses_a_token_unfit_for_a_header_before_any_request(fake_disk_api, token):
     with pytest.raises(auth.InvalidTokenError) as excinfo:
-        auth.fetch_account(token)
+        DiskClient(
+            token, base_url=fake_disk_api.base_url, limits=ApiLimits(interval=0.05, concurrency=1, timeout=1, retries=0)
+        )
 
     assert 'SECRET' not in str(excinfo.value)
     assert fake_disk_api.requests == []
@@ -222,13 +229,6 @@ def test_logout_warns_when_the_env_var_still_provides_a_token(monkeypatch):
     assert TOKEN not in result.output
 
 
-def _closed_port_url() -> str:
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0))
-        port = probe.getsockname()[1]
-    return f'http://127.0.0.1:{port}'
-
-
 def test_status_with_a_stored_token_shows_the_account(fake_disk_api):
     path = auth.save_token(TOKEN)
 
@@ -265,7 +265,8 @@ def test_status_names_the_env_var_as_the_source(monkeypatch, fake_disk_api):
         (500, 'Error: Yandex Disk API returned HTTP 500: Internal failure'),
     ],
 )
-def test_status_reports_api_errors_without_a_traceback_or_the_token(fake_disk_api, status, expected):
+def test_status_reports_api_errors_without_a_traceback_or_the_token(monkeypatch, fake_disk_api, status, expected):
+    monkeypatch.setenv('YANDEX_DISK_RESCUE_API_RETRIES', '0')
     auth.save_token(TOKEN)
     fake_disk_api.route_json('GET', '/v1/disk/', status, {'error': 'SomeError', 'description': 'Internal failure'})
 
@@ -278,7 +279,8 @@ def test_status_reports_api_errors_without_a_traceback_or_the_token(fake_disk_ap
     assert TOKEN not in result.output
 
 
-def test_status_error_without_a_json_description_uses_the_reason_phrase(fake_disk_api):
+def test_status_error_without_a_json_description_uses_the_reason_phrase(monkeypatch, fake_disk_api):
+    monkeypatch.setenv('YANDEX_DISK_RESCUE_API_RETRIES', '0')
     auth.save_token(TOKEN)
     fake_disk_api.route('GET', '/v1/disk/', 502, b'<html>bad gateway</html>')
 
@@ -288,10 +290,11 @@ def test_status_error_without_a_json_description_uses_the_reason_phrase(fake_dis
     assert result.stderr == 'Error: Yandex Disk API returned HTTP 502: Bad Gateway\n'
 
 
-def test_status_reports_an_unreachable_api(monkeypatch):
+def test_status_reports_an_unreachable_api(monkeypatch, closed_port_url):
+    monkeypatch.setenv('YANDEX_DISK_RESCUE_API_RETRIES', '0')
     auth.save_token(TOKEN)
-    url = _closed_port_url()
-    monkeypatch.setenv(auth.API_URL_ENV_VAR, url)
+    url = closed_port_url
+    monkeypatch.setenv('YANDEX_DISK_RESCUE_API_URL', url)
 
     result = runner.invoke(app, ['auth', 'status'])
 
@@ -310,6 +313,7 @@ def test_status_reports_an_unreachable_api(monkeypatch):
         (b'{"user": {"login": "a"}, "total_space": 10, "used_space": true}', 'used_space is missing'),
         (b'{"user": {"login": "a"}, "total_space": -1, "used_space": 1}', 'total_space is missing'),
         (b'{"user": {"login": "a"}, "used_space": 1}', 'total_space is missing'),
+        (b'{"user": {"login": "a"}, "total_space": 10, "used_space": 1}', 'user.uid is missing'),
     ],
 )
 def test_status_rejects_an_unexpected_success_body(fake_disk_api, body, reason):
@@ -345,7 +349,7 @@ def test_status_without_a_token_points_at_login(fake_disk_api):
 def test_status_formats_sizes_in_binary_units(fake_disk_api, used, total, usage):
     auth.save_token(TOKEN)
     fake_disk_api.route_json(
-        'GET', '/v1/disk/', 200, {'user': {'login': 'a'}, 'total_space': total, 'used_space': used}
+        'GET', '/v1/disk/', 200, {'user': {'login': 'a', 'uid': '1'}, 'total_space': total, 'used_space': used}
     )
 
     result = runner.invoke(app, ['auth', 'status'])
@@ -354,10 +358,65 @@ def test_status_formats_sizes_in_binary_units(fake_disk_api, used, total, usage)
     assert result.stdout.splitlines()[-1] == usage
 
 
-def test_api_base_url_defaults_to_yandex(monkeypatch):
-    assert auth.api_base_url() == 'https://cloud-api.yandex.net'
-    monkeypatch.setenv(auth.API_URL_ENV_VAR, 'http://127.0.0.1:1')
-    assert auth.api_base_url() == 'http://127.0.0.1:1'
+def test_status_api_url_option_reaches_the_api_without_the_env_var(monkeypatch, fake_disk_api):
+    monkeypatch.delenv('YANDEX_DISK_RESCUE_API_URL')
+    auth.save_token(TOKEN)
+
+    result = runner.invoke(app, ['auth', 'status', '--api-url', fake_disk_api.base_url])
+
+    assert result.exit_code == 0, result.output
+    assert 'Account: rescue.tester' in result.stdout
+    assert [(r.method, r.path) for r in fake_disk_api.requests] == [('GET', '/v1/disk/')]
+
+
+@pytest.mark.parametrize(
+    ('args', 'env', 'flag', 'reason'),
+    [
+        (['--api-interval-ms', '10'], {}, '--api-interval-ms', 'must be an integer from 25 to 1000.'),
+        (
+            [],
+            {'YANDEX_DISK_RESCUE_API_INTERVAL_MS': '1001'},
+            '--api-interval-ms',
+            'must be an integer from 25 to 1000.',
+        ),
+        ([], {'YANDEX_DISK_RESCUE_API_CONCURRENCY': '99'}, '--api-concurrency', 'must be an integer from 1 to 30.'),
+        (['--api-concurrency', '0'], {}, '--api-concurrency', 'must be an integer from 1 to 30.'),
+        (['--api-timeout', '301'], {}, '--api-timeout', 'must be an integer from 1 to 300.'),
+        ([], {'YANDEX_DISK_RESCUE_API_RETRIES': '21'}, '--api-retries', 'must be an integer from 0 to 20.'),
+        (['--api-retries', 'many'], {}, '--api-retries', "'many' is not a valid int"),
+        (['--api-url', 'ftp://example.com'], {}, '--api-url', 'must be an http:// or https:// URL.'),
+        (
+            [],
+            {'YANDEX_DISK_RESCUE_API_URL': 'cloud-api.yandex.net'},
+            '--api-url',
+            'must be an http:// or https:// URL.',
+        ),
+    ],
+)
+def test_status_rejects_an_invalid_api_option_from_any_source(monkeypatch, fake_disk_api, args, env, flag, reason):
+    auth.save_token(TOKEN)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+
+    result = runner.invoke(app, ['auth', 'status', *args])
+
+    assert result.exit_code == 2
+    error = ' '.join(result.stderr.replace('│', ' ').split())
+    assert f"Invalid value for '{flag}'" in error
+    assert reason in error
+    assert fake_disk_api.requests == []
+
+
+@pytest.mark.parametrize('command', [['auth', 'status'], ['auth', 'login']])
+def test_auth_commands_retry_a_throttled_account_check(fake_disk_api, command):
+    auth.save_token(TOKEN)
+    fake_disk_api.inject('GET', '/v1/disk/', FakeResponse.error(503, {'Retry-After': '0'}))
+
+    result = runner.invoke(app, command, input=f'{TOKEN}\n')
+
+    assert result.exit_code == 0, result.output
+    assert 'rescue.tester' in result.stdout
+    assert [r.path for r in fake_disk_api.requests] == ['/v1/disk/', '/v1/disk/']
 
 
 def _authorize_url_from(output: str) -> str:
@@ -398,7 +457,7 @@ def test_login_prints_the_implicit_flow_url_on_stderr(
     monkeypatch, fake_disk_api, args, env_client_id, expected_client_id
 ):
     if env_client_id is not None:
-        monkeypatch.setenv(auth.CLIENT_ID_ENV_VAR, env_client_id)
+        monkeypatch.setenv('YANDEX_DISK_RESCUE_CLIENT_ID', env_client_id)
 
     result = runner.invoke(app, ['auth', 'login', *args], input=f'{TOKEN}\n')
 
@@ -483,7 +542,7 @@ def test_login_rejects_a_malformed_client_id_as_a_usage_error(monkeypatch, fake_
         args = ['--client-id', client_id]
     else:
         args = []
-        monkeypatch.setenv(auth.CLIENT_ID_ENV_VAR, client_id)
+        monkeypatch.setenv('YANDEX_DISK_RESCUE_CLIENT_ID', client_id)
 
     result = runner.invoke(app, ['auth', 'login', *args], input=f'{TOKEN}\n')
 

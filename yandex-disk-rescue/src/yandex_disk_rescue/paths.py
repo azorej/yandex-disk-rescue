@@ -7,11 +7,17 @@ APP_DIR_NAME = 'yandex-disk-rescue'
 
 
 def config_dir() -> Path:
-    """Return the configuration directory without creating it.
+    """Return `$XDG_CONFIG_HOME/yandex-disk-rescue` (default `~/.config/yandex-disk-rescue`) without creating it."""
+    return _xdg_dir('XDG_CONFIG_HOME', '.config')
 
-    `$XDG_CONFIG_HOME/yandex-disk-rescue`, or `~/.config/yandex-disk-rescue` when the variable is
-    unset, empty or not an absolute path (the XDG spec says relative values must be ignored).
-    """
-    xdg_config_home = os.environ.get('XDG_CONFIG_HOME', '')
-    base = Path(xdg_config_home) if os.path.isabs(xdg_config_home) else Path.home() / '.config'
+
+def state_dir() -> Path:
+    """Return `$XDG_STATE_HOME/yandex-disk-rescue` (default `~/.local/state/yandex-disk-rescue`) without creating it."""
+    return _xdg_dir('XDG_STATE_HOME', '.local/state')
+
+
+def _xdg_dir(env_var: str, default_under_home: str) -> Path:
+    # The XDG spec says unset, empty and relative values must all be ignored in favour of the default.
+    value = os.environ.get(env_var, '')
+    base = Path(value) if os.path.isabs(value) else Path.home() / default_under_home
     return base / APP_DIR_NAME
