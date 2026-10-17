@@ -753,10 +753,10 @@ Three cases abort the run (exit 1):
   - **Messages** never contain the href's query string.
 - **Behaviour to lock:** extend `tests/test_download.py`:
   - **Truncate mid-run.** `inject(Truncate(after_bytes=300_000))` on a 1 MiB file's download: the
-    run exits 0, and the second `/download` request carries `range: bytes=300000-`.
+    run exits 0, and the second `/download` request carries `range: bytes=300000-<size-1>` (Stage 4 sends closed ranges).
   - **SIGKILL** (issue acceptance). A subprocess `yandex-disk-rescue download` runs with
     `chunk_delay`. Once the partial file is over 256 KiB, it is killed with SIGKILL. A rerun
-    exits 0, its first `/download` request has `range: bytes=<k>-` with `k > 0`, and the file
+    exits 0, its first `/download` request has `range: bytes=<k>-<size-1>` with `k > 0`, and the file
     verifies.
   - **SIGINT.** The same with SIGINT exits 130, prints the stderr message, and keeps the partial.
   - **Cloud changed before resume.** After the kill, `add_file` changes the content, and the rerun
