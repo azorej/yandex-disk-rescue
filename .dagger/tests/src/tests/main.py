@@ -28,7 +28,7 @@ class Tests:
         """Workspace members and dev tools are importable after the locked sync."""
         workspace = dag.repo_ci().workspace()
         await expect_output(
-            workspace.with_exec(['uv', 'run', '--no-sync', 'example-app', 'hello', 'Dagger']),
-            'Hello, Dagger!',
+            workspace.with_exec(['uv', 'run', '--no-sync', 'yandex-disk-rescue', '--version']),
+            'yandex-disk-rescue ',
         )
         await expect_output(workspace.with_exec(['uv', 'run', '--no-sync', 'ruff', '--version']), 'ruff ')

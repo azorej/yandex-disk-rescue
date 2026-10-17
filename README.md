@@ -1,16 +1,28 @@
-# Python Template
+# Yandex Disk Rescue
 
-A batteries-included template for Python repositories, built for working
-alongside AI coding agents.
+A Linux command-line tool that downloads everything from a Yandex Disk
+account to local storage. It is a headless analogue of the Windows app
+[Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
-- **[uv](https://docs.astral.sh/uv/) workspace** — several packages, one lock file
-- **[mise](https://mise.jdx.dev/)** — pinned tool versions (Python, uv, Dagger) and every dev task
-- **[Dagger](https://dagger.io/) CI** — the same containerized pipeline runs locally and in GitHub Actions
-- **[Ruff](https://docs.astral.sh/ruff/) + [pytest](https://docs.pytest.org/) + [pre-commit](https://pre-commit.com/)**
-- **Devcontainer / Codespaces** — Ubuntu 26.04, Docker-in-Docker, [Claude Code](https://code.claude.com/) pre-installed
-- **Agent-ready** — [`AGENTS.md`](AGENTS.md) rules, skills and subagents for a plan → critique → build → review loop
+> **Status: early development.** The CLI skeleton exists
+> (`yandex-disk-rescue --help`, `--version`). Download features are being
+> built. Planned work is tracked in GitHub issues.
 
-👉 **New repository from this template?** Follow [docs/using-this-template.md](docs/using-this-template.md).
+## Goals
+
+- **Whole-account or one-folder backup.** Mirror `disk:/` or any
+  sub-folder, keeping the folder structure.
+- **Official API, OAuth token.** Uses the Yandex Disk REST API. No browser
+  automation and no Yandex 360 subscription required.
+- **Resumable and crash-safe.** Interrupted transfers continue from the
+  last confirmed byte. A rerun only fetches what is missing or changed.
+- **Fast but polite.** Parallel downloads, segmented transfers for large
+  files, and adaptive back-off that honours `429` / `Retry-After`.
+- **Verified.** Every file is checked against the cloud size and MD5 /
+  SHA-256. Failures are reported, never silently skipped.
+- **CLI only.** Scriptable, cron- and systemd-friendly, no GUI.
+
+This is an independent, unofficial tool. It is not affiliated with Yandex.
 
 ## Quick start
 
@@ -21,9 +33,9 @@ Container*, or create a GitHub Codespace. Everything below runs on creation.
 and Docker (for Dagger), then:
 
 ```bash
-mise trust && mise run setup    # tools + deps + git hooks
-mise run check                  # lint + test
-uv run example-app hello Alice  # Hello, Alice!
+mise trust && mise run setup        # tools + deps + git hooks
+mise run check                      # lint + test
+uv run yandex-disk-rescue --help
 ```
 
 ## Everyday commands
@@ -46,14 +58,13 @@ Dependencies: `uv add <pkg> --package <member>` (runtime) or
 ## Layout
 
 ```
-├── example-app/          # Typer CLI — workspace member (replace me)
-├── example-library/      # Library — workspace member (replace me)
+├── yandex-disk-rescue/   # The CLI package — workspace member
 ├── .dagger/              # Dagger CI module (+ its own tests in .dagger/tests)
 ├── .devcontainer/        # Devcontainer: mise, Claude Code, Docker-in-Docker
 ├── .github/              # CI workflow, PR template
 ├── .agents/skills/       # Agent skills (symlinked into .claude/skills/)
 ├── .claude/              # Claude Code settings, hooks, subagents
-├── docs/                 # Guides and implementation plans
+├── docs/                 # Guides (GitHub setup) and implementation plans
 ├── scripts/              # Standalone helper scripts
 ├── AGENTS.md             # Rules for humans and agents — start here
 ├── mise.toml             # Tool versions, env, tasks
@@ -71,7 +82,8 @@ Upgrade with `mise outdated` / `mise upgrade --bump` (tools) and `mise run lock`
 wrapper around `mise run ci`, which calls the Dagger module in
 [`.dagger/`](.dagger/README.md). Pull requests run only the lanes their
 diff touches; pushes to `main`, a weekly schedule and manual runs execute
-everything. Require the single **`CI required`** check in branch protection.
+everything. Require the single **`CI required`** check in branch protection
+(see [docs/github-setup.md](docs/github-setup.md)).
 
 **AI agents.** [`AGENTS.md`](AGENTS.md) is the one rule file every agent
 reads ([`CLAUDE.md`](CLAUDE.md) imports it). With Claude Code:

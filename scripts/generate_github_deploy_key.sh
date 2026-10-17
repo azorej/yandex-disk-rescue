@@ -87,4 +87,4 @@ echo
 echo "🔐 Private key (add to GitHub Actions Secrets):"
 echo "cat $PRIVATE_KEY"
 echo
-echo "📖 For setup instructions, see: docs/using-this-template.md"
+echo "📖 For setup instructions, see: docs/github-setup.md"

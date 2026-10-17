@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping improve the template!
+Thanks for helping improve Yandex Disk Rescue!
 
 1. Read [AGENTS.md](AGENTS.md) — it holds the rules for humans and agents alike.
 2. Open the repo in the devcontainer, or run `mise trust && mise run setup` locally.

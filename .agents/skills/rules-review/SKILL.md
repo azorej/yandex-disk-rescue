@@ -61,7 +61,7 @@ Always reconcile with the working tree (`git status`, `git diff`,
 
 1. Get the diff (`git diff <base>...HEAD`, `git diff`, or `gh pr diff <N>`).
 2. List touched files and the area each belongs to: workspace package
-   (`example-app/`, `example-library/`, or any new member), `.dagger/`,
+   (`yandex-disk-rescue/` or any new member), `.dagger/`,
    `mise-tasks/` / `mise.toml`, `.devcontainer/`, `.github/`, `docs/`,
    agent config (`.agents/`, `.claude/`, `AGENTS.md`, `CLAUDE.md`).
 3. Read the root `AGENTS.md` and any package-level `README.md` / `AGENTS.md`

@@ -1,6 +1,6 @@
 // For format details, see https://aka.ms/devcontainer.json
 {
-	"name": "python-template",
+	"name": "yandex-disk-rescue",
 	"build": {
 		"dockerfile": "./Dockerfile",
 		"args": {

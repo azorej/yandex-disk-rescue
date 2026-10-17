@@ -1,0 +1,23 @@
+[project]
+name = "yandex-disk-rescue"
+version = "0.1.0"
+description = "Linux CLI that downloads everything from a Yandex Disk account: resumable, verified, rate-limit aware"
+authors = [
+    {name = "Leonid Kozhinov", email = "azorej@gmail.com"}
+]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.14"
+dependencies = [
+    "typer>=0.27.3",
+]
+
+[project.scripts]
+yandex-disk-rescue = "yandex_disk_rescue.cli:app"
+
+[build-system]
+requires = ["hatchling>=1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/yandex_disk_rescue"]

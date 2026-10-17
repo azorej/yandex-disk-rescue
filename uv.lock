@@ -4,9 +4,8 @@ requires-python = ">=3.14"
 
 [manifest]
 members = [
-    "example-app",
-    "example-library",
-    "python-template",
+    "yandex-disk-rescue",
+    "yandex-disk-rescue-workspace",
 ]
 
 [[package]]
@@ -122,26 +121,6 @@ sdist = { url = "https://files.pythonhosted.org/packages/68/bc/d36966de7304047a1
 wheels = [
     { url = "https://files.pythonhosted.org/packages/c1/2b/238f02a4927fa2e27aa995371d240a468b52e42eae44a678434aff736b38/distlib-0.4.4-py2.py3-none-any.whl", hash = "sha256:cf09d55b1e85a89576b036aeb71550bfd68320f3f21761ca329eadadad918638", size = 472099, upload-time = "2026-10-16T13:56:32.053Z" },
 ]
-
-[[package]]
-name = "example-app"
-version = "0.1.0"
-source = { editable = "example-app" }
-dependencies = [
-    { name = "example-library" },
-    { name = "typer" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "example-library", editable = "example-library" },
-    { name = "typer", specifier = ">=0.27.3" },
-]
-
-[[package]]
-name = "example-library"
-version = "0.1.0"
-source = { editable = "example-library" }
 
 [[package]]
 name = "executing"
@@ -434,35 +413,6 @@ wheels = [
 ]
 
 [[package]]
-name = "python-template"
-version = "0.1.0"
-source = { virtual = "." }
-
-[package.dev-dependencies]
-dev = [
-    { name = "example-app" },
-    { name = "example-library" },
-    { name = "ipython" },
-    { name = "pre-commit" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "example-app", editable = "example-app" },
-    { name = "example-library", editable = "example-library" },
-    { name = "ipython", specifier = ">=9.17.1" },
-    { name = "pre-commit", specifier = ">=4.7.0" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "pytest-cov", specifier = ">=7.1.0" },
-    { name = "ruff", specifier = ">=0.17.1" },
-]
-
-[[package]]
 name = "pyyaml"
 version = "6.0.3"
 source = { registry = "https://pypi.org/simple" }
@@ -623,4 +573,42 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/63/80/6a03356d8ee38261e3a78cf89ee03d8e7f12c572d969237be00869e2dc73/wcwidth-0.9.2-cp315-cp315t-win_amd64.whl", hash = "sha256:33df042f96c61ed3cd5fb3742fba427553a635bc578799857a48aa79f774a0b9", size = 605441, upload-time = "2026-10-05T00:24:04.052Z" },
     { url = "https://files.pythonhosted.org/packages/0c/48/1a308a86a833fd12ff7a08d0d2491ff4a72c8a92d12f5ead8317630f771e/wcwidth-0.9.2-cp315-cp315t-win_arm64.whl", hash = "sha256:48719a9bc76c2f84238693fe5013571fa5beffa3621cf228f1f3a9e30dae84b8", size = 605885, upload-time = "2026-10-05T00:23:54.274Z" },
     { url = "https://files.pythonhosted.org/packages/9c/b4/0bfa065af506540d9d558e3e5548cff00bc1f9b24e6e2a8512498e8628de/wcwidth-0.9.2-py3-none-any.whl", hash = "sha256:89ca642c5bf0101157a09366be69fad0379db1f700ae39a920e103234573670e", size = 301667, upload-time = "2026-10-05T00:23:21.097Z" },
+]
+
+[[package]]
+name = "yandex-disk-rescue"
+version = "0.1.0"
+source = { editable = "yandex-disk-rescue" }
+dependencies = [
+    { name = "typer" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "typer", specifier = ">=0.27.3" }]
+
+[[package]]
+name = "yandex-disk-rescue-workspace"
+version = "0.1.0"
+source = { virtual = "." }
+
+[package.dev-dependencies]
+dev = [
+    { name = "ipython" },
+    { name = "pre-commit" },
+    { name = "pytest" },
+    { name = "pytest-cov" },
+    { name = "ruff" },
+    { name = "yandex-disk-rescue" },
+]
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "ipython", specifier = ">=9.17.1" },
+    { name = "pre-commit", specifier = ">=4.7.0" },
+    { name = "pytest", specifier = ">=9.1.1" },
+    { name = "pytest-cov", specifier = ">=7.1.0" },
+    { name = "ruff", specifier = ">=0.17.1" },
+    { name = "yandex-disk-rescue", editable = "yandex-disk-rescue" },
 ]

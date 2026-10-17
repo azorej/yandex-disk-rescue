@@ -1,5 +1,5 @@
 [project]
-name = "python-template"
+name = "yandex-disk-rescue-workspace"
 version = "0.1.0"
 requires-python = ">=3.14"
 
@@ -11,25 +11,23 @@ dev = [
   "pytest-cov>=7.1.0",
   "ruff>=0.17.1",
   # Workspace members — listed here so `uv sync` installs them in editable mode.
-  "example-app",
-  "example-library",
+  "yandex-disk-rescue",
 ]
 
 [tool.uv.sources]
-example-app = { workspace = true }
-example-library = { workspace = true }
+yandex-disk-rescue = { workspace = true }
 
 [tool.uv.workspace]
-members = ["example-app", "example-library"]
+members = ["yandex-disk-rescue"]
 # The Dagger modules are separate uv projects with their own lock files.
 exclude = [".dagger", ".dagger/tests"]
 
 [tool.pytest.ini_options]
-testpaths = ["example-app/tests", "example-library/tests"]
+testpaths = ["yandex-disk-rescue/tests"]
 addopts = "-v --tb=short --import-mode=importlib"
 
 [tool.coverage.run]
-source = ["example_app", "example_library"]
+source = ["yandex_disk_rescue"]
 branch = true
 
 [tool.ruff]
