@@ -3,10 +3,13 @@ summarizing a run.
 
 A file is verified before it reaches its final path: the bytes go to a partial file while their MD5 and SHA-256
 are computed, the size and every checksum the cloud provides are checked, and only then is the file moved into
-place without replacing anything. A verified file whose record and `lstat` fingerprint still match is skipped
-without being read. Any other file already at a final path is hashed: one matching the cloud is adopted as it is,
-and anything else there is moved aside once the new version is verified. Paths with no cloud counterpart are never
-looked at.
+place without replacing anything. A downloaded file that fails the check is moved, never deleted, to the run's
+quarantine folder and recorded; while the cloud file keeps that identity, only `--retry-failed` downloads it again. A
+verified file whose record and `lstat` fingerprint still match is skipped without being read, unless `verify` found
+the file at its path broken: such a file is downloaded again without its copy there being read, and that copy is
+moved aside once the new one is verified. Any other file already at a final path is hashed: one matching the cloud is
+adopted as it is, and anything else there is moved aside once the new version is verified. Paths with no cloud
+counterpart are never looked at.
 
 A file larger than the policy's segment threshold is downloaded as several segments, ranged fetches running in
 parallel into one partial file, which is preallocated to the file's size first and read back in full to be verified
@@ -75,6 +78,9 @@ _SPARE_THREADS = 4
 _PREALLOCATION_STEP = 64 * 2**20
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
+_QUARANTINE_HINT = (
+    'Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).'
+)
 
 
 class FileFailed(Exception):
@@ -83,6 +89,16 @@ class FileFailed(Exception):
     def __init__(self, reason: str) -> None:
         super().__init__(reason)
         self.reason = reason
+
+
+class FileQuarantined(Exception):
+    """The file's download failed verification for `reason`; it was moved to `copy` in the quarantine folder and
+    recorded. The run goes on."""
+
+    def __init__(self, reason: str, copy: PurePosixPath) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.copy = copy
 
 
 class FileDeferred(FileFailed):
@@ -101,6 +117,15 @@ class Failure:
     reason: str
 
 
+@dataclass(frozen=True)
+class QuarantinedFile:
+    """A file whose quarantined copy at `copy` (relative to the destination) stands for it in this run."""
+
+    path: str
+    reason: str
+    copy: PurePosixPath
+
+
 @dataclass
 class MirrorReport:
     """What a run did. Lists hold every member in path order; the summary shows the first few."""
@@ -115,6 +140,7 @@ class MirrorReport:
     renamed: list[tuple[str, PurePosixPath]] = field(default_factory=list)
     moved_aside: list[PurePosixPath] = field(default_factory=list)
     replaced_folder: PurePosixPath | None = None
+    quarantined: list[QuarantinedFile] = field(default_factory=list)
     failed: list[Failure] = field(default_factory=list)
     passes: tuple[int, int] | None = None  # (used, limit; 0 is no limit) once a transient failure deferred a file
 
@@ -200,7 +226,7 @@ class Digest:
     def mismatch(self, identity: RemoteIdentity) -> str | None:
         """How the bytes differ from `identity`: the size, then the MD5 and the SHA-256 the cloud provides."""
         if self.size != identity.size:
-            return f'size mismatch (expected {identity.size} bytes, got {self.size})'
+            return size_mismatch(identity, self.size)
         for name, expected, actual in (
             ('MD5', identity.md5, self._md5.hexdigest()),
             ('SHA-256', identity.sha256, self._sha256.hexdigest()),
@@ -209,11 +235,10 @@ class Digest:
                 return f'{name} mismatch (expected {expected}, got {actual})'
         return None
 
-    def verify(self, identity: RemoteIdentity) -> VerifiedBy:
-        """The verification method of `identity`; raises `FileFailed` when the bytes do not match it."""
-        if (reason := self.mismatch(identity)) is not None:
-            raise FileFailed(reason)
-        return _method(identity)
+
+def size_mismatch(identity: RemoteIdentity, size: int) -> str:
+    """How `size` bytes differ from the size of `identity`."""
+    return f'size mismatch (expected {identity.size} bytes, got {size})'
 
 
 @dataclass(frozen=True)
@@ -332,25 +357,41 @@ class _FileTurns:
 
 
 class MirrorRun:
-    """One run over a mirror: names are assigned, stray partial files deleted and the files still to download
-    counted on construction; `run` then walks the entries in path order.
+    """One run over a mirror: names are assigned, stray partial files deleted and the files this run will attempt
+    counted on construction; `run` then walks the run's entries in path order.
 
-    Each entry the manifest records as left out of its scan, because its name is not valid Unicode, is a failure of
-    the run.
+    With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record, a
+    `verify` finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
+    the folders above them, and no other path of the mirror is looked at. Otherwise the run covers every entry, and
+    holds every file whose quarantine record is for its current identity: such a file is reported as quarantined
+    without being looked at.
+
+    Every entry that fails gets a failure record with the reason when the failure happens; an entry verified, adopted
+    or made in place loses it. A failed entry is reported as failed, or as quarantined when its quarantine record is
+    for its current identity, the failure then shown as its last retry. Each entry the manifest records as left out of
+    its scan, because its name is not valid Unicode, is a failure of the run, and has no record.
     """
 
-    def __init__(self, mirror: Mirror, destination: Destination) -> None:
+    def __init__(self, mirror: Mirror, destination: Destination, *, retry_failed: bool) -> None:
         self._mirror = mirror
         self._destination = destination
-        self._entries = _assign_local_names(mirror)
+        entries = _assign_local_names(mirror)
+        self._names = LocalNames(mirror, entries)
+        self._entries = _retry_walk(entries, self._names) if retry_failed else entries
         self._positions = {entry.entry_id: position for position, entry in enumerate(self._entries)}
-        self._names = LocalNames(mirror, self._entries)
+        self._held = set() if retry_failed else {e.entry_id for e in self._entries if is_held(e)}
         with _fatal_errors(destination.path):
             destination.keep_partials(
-                [e.entry_id for e in self._entries if e.download is not None and e.download.state == 'partial']
+                [e.entry_id for e in entries if e.download is not None and e.download.state == 'partial']
             )
-            self._current = {e.entry_id for e in self._entries if _is_current(e, destination)}
-        pending = [e for e in self._entries if e.resource.kind == 'file' and e.entry_id not in self._current]
+            self._current = {
+                e.entry_id for e in self._entries if e.entry_id not in self._held and _is_current(e, destination)
+            }
+        pending = [
+            e
+            for e in self._entries
+            if e.resource.kind == 'file' and e.entry_id not in self._current and e.entry_id not in self._held
+        ]
         self.pending_files = len(pending)
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
@@ -379,7 +420,7 @@ class MirrorRun:
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes)
         report.replaced_folder = self._destination.replaced_folder
-        report.failed += [Failure(display_path(e.path), _unencodable_reason(e)) for e in self._mirror.unencodable()]
+        report.failed += [Failure(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()]
         self._in_path_order(report)
         return report
 
@@ -393,13 +434,16 @@ class MirrorRun:
                 entry = replace(listed_entry, local_path=local)
                 if local.name != entry.resource.path.rpartition('/')[2]:
                     report.renamed.append((entry.resource.path, local))
-                if reason := _blocked_by(local, blocked):
-                    report.failed.append(Failure(entry.resource.path, reason))
+                if entry.entry_id in self._held:
+                    report.quarantined.append(held_copy(entry, entry.failure))
+                elif reason := _blocked_by(local, blocked):
+                    self._fail(report, entry, reason)
                 elif entry.resource.kind == 'dir':
                     await self._make_folder(entry, local, blocked, tools)
                 elif entry.entry_id in self._current:
                     report.skipped += 1
                     _note_verified(report, entry, _recorded_method(entry))
+                    self._succeeded(entry)
                 else:
                     await turns.start(self._turn(entry, tools, deferred))
         return self._sorted(deferred)
@@ -407,6 +451,18 @@ class MirrorRun:
     async def _make_folder(
         self, entry: MirrorEntry, local: PurePosixPath, blocked: dict[PurePosixPath, str], tools: _RunTools
     ) -> None:
+        reason, local = await self._folder_failure(entry, local, tools)
+        if reason is None:
+            self._succeeded(entry)
+            return
+        blocked[local] = reason
+        self._fail(tools.report, entry, reason)
+
+    async def _folder_failure(
+        self, entry: MirrorEntry, local: PurePosixPath, tools: _RunTools
+    ) -> tuple[str | None, PurePosixPath]:
+        """Make the folder `entry` at `local`, or find it there; why it failed (`None` once it is in place), with the
+        local path it ended up under."""
         destination, report, threads = self._destination, tools.report, tools.threads
 
         def make_folder(path: PurePosixPath) -> Awaitable[bool]:
@@ -419,16 +475,14 @@ class MirrorRun:
                     if local != entry.local_path:
                         report.renamed.append((entry.resource.path, local))
                     if made:
-                        return
+                        return None, local
                     await threads.run(destination.move_aside, local)
                     report.moved_aside.append(local)
                     if await make_folder(local):
-                        return
-            reason = f'{local} was created again as something other than a folder while it was being moved aside'
+                        return None, local
+            return f'{local} was created again as something other than a folder while it was being moved aside', local
         except FileFailed as failed:
-            reason = failed.reason
-        blocked[local] = reason
-        report.failed.append(Failure(entry.resource.path, reason))
+            return failed.reason, local
 
     async def _later_passes(
         self, deferred: list[tuple[MirrorEntry, FileDeferred]], tools: _RunTools, *, passes: int
@@ -444,7 +498,8 @@ class MirrorRun:
                     await turns.start(self._turn(entry, tools, remaining))
             deferred = self._sorted(remaining)
         suffix = f' (after {used} passes)' if used > 1 else ''
-        tools.report.failed += [Failure(entry.resource.path, failure.reason + suffix) for entry, failure in deferred]
+        for entry, failure in deferred:
+            self._fail(tools.report, entry, failure.reason + suffix)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -453,6 +508,19 @@ class MirrorRun:
         """One file's turn in a pass; a deferred file is added to `deferred`."""
         if (later := await self._download(entry, tools)) is not None:
             deferred.append((entry, later))
+
+    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str) -> None:
+        if is_held(entry):
+            report.quarantined.append(held_copy(entry, reason))
+        else:
+            report.failed.append(Failure(entry.resource.path, reason))
+        self._mirror.record_failure(entry.entry_id, reason)
+
+    def _succeeded(self, entry: MirrorEntry) -> None:
+        """Drop the failure a folder found in place, or a file skipped as current, had when the run started; placing
+        or adopting a file drops it with the verified record."""
+        if entry.failure is not None:
+            self._mirror.clear_failure(entry.entry_id)
 
     def _sorted(self, deferred: list[tuple[MirrorEntry, FileDeferred]]) -> list[tuple[MirrorEntry, FileDeferred]]:
         return sorted(deferred, key=lambda item: self._positions[item[0].entry_id])
@@ -463,6 +531,7 @@ class MirrorRun:
         report.adopted.sort(key=by_path.__getitem__)
         report.size_only.sort(key=by_path.__getitem__)
         report.moved_aside.sort(key=by_local.__getitem__)
+        report.quarantined.sort(key=lambda quarantined: quarantined.path)
         report.failed.sort(key=lambda failure: failure.path)
         report.renamed.sort()
 
@@ -484,7 +553,10 @@ class MirrorRun:
         except FileDeferred as deferred:
             return deferred
         except FileFailed as failed:
-            report.failed.append(Failure(entry.resource.path, failed.reason))
+            self._fail(report, entry, failed.reason)
+            return None
+        except FileQuarantined as quarantined:
+            report.quarantined.append(QuarantinedFile(entry.resource.path, quarantined.reason, quarantined.copy))
             return None
         if outcome.adopted:
             report.skipped += 1
@@ -518,10 +590,11 @@ async def download_file(
     hold `placement` in one acquisition, so no other file of the run sees the path or the inode in between. The
     first look at the path, hashing a local copy and fetching run outside it.
 
-    A file already at the local path is adopted when its content matches the cloud. Otherwise the file is
-    downloaded and verified first, and only then is whatever stands at the local path moved aside and the new file
-    placed. A path that is the same file as another entry's verified copy is never adopted, moved or replaced. A name
-    the destination refuses is converted, and the file placed under the converted name.
+    A file already at the local path is adopted when its content matches the cloud, unless the entry has a finding:
+    that copy is never read. Otherwise the file is downloaded and verified first, and only then is whatever stands at
+    the local path moved aside and the new file placed; placing it drops the finding. A path that is the same file as
+    another entry's verified copy is never adopted, moved or replaced. A name the destination refuses is converted,
+    and the file placed under the converted name.
 
     The entry's download record is read from `mirror` when the turn starts. A partial file whose `partial` record
     is for the entry's identity is resumed, segment by segment, from its journal's confirmed offsets after
@@ -529,9 +602,10 @@ async def download_file(
     digest; any other partial file is started again from byte 0 with the segments of `policy`. Checkpoints and
     immediate retries follow `policy`, as described in the module.
 
-    Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileFailed` when
-    this file cannot be mirrored, `DestinationError` when the destination cannot be written at all, and the API
-    errors that stop the run (`TokenRejectedError`, `DiskApiError`).
+    Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
+    when the downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError`
+    when the destination cannot be written at all, and the API errors that stop the run (`TokenRejectedError`,
+    `DiskApiError`).
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
@@ -541,15 +615,17 @@ async def download_file(
         if existing is not None:
             if reason := _alias(entry, local, existing, mirror, destination):
                 raise FileFailed(reason)
-            verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads, placement)
-            if verified_by is not None:
-                return FileOutcome(local, verified_by, adopted=True, moved_aside=False)
+            if entry.finding is None:
+                verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads, placement)
+                if verified_by is not None:
+                    return FileOutcome(local, verified_by, adopted=True, moved_aside=False)
         verified_by = await _fetch_verified(
             entry,
             identity,
             client=client,
             content=content,
             threads=threads,
+            placement=placement,
             mirror=mirror,
             destination=destination,
             policy=policy,
@@ -702,17 +778,19 @@ async def _fetch_verified(
     client: api.DiskClient,
     content: api.ContentClient,
     threads: DiskThreads,
+    placement: asyncio.Lock,
     mirror: Mirror,
     destination: Destination,
     policy: TransferPolicy,
 ) -> VerifiedBy:
-    """Fetch the file into its partial file, keeping the confirmed bytes already there when they can be resumed,
-    verify it, and give it the cloud mtime, durably.
+    """Fetch the file into its partial file, keeping the confirmed bytes already there when they can be resumed, give
+    it the cloud mtime, durably, and verify it.
 
     A file fetched as one stream is cut to its confirmed bytes and verified by the digest computed as it arrives. A
     segmented file is preallocated to its size first, and read back in full once every segment is in.
 
-    A partial file that fails verification is deleted and its record dropped; one cut short by a transfer error is
+    A partial file that fails verification is moved to the run's quarantine folder under `placement`, then recorded as
+    quarantined, which drops its download record, and `FileQuarantined` is raised. One cut short by a transfer error is
     kept with its journal. The partial file is closed only once no thread call on it is running, also when the task
     is cancelled.
     """
@@ -752,13 +830,13 @@ async def _fetch_verified(
         )
         await fetch.run()
         digest = await _file_digest(journal, partial, threads, identity.size)
-        try:
-            verified_by = digest.verify(identity)
-        except FileFailed:
-            _discard(entry, mirror, destination)
-            raise
         await threads.run(partial.finish, _mtime_ns(identity.modified))
-    return verified_by
+    if (reason := digest.mismatch(identity)) is None:
+        return _method(identity)
+    async with placement:
+        copy = await threads.run(destination.quarantine, entry.entry_id, _local_path(entry))
+    mirror.record_quarantined(entry.entry_id, identity, copy, reason)
+    raise FileQuarantined(reason, copy)
 
 
 async def _resume(
@@ -1116,10 +1194,12 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
 
 def mirror_summary(report: MirrorReport) -> list[str]:
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
-    files, renamed entries, what was moved aside, and failures with their reasons."""
+    files, renamed entries, what was moved aside, quarantined files with their reasons and copies, and failures with
+    their reasons."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
-        f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.failed)} failed'
+        f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
+        f'{len(report.failed)} failed'
     ]
     if report.passes is not None:
         used, limit = report.passes
@@ -1138,6 +1218,11 @@ def mirror_summary(report: MirrorReport) -> list[str]:
         lines.append(f'Moved aside to {report.replaced_folder}/: {len(report.moved_aside)}')
         shown = [str(local) for local in report.moved_aside]
         lines += listed('', shown, len(shown), '')
+    if report.quarantined:
+        lines.append(f'Quarantined: {len(report.quarantined)}')
+        shown = [f'{held.path}: {held.reason}; kept at {held.copy}' for held in report.quarantined]
+        lines += listed('', shown, len(shown), '')
+        lines.append(_QUARANTINE_HINT)
     if report.failed:
         lines.append(f'Failed: {len(report.failed)}')
         shown = [f'{failure.path}: {failure.reason}' for failure in report.failed]
@@ -1155,13 +1240,42 @@ def _assign_local_names(mirror: Mirror) -> list[MirrorEntry]:
     return [replace(e, local_path=mapped[e.resource.path]) for e in entries]
 
 
+def _retry_walk(entries: list[MirrorEntry], names: LocalNames) -> list[MirrorEntry]:
+    """The entries a `--retry-failed` run walks, in path order: the retry set and the folders above its members."""
+    members = [
+        e
+        for e in entries
+        if e.failure is not None
+        or e.quarantine is not None
+        or e.finding is not None
+        or (e.resource.kind == 'file' and e.download is not None and e.download.state == 'partial')
+    ]
+    walked = {names[e.entry_id] for e in members}
+    walked.update(parent for e in members for parent in names[e.entry_id].parents)
+    return [e for e in entries if names[e.entry_id] in walked]
+
+
+def is_held(entry: MirrorEntry) -> bool:
+    """Whether the entry's quarantine record is for its current identity, so a plain run holds the file back."""
+    return entry.quarantine is not None and entry.quarantine.identity == RemoteIdentity.of(entry.resource)
+
+
+def held_copy(entry: MirrorEntry, last_retry: str | None) -> QuarantinedFile:
+    """The report of a file held by its quarantine record, with the failure of its last retry, if any."""
+    if entry.quarantine is None:
+        raise ValueError(f'{entry.resource.path} has no quarantine record')
+    reason = entry.quarantine.reason if last_retry is None else f'{entry.quarantine.reason}; last retry: {last_retry}'
+    return QuarantinedFile(entry.resource.path, reason, entry.quarantine.copy)
+
+
 def _is_current(entry: MirrorEntry, destination: Destination) -> bool:
-    """Whether the entry is a file verified for its current identity whose placed copy has the recorded `lstat`.
+    """Whether the entry is a file verified for its current identity, with no finding, whose placed copy has the
+    recorded `lstat`.
 
     A placed copy that cannot be looked at is not current: the file's own turn meets the error and reports it.
     """
     record = entry.download
-    if entry.resource.kind != 'file' or record is None or record.state != 'verified':
+    if entry.resource.kind != 'file' or record is None or record.state != 'verified' or entry.finding is not None:
         return False
     if record.identity != RemoteIdentity.of(entry.resource):
         return False
@@ -1251,7 +1365,7 @@ def _recorded_method(entry: MirrorEntry) -> VerifiedBy:
     return entry.download.verified_by
 
 
-def _unencodable_reason(entry: UnencodableEntry) -> str:
+def unencodable_reason(entry: UnencodableEntry) -> str:
     if entry.kind == 'dir':
         return 'the folder name is not valid Unicode, so the Disk API cannot list it or download anything in it'
     return 'the name is not valid Unicode, so the Disk API cannot download it'

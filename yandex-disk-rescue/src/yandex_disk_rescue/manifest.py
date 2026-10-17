@@ -8,10 +8,12 @@ the entries it left out because their names are not valid Unicode (`unencodable_
 scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
-the local name of every entry (`local_names`) and each file's download state (`downloads`), keyed by `entries.id`,
-with the checkpoint journal of a partial download (`download_segments`).
-A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
-the manifest deletes its rows.
+the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
+of a partial download (`download_segments`), the reason the last turn of an entry failed (`failures`), and the copy
+of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
+wrong at the entry's final path (`verify_findings`), all keyed by `entries.id`. A rescan never rewrites them: a
+record keeps the remote identity it was made for, and only an entry's removal from the manifest deletes its rows.
+A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got.
 
 The database runs in WAL mode with `synchronous=FULL`: a commit is atomic and durable across a crash or power cut,
 and each `ScanSession.add` costs one WAL append and fsync instead of the rollback journal's several. WAL needs a
@@ -167,6 +169,57 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         SELECT mirror_id, entry_id, 0, size, 0, NULL FROM downloads WHERE state = 'partial' AND size > 0
         """,
     ),
+    (
+        # `reason` is the user-facing reason the entry's last turn in this mirror failed.
+        """
+        CREATE TABLE failures (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id)
+        )
+        """,
+    ),
+    (
+        # The identity columns are the remote file the quarantined copy was downloaded for; `copy_path` is that copy,
+        # relative to the destination, and `reason` how it failed verification.
+        """
+        CREATE TABLE quarantined (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            md5 TEXT,
+            sha256 TEXT,
+            modified TEXT NOT NULL,
+            copy_path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id)
+        )
+        """,
+    ),
+    (
+        # What `verify` found wrong with the file at the entry's final path, whatever the entry's download record.
+        """
+        CREATE TABLE verify_findings (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            finding TEXT NOT NULL CHECK (finding IN ('missing', 'modified', 'corrupt')),
+            reason TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id)
+        )
+        """,
+    ),
+    (
+        # The `verify` pass in progress on a mirror; `checked_through` is the Disk path of the last file whose check is
+        # committed, NULL before the first.
+        """
+        CREATE TABLE verify_passes (
+            mirror_id INTEGER PRIMARY KEY REFERENCES mirrors (id) ON DELETE CASCADE,
+            started_at TEXT NOT NULL,
+            checked_through TEXT
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -179,6 +232,10 @@ class ManifestError(RescueError):
     """The manifest cannot be opened or updated; the message names the file and what to do."""
 
 
+class ManifestMissingError(ManifestError):
+    """No manifest exists at the path `Manifest.open_existing` was given."""
+
+
 class MirrorMismatchError(RescueError):
     """The destination already mirrors another remote folder or another account."""
 
@@ -186,6 +243,7 @@ class MirrorMismatchError(RescueError):
 
 
 type VerifiedBy = Literal['md5+sha256', 'md5', 'sha256', 'size']
+type FindingKind = Literal['missing', 'modified', 'corrupt']
 
 
 @dataclass(frozen=True)
@@ -243,11 +301,42 @@ class DownloadRecord:
 
 
 @dataclass(frozen=True)
+class Quarantine:
+    """A download of `identity` that failed verification for `reason`, kept at `copy` (relative to the destination)."""
+
+    identity: RemoteIdentity
+    copy: PurePosixPath
+    reason: str
+
+
+@dataclass(frozen=True)
+class Finding:
+    """What `verify` found wrong with the file at an entry's final path: nothing there (`missing`), something else
+    there (`modified`), or the recorded file with other content or unreadable (`corrupt`); `reason` is the
+    user-facing text."""
+
+    kind: FindingKind
+    reason: str
+
+
+@dataclass(frozen=True)
+class VerifyPass:
+    """A `verify` pass in progress on a mirror: the files up to `checked_through` (a Disk path; `None` before the
+    first) are checked, every file after it is still to check."""
+
+    started_at: datetime
+    checked_through: str | None
+
+
+@dataclass(frozen=True)
 class MirrorEntry:
     entry_id: int
     resource: Resource
     local_path: PurePosixPath | None  # relative to the destination; `None` until a name is assigned
     download: DownloadRecord | None
+    failure: str | None  # why the entry's last turn in this mirror failed; `None` once it succeeded
+    quarantine: Quarantine | None  # the last quarantined copy; `None` once the file is verified
+    finding: Finding | None  # what `verify` found wrong at the final path; `None` once a copy is verified there
 
 
 @dataclass(frozen=True)
@@ -291,12 +380,31 @@ class Manifest:
         """
         try:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            lock_fd = os.open(_lock_path(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         except OSError as exc:
             raise ManifestError(f'Could not create the manifest at {path}: {exc.strerror}.') from None
+        return cls._open(path, create=True)
+
+    @classmethod
+    def open_existing(cls, path: Path) -> Manifest:
+        """Open the manifest at `path` as `open` does, but create nothing: raises `ManifestMissingError` when no file
+        is there."""
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            raise ManifestMissingError(f'No manifest exists at {path}.') from None
+        except OSError as exc:
+            raise ManifestError(f'Could not open the manifest at {path}: {exc.strerror}.') from None
+        return cls._open(path, create=False)
+
+    @classmethod
+    def _open(cls, path: Path, *, create: bool) -> Manifest:
+        try:
+            lock_fd = os.open(_lock_path(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        except OSError as exc:
+            raise ManifestError(f'Could not open the run lock of the manifest at {path}: {exc.strerror}.') from None
         try:
             _acquire_run_lock(lock_fd, path)
-            connection = _connect(path)
+            connection = _connect(path, create=create)
         except BaseException:
             os.close(lock_fd)
             raise
@@ -358,6 +466,16 @@ class Manifest:
                         'another destination.'
                     )
         return Mirror(self, mirror_id, account_uid, remote_root, destination)
+
+    def mirror_at(self, destination: Path) -> Mirror | None:
+        """The mirror recorded at `destination` (resolved, absolute), or `None`; nothing is created."""
+        if not destination.is_absolute():
+            raise ValueError(f'mirror destination {destination} is not an absolute path')
+        with self._errors('read'):
+            row = self._connection.execute(
+                'SELECT id, account_uid, remote_root FROM mirrors WHERE destination = ?', (os.fsencode(destination),)
+            ).fetchone()
+        return None if row is None else Mirror(self, *row, destination)
 
     def last_scan(self, account_uid: str, root: str) -> ScanTime | None:
         """The newest completed scan of `account_uid` covering `root`: a scan of `root` itself or of an ancestor."""
@@ -499,8 +617,9 @@ class Mirror:
         self.destination = destination
 
     def entries(self) -> list[MirrorEntry]:
-        """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names and
-        download records, read in full so no read stays open across later writes."""
+        """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names,
+        download records, failures, quarantine records and findings, read in full so no read stays open across later
+        writes."""
         params = {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
         connection = self._manifest._connection
         with self._manifest._transaction('read'):
@@ -596,9 +715,9 @@ class Mirror:
     ) -> None:
         """Record the entry's file as verified against `identity`, placed at its final path with `lstat` `local`.
 
-        The record's segments are deleted. Any other verified record of this mirror holding the same inode is deleted:
-        the caller has just placed this file there, so that record describes a file that is gone and whose inode
-        number was reused.
+        The record's segments, the entry's failure, its quarantine record and its finding are deleted. Any other
+        verified record of this mirror holding the same inode is deleted: the caller has just placed this file there,
+        so that record describes a file that is gone and whose inode number was reused.
         """
         self._record(entry_id, identity, 'verified', verified_by, LocalFingerprint.of(local), ())
 
@@ -610,12 +729,94 @@ class Mirror:
             ).fetchone()
         return None if row is None else _mirror_entry(row, ())
 
+    def record_quarantined(self, entry_id: int, identity: RemoteIdentity, copy: PurePosixPath, reason: str) -> None:
+        """Record that the entry's download of `identity` failed verification for `reason` and was moved to `copy`,
+        replacing any quarantine record; the entry's download record, with its segments, and its failure are
+        deleted, while its finding stays: the copy at the final path is still the one `verify` found."""
+        params = {
+            'mirror': self.id,
+            'entry': entry_id,
+            'size': identity.size,
+            'md5': identity.md5,
+            'sha256': identity.sha256,
+            'modified': _timestamp(identity.modified),
+            'copy_path': _local_path_text(copy),
+            'reason': reason,
+        }
+        connection = self._manifest._connection
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            connection.execute(_RECORD_QUARANTINE_SQL, params)
+            connection.execute('DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+            connection.execute('DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+
     def forget(self, entry_id: int) -> None:
-        """Delete the entry's download record and its segments, if any."""
+        """Delete the entry's download record and its segments, if any; its failure, quarantine record and finding
+        stay."""
         with self._manifest._transaction('update'):
             self._manifest._connection.execute(
                 'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
+
+    def record_failure(self, entry_id: int, reason: str) -> None:
+        """Record `reason` as why the entry's last turn failed, replacing any earlier reason."""
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            self._manifest._connection.execute(_RECORD_FAILURE_SQL, (self.id, entry_id, reason))
+
+    def clear_failure(self, entry_id: int) -> None:
+        """Delete the entry's failure, if any."""
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            )
+
+    def record_finding(self, entry_id: int, finding: Finding) -> None:
+        """Record `finding` about the file at the entry's final path, replacing any earlier one, whatever the entry's
+        download record."""
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            self._manifest._connection.execute(_RECORD_FINDING_SQL, (self.id, entry_id, finding.kind, finding.reason))
+
+    def clear_finding(self, entry_id: int) -> None:
+        """Delete the entry's finding, if any."""
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'DELETE FROM verify_findings WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            )
+
+    def verify_pass(self) -> VerifyPass | None:
+        """The `verify` pass in progress on this mirror, if any."""
+        with self._manifest._errors('read'):
+            row = self._manifest._connection.execute(
+                'SELECT started_at, checked_through FROM verify_passes WHERE mirror_id = ?', (self.id,)
+            ).fetchone()
+        return None if row is None else VerifyPass(datetime.fromisoformat(row[0]), row[1])
+
+    def start_verify_pass(self) -> VerifyPass:
+        """Start a `verify` pass with nothing checked, replacing any pass in progress."""
+        started = VerifyPass(datetime.now(UTC), None)
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'INSERT OR REPLACE INTO verify_passes (mirror_id, started_at, checked_through) VALUES (?, ?, NULL)',
+                (self.id, _timestamp(started.started_at)),
+            )
+        return started
+
+    def checked_through(self, path: str) -> None:
+        """Record that the pass in progress has checked every file up to the Disk path `path`; raises `ValueError`
+        when no pass is in progress."""
+        with self._manifest._transaction('update'):
+            updated = self._manifest._connection.execute(
+                'UPDATE verify_passes SET checked_through = ? WHERE mirror_id = ?', (path, self.id)
+            ).rowcount
+            if not updated:
+                raise ValueError(f'mirror {self.id} has no verify pass in progress')
+
+    def end_verify_pass(self) -> None:
+        """Delete the pass in progress, if any."""
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute('DELETE FROM verify_passes WHERE mirror_id = ?', (self.id,))
 
     def _segments(self, entry_id: int) -> tuple[Segment, ...]:
         rows = self._manifest._connection.execute(
@@ -661,8 +862,13 @@ class Mirror:
         ]
         with self._manifest._transaction('update'):
             self._check_entry(entry_id)
-            if local is not None:
+            if state == 'verified':
                 connection.execute(_RELEASE_INO_SQL, params)
+                connection.execute('DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+                connection.execute('DELETE FROM quarantined WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+                connection.execute(
+                    'DELETE FROM verify_findings WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+                )
             # The upsert updates the row in place, so no cascade deletes the old segments.
             connection.execute(
                 'DELETE FROM download_segments WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
@@ -679,12 +885,18 @@ class Mirror:
 
 _MIRROR_ENTRY_COLUMNS = """
     e.id, e.path, e.kind, e.size, e.md5, e.sha256, e.modified, n.local_path,
-    d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino
+    d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino,
+    f.reason,
+    q.size, q.md5, q.sha256, q.modified, q.copy_path, q.reason,
+    v.finding, v.reason
 """
 _MIRROR_JOINS = """
     FROM entries e
     LEFT JOIN local_names n ON n.mirror_id = :mirror AND n.entry_id = e.id
     LEFT JOIN downloads d ON d.mirror_id = :mirror AND d.entry_id = e.id
+    LEFT JOIN failures f ON f.mirror_id = :mirror AND f.entry_id = e.id
+    LEFT JOIN quarantined q ON q.mirror_id = :mirror AND q.entry_id = e.id
+    LEFT JOIN verify_findings v ON v.mirror_id = :mirror AND v.entry_id = e.id
 """
 _MIRROR_ENTRIES_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
@@ -734,6 +946,21 @@ _RECORD_DOWNLOAD_SQL = """
         state = excluded.state, size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256,
         modified = excluded.modified, verified_by = excluded.verified_by, local_size = excluded.local_size,
         local_mtime_ns = excluded.local_mtime_ns, local_ino = excluded.local_ino
+"""
+_RECORD_FAILURE_SQL = """
+    INSERT INTO failures (mirror_id, entry_id, reason) VALUES (?, ?, ?)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET reason = excluded.reason
+"""
+_RECORD_QUARANTINE_SQL = """
+    INSERT INTO quarantined (mirror_id, entry_id, size, md5, sha256, modified, copy_path, reason)
+    VALUES (:mirror, :entry, :size, :md5, :sha256, :modified, :copy_path, :reason)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET
+        size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256, modified = excluded.modified,
+        copy_path = excluded.copy_path, reason = excluded.reason
+"""
+_RECORD_FINDING_SQL = """
+    INSERT INTO verify_findings (mirror_id, entry_id, finding, reason) VALUES (?, ?, ?, ?)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET finding = excluded.finding, reason = excluded.reason
 """
 _UNENCODABLE_SQL = """
     SELECT path, kind FROM unencodable_entries
@@ -803,11 +1030,14 @@ def _acquire_run_lock(lock_fd: int, path: Path) -> None:
         ) from None
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+def _connect(path: Path, *, create: bool) -> sqlite3.Connection:
     try:
-        # Created here so the database (and the WAL files SQLite gives the same mode) are private from the start.
-        os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600))
-        connection = sqlite3.connect(path, autocommit=True)
+        if create:
+            # Created here so the database (and the WAL files SQLite gives the same mode) are private from the start.
+            os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600))
+            connection = sqlite3.connect(path, autocommit=True)
+        else:
+            connection = sqlite3.connect(f'{path.absolute().as_uri()}?mode=rw', uri=True, autocommit=True)
     except (OSError, sqlite3.Error) as exc:
         raise ManifestError(f'Could not open the manifest at {path}: {_reason(exc)}.') from None
     try:
@@ -969,8 +1199,18 @@ def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
         entry_id=entry_id,
         resource=_resource(row[1:7]),
         local_path=None if local_path is None else PurePosixPath(local_path),
-        download=None if row[8] is None else _download_record(row[8:], segments),
+        download=None if row[8] is None else _download_record(row[8:17], segments),
+        failure=row[17],
+        quarantine=None if row[18] is None else _quarantine(row[18:24]),
+        finding=None if row[24] is None else Finding(kind=row[24], reason=row[25]),
     )
+
+
+def _quarantine(row: tuple) -> Quarantine:
+    """Build a `Quarantine` from the `quarantined` columns size, md5, sha256, modified, copy_path and reason."""
+    size, md5, sha256, modified, copy_path, reason = row
+    identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
+    return Quarantine(identity=identity, copy=PurePosixPath(copy_path), reason=reason)
 
 
 def _download_record(row: tuple, segments: tuple[Segment, ...]) -> DownloadRecord:

@@ -15,15 +15,19 @@ from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.manifest import (
     SCHEMA_VERSION,
     DownloadRecord,
+    Finding,
     LocalFingerprint,
     Manifest,
     ManifestError,
+    ManifestMissingError,
     Mirror,
     MirrorMismatchError,
+    Quarantine,
     RemoteIdentity,
     ScanTime,
     Segment,
     UnencodableEntry,
+    VerifyPass,
 )
 from yandex_disk_rescue.paths import state_dir
 
@@ -207,6 +211,32 @@ def test_open_creates_a_private_directory_and_database_at_the_current_schema_ver
         assert connection.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
 
 
+def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_and_upgrades(tmp_path):
+    db = tmp_path / 'state' / 'manifest.sqlite3'
+
+    with pytest.raises(ManifestMissingError, match=f'No manifest exists at {db}'):
+        Manifest.open_existing(db)
+    assert not db.parent.exists()
+    db.parent.mkdir()
+    with pytest.raises(ManifestMissingError):
+        Manifest.open_existing(db)
+    assert list(db.parent.iterdir()) == []
+
+    _scan(db, TREE)
+    with sqlite3.connect(db) as connection:
+        connection.execute('DROP TABLE verify_passes')
+        connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 1}')
+    with Manifest.open_existing(db) as manifest:
+        assert [r.path for r in manifest.entries(UID, 'disk:/')] == sorted(r.path for r in TREE)
+        with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
+            Manifest.open(db)
+        with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
+            Manifest.open_existing(db)
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
+        assert connection.execute('SELECT count(*) FROM verify_passes').fetchone()[0] == 0
+
+
 def test_a_newer_schema_version_is_refused(tmp_path):
     db = tmp_path / 'manifest.sqlite3'
     Manifest.open(db).close()
@@ -337,7 +367,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 4
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -361,7 +391,39 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 4
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
+
+
+V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
+
+
+def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    with closing(sqlite3.connect(db)) as connection:
+        connection.executescript(V4_FIXTURE.read_text())
+
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
+        entries = {e.resource.path: e for e in mirror.entries()}
+
+    assert {path: e.failure for path, e in entries.items()} == {
+        'disk:/Photos': None,
+        'disk:/Photos/a.jpg': None,
+        'disk:/Photos/big.bin': None,
+    }
+    verified, partial = entries['disk:/Photos/a.jpg'].download, entries['disk:/Photos/big.bin'].download
+    assert verified is not None
+    assert (verified.state, verified.verified_by, verified.segments) == ('verified', 'md5+sha256', ())
+    assert partial is not None
+    assert (partial.state, partial.segments) == (
+        'partial',
+        (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
+    )
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
+        assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
+        assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
+        assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
 
 
 def test_a_mirror_is_found_again_by_its_destination(tmp_path):
@@ -377,6 +439,23 @@ def test_a_mirror_is_found_again_by_its_destination(tmp_path):
 
     assert (again.id, again.destination, again.remote_root) == (first.id, dest, 'disk:/A')
     assert other.id != first.id
+
+
+def test_a_recorded_mirror_is_looked_up_by_its_destination_without_creating_one(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    dest = tmp_path / 'dest'
+    with Manifest.open(db) as manifest:
+        recorded = manifest.mirror(UID, 'disk:/A', dest)
+        found = manifest.mirror_at(dest)
+        missing = manifest.mirror_at(tmp_path / 'elsewhere')
+        with pytest.raises(ValueError, match='not an absolute path'):
+            manifest.mirror_at(Path('relative'))
+
+    assert found is not None
+    assert (found.id, found.account_uid, found.remote_root, found.destination) == (recorded.id, UID, 'disk:/A', dest)
+    assert missing is None
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('SELECT count(*) FROM mirrors').fetchone()[0] == 1
 
 
 @pytest.mark.parametrize(
@@ -713,6 +792,96 @@ def test_verifying_or_forgetting_a_download_deletes_its_journal(tmp_path):
     assert _segment_rows(db) == []
 
 
+def _failures(mirror: Mirror) -> dict[str, str]:
+    return {e.resource.path: e.failure for e in mirror.entries() if e.failure is not None}
+
+
+def test_a_failure_is_replaced_kept_by_forget_and_dropped_by_verifying_or_clearing(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_failure(ids['disk:/A'], 'could not write A: Permission denied')
+        mirror.record_failure(ids[keep.path], 'the download stalled: no data for 15 s')
+        mirror.record_failure(ids[edit.path], 'the download stalled: no data for 15 s')
+        mirror.record_failure(ids[edit.path], 'removed from the Disk after the scan')
+        recorded = _failures(mirror)
+
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), _unconfirmed(edit))
+        mirror.forget(ids[edit.path])
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), _unconfirmed(keep))
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        mirror.clear_failure(ids['disk:/A'])
+        mirror.clear_failure(ids['disk:/A'])
+        after = _failures(mirror)
+        elsewhere = _failures(other)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_failure(10_000, 'nowhere')
+
+    assert recorded == {
+        'disk:/A': 'could not write A: Permission denied',
+        'disk:/A/edit.txt': 'removed from the Disk after the scan',
+        'disk:/A/keep.txt': 'the download stalled: no data for 15 s',
+    }
+    assert after == {'disk:/A/edit.txt': 'removed from the Disk after the scan'}
+    assert elsewhere == {}
+
+
+def test_a_failure_survives_a_rescan_and_goes_with_its_removed_entry(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    with manifest:
+        for path in ('disk:/A/edit.txt', 'disk:/A/gone.txt'):
+            mirror.record_failure(ids[path], 'the download stalled: no data for 15 s')
+
+    _scan(db, [r for r in TREE if r.path != 'disk:/A/gone.txt'])
+    with Manifest.open(db) as manifest:
+        failures = _failures(manifest.mirror(UID, 'disk:/', Path('/dest')))
+
+    assert failures == {'disk:/A/edit.txt': 'the download stalled: no data for 15 s'}
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('SELECT entry_id FROM failures').fetchall() == [(ids['disk:/A/edit.txt'],)]
+
+
+def _quarantines(mirror: Mirror) -> dict[str, Quarantine]:
+    return {e.resource.path: e.quarantine for e in mirror.entries() if e.quarantine is not None}
+
+
+def test_a_quarantine_drops_the_download_its_journal_and_the_failure_and_verifying_drops_the_quarantine(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    older = RemoteIdentity(size=4, md5='dd', sha256='ee', modified=MODIFIED - timedelta(days=1))
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    first = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/A/keep.txt')
+    second = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T10-00-00Z/A/keep.txt')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 10, 6, 'aa')])
+        mirror.record_failure(ids[keep.path], 'the download stalled: no data for 15 s')
+        mirror.record_quarantined(ids[keep.path], older, first, 'MD5 mismatch (expected dd, got ff)')
+        mirror.record_quarantined(ids[keep.path], RemoteIdentity.of(keep), second, 'size mismatch')
+        mirror.record_quarantined(ids[edit.path], RemoteIdentity.of(edit), first.with_name('edit.txt'), 'bad')
+        quarantined = mirror.entries()
+        elsewhere = _quarantines(other)
+
+        mirror.forget(ids[edit.path])
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        after = _quarantines(mirror)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_quarantined(10_000, older, first, 'nowhere')
+
+    [entry] = [e for e in quarantined if e.resource.path == keep.path]
+    assert (entry.download, entry.failure) == (None, None)
+    assert entry.quarantine == Quarantine(RemoteIdentity.of(keep), second, 'size mismatch')
+    assert _segment_rows(db) == []
+    assert elsewhere == {}
+    assert after == {edit.path: Quarantine(RemoteIdentity.of(edit), first.with_name('edit.txt'), 'bad')}
+
+
 def _stat(ino: int, size: int = 1) -> os.stat_result:
     fields = [0] * os.stat_result.n_fields
     fields[1], fields[6], fields[14] = ino, size, 1_700_000_000_000_000_000
@@ -832,3 +1001,90 @@ def test_entries_left_out_for_their_names_are_kept_per_subtree_until_a_scan_cove
         assert manifest.mirror('2', 'disk:/', tmp_path / 'other').unencodable() == [
             UnencodableEntry('disk:/A/other\udc82', 'file')
         ]
+
+
+def _findings(mirror: Mirror) -> dict[str, Finding]:
+    return {e.resource.path: e.finding for e in mirror.entries() if e.finding is not None}
+
+
+def test_a_finding_survives_download_record_changes_and_goes_with_verifying_clearing_or_removing_the_entry(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep, edit, gone, top = (
+        next(r for r in TREE if r.path == p)
+        for p in ('disk:/A/keep.txt', 'disk:/A/edit.txt', 'disk:/A/gone.txt', 'disk:/top.bin')
+    )
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    corrupt = Finding('corrupt', 'MD5 mismatch (expected aa, got ff)')
+    copy = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/A/edit.txt')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        mirror.record_finding(ids[keep.path], Finding('missing', 'A/keep.txt is missing'))
+        mirror.record_finding(ids[keep.path], corrupt)
+        for resource in (edit, gone, top):
+            mirror.record_finding(ids[resource.path], Finding('modified', 'A/x is no longer a regular file'))
+        recorded = _findings(mirror)
+
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 10, 0, None)])
+        mirror.checkpoint(ids[keep.path], [Segment(0, 10, 6, 'aa')])
+        mirror.forget(ids[keep.path])
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), _unconfirmed(edit))
+        mirror.record_quarantined(ids[edit.path], RemoteIdentity.of(edit), copy, 'size mismatch')
+        mirror.record_verified(ids[top.path], RemoteIdentity.of(top), 'md5+sha256', os.lstat(placed))
+        mirror.clear_finding(ids['disk:/A/gone.txt'])
+        mirror.clear_finding(ids['disk:/A/gone.txt'])
+        kept = _findings(mirror)
+        elsewhere = _findings(other)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_finding(10_000, corrupt)
+
+    assert recorded == {
+        keep.path: corrupt,
+        edit.path: Finding('modified', 'A/x is no longer a regular file'),
+        gone.path: Finding('modified', 'A/x is no longer a regular file'),
+        top.path: Finding('modified', 'A/x is no longer a regular file'),
+    }
+    assert kept == {keep.path: corrupt, edit.path: Finding('modified', 'A/x is no longer a regular file')}
+    assert elsewhere == {}
+
+    _scan(db, [r for r in TREE if r.path != keep.path])
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('SELECT entry_id, finding FROM verify_findings').fetchall() == [
+            (ids[edit.path], 'modified')
+        ]
+
+
+def test_a_verify_pass_round_trips_is_replaced_by_a_new_one_and_goes_with_its_mirror(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    _scan(db, TREE)
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/', tmp_path / 'dest')
+        other = manifest.mirror(UID, 'disk:/', tmp_path / 'other')
+        assert mirror.verify_pass() is None
+        with pytest.raises(ValueError, match='has no verify pass in progress'):
+            mirror.checked_through('disk:/A/keep.txt')
+
+        before = datetime.now(UTC)
+        started = mirror.start_verify_pass()
+        mirror.checked_through('disk:/A/edit.txt')
+        mirror.checked_through('disk:/A/keep.txt')
+        assert mirror.verify_pass() == VerifyPass(started.started_at, 'disk:/A/keep.txt')
+        assert before <= started.started_at <= datetime.now(UTC)
+        assert started.checked_through is None
+        assert other.verify_pass() is None
+
+        restarted = mirror.start_verify_pass()
+        assert mirror.verify_pass() == restarted == VerifyPass(restarted.started_at, None)
+        assert restarted.started_at >= started.started_at
+        other.start_verify_pass()
+        mirror.end_verify_pass()
+        mirror.end_verify_pass()
+        assert mirror.verify_pass() is None
+        assert other.verify_pass() is not None
+
+    with closing(sqlite3.connect(db)) as connection:
+        connection.execute('PRAGMA foreign_keys = ON')
+        connection.execute('DELETE FROM mirrors')
+        connection.commit()
+        assert connection.execute('SELECT count(*) FROM verify_passes').fetchone()[0] == 0

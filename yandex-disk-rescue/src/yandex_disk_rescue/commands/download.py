@@ -1,5 +1,6 @@
 """`download`: scan a remote folder (unless a recent scan covers it), mirror it into a local folder with every file
-verified, and summarize the run."""
+verified, or retry only the files whose last attempt failed, was quarantined or never finished and those `verify`
+found broken, and summarize the run."""
 
 import asyncio
 from dataclasses import dataclass
@@ -18,9 +19,16 @@ from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tr
 from yandex_disk_rescue.units import format_size
 
 
-class FilesFailedError(RescueError):
-    def __init__(self, count: int) -> None:
-        super().__init__(f'{count} failed; see the list above.')
+class FilesNotMirroredError(RescueError):
+    """Files of the run failed or are quarantined."""
+
+    def __init__(self, failed: int, quarantined: int) -> None:
+        if failed and quarantined:
+            super().__init__(f'{failed} failed and {quarantined} quarantined; see the lists above.')
+        elif quarantined:
+            super().__init__(f'{quarantined} quarantined; see the list above.')
+        else:
+            super().__init__(f'{failed} failed; see the list above.')
 
 
 class NeverScannedError(RescueError):
@@ -46,6 +54,15 @@ def download(
             help='Use the manifest as it is, whatever the age of its scan, instead of scanning REMOTE_PATH first.',
         ),
     ] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(
+            '--retry-failed',
+            help='Download only the files whose last attempt in DEST failed, was quarantined or never finished, the '
+            'files verify found missing, modified or corrupt, and the folders that failed; leave everything else '
+            'alone.',
+        ),
+    ] = False,
     scan_max_age: settings.ScanMaxAge = settings.SCAN_MAX_AGE.default,
     download_timeout: settings.DownloadTimeout = settings.DOWNLOAD_TIMEOUT.default,
     download_retries: settings.DownloadRetries = settings.DOWNLOAD_RETRIES.default,
@@ -63,7 +80,7 @@ def download(
     api_url: settings.ApiUrl = settings.API_URL.default,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
-    skipped on a rerun."""
+    skipped on a rerun, or with --retry-failed only the failed, quarantined, unfinished and broken ones."""
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
@@ -81,6 +98,7 @@ def download(
                 base_url=api_url,
                 limits=limits,
                 scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
+                retry_failed=retry_failed,
                 transfers=_Transfers(
                     timeout=download_timeout,
                     retries=download_retries,
@@ -99,8 +117,8 @@ def download(
     for line in mirror_summary(report):
         typer.echo(line)
     typer.echo(f'Manifest: {manifest_path}')
-    if report.failed:
-        raise FilesFailedError(len(report.failed))
+    if report.failed or report.quarantined:
+        raise FilesNotMirroredError(len(report.failed), len(report.quarantined))
 
 
 def _split_locations(locations: list[str]) -> tuple[str, str]:
@@ -170,6 +188,7 @@ async def _run(
     base_url: str,
     limits: api.ApiLimits,
     scan_policy: _ScanPolicy,
+    retry_failed: bool,
     transfers: _Transfers,
     manifest_path: Path,
 ) -> MirrorReport:
@@ -185,14 +204,22 @@ async def _run(
                         typer.echo(line)
                 else:
                     typer.echo(reused)
-                return await _mirror(client, MirrorRun(mirror, destination), destination, transfers)
+                run = MirrorRun(mirror, destination, retry_failed=retry_failed)
+                return await _mirror(client, run, destination, transfers, retry_failed=retry_failed)
 
 
 async def _mirror(
-    client: api.DiskClient, run: MirrorRun, destination: Destination, transfers: _Transfers
+    client: api.DiskClient, run: MirrorRun, destination: Destination, transfers: _Transfers, *, retry_failed: bool
 ) -> MirrorReport:
     files = 'file' if run.pending_files == 1 else 'files'
-    typer.echo(f'Downloading {run.pending_files} {files} ({format_size(run.pending_size)}) to {destination.path}')
+    size = format_size(run.pending_size)
+    if retry_failed:
+        typer.echo(
+            f'Retrying {run.pending_files} failed, quarantined, unfinished or broken {files} ({size}) in '
+            f'{destination.path}'
+        )
+    else:
+        typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
         policy = TransferPolicy(
             retries=transfers.retries,
