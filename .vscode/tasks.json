@@ -38,24 +38,10 @@
             "problemMatcher": []
         },
         {
-            "label": "Run example-app: hello",
+            "label": "Run yandex-disk-rescue --help",
             "type": "shell",
-            "command": "uv run example-app hello",
+            "command": "uv run yandex-disk-rescue --help",
             "problemMatcher": []
-        },
-        {
-            "label": "Run example-app: greet multiple",
-            "type": "shell",
-            "command": "uv run example-app greet-multiple ${input:names}",
-            "problemMatcher": []
-        }
-    ],
-    "inputs": [
-        {
-            "id": "names",
-            "description": "Names to greet (space separated)",
-            "default": "Alice Bob Charlie",
-            "type": "promptString"
         }
     ]
 }

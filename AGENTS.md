@@ -9,11 +9,22 @@ Cursor, Roo, Copilot, …) working in this repository. Tool-specific files
 
 ## Project Overview
 
-A template for Python projects: a **uv workspace** of packages, **mise** for
-tool versions and tasks, **Dagger** for containerized CI that runs the same
-way locally and on GitHub, and a devcontainer with **Claude Code**
-pre-installed. The `example-app/` and `example-library/` packages are
-placeholders meant to be replaced.
+**yandex-disk-rescue** is a Linux command-line tool that downloads the whole
+content of a Yandex Disk account (or one folder) to local storage, through the
+official Yandex Disk REST API with an OAuth token. It is a headless analogue
+of the Windows app [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue):
+resumable and crash-safe downloads, parallel and segmented transfers, adaptive
+handling of API rate limits, and checksum verification (MD5 / SHA-256) of
+every file. There is no GUI; the CLI is the only interface.
+
+The repository is a **uv workspace** (one package today: `yandex-disk-rescue/`),
+uses **mise** for tool versions and tasks, **Dagger** for containerized CI
+that runs the same way locally and on GitHub, and ships a devcontainer with
+**Claude Code** pre-installed.
+
+**Language:** everything in the repository — code, comments, docs, CLI
+output, commit messages, issues — is in English. No Russian text, even
+when referring to Yandex UI labels or folder names; translate them.
 
 ## Core Rules
 
@@ -61,8 +72,7 @@ commands — never a raw `python`, `pip`, or `.venv/bin/...`.
 ## Repository Layout
 
 ```
-├── example-app/          # Workspace member: Typer CLI (depends on example-library)
-├── example-library/      # Workspace member: plain library
+├── yandex-disk-rescue/   # Workspace member: the CLI and its internals (Typer)
 ├── .dagger/              # Dagger module `repo-ci` (CI pipeline) + tests/ (its own tests)
 ├── .devcontainer/        # Ubuntu devcontainer: mise, Claude Code, Docker-in-Docker
 ├── .github/              # CI workflow, PR template
@@ -97,7 +107,7 @@ commands — never a raw `python`, `pip`, or `.venv/bin/...`.
 - Members reference each other by name; the root lists each member in
   `[tool.uv.sources]` (`{ workspace = true }`) **and** in the `dev`
   group so `uv sync` installs it in editable mode.
-- Add deps with `uv add` (`uv add --package example-app httpx`). Never
+- Add deps with `uv add` (`uv add --package yandex-disk-rescue httpx`). Never
   write `uv.lock` by hand.
 
 **Adding a package:** create `my-package/` with `pyproject.toml`,

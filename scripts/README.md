@@ -6,7 +6,7 @@ Standalone helper scripts that are **not** part of the everyday dev loop
 | Script | Purpose |
 |---|---|
 | `common.sh` | Shared logging/assert helpers; sourced by every script |
-| `generate_github_deploy_key.sh` | Generate an SSH deploy key for workflows that push (see [docs/using-this-template.md](../docs/using-this-template.md)) |
+| `generate_github_deploy_key.sh` | Generate an SSH deploy key for workflows that push (see [docs/github-setup.md](../docs/github-setup.md)) |
 
 ## Template for new scripts
 

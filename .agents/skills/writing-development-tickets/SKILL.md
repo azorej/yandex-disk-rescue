@@ -46,7 +46,7 @@ The deliverable IS a step → too small.
 
 ### Title
 Action-oriented, describes the deliverable, conventional-commit prefix:
-`feat: Add config file support to example-app`
+`feat: Add config file support to yandex-disk-rescue`
 
 ### Labels
 

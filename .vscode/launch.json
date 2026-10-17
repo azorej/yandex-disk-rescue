@@ -5,37 +5,12 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Example App: Hello",
+            "name": "yandex-disk-rescue: --help",
             "type": "debugpy",
             "request": "launch",
-            "module": "example_app.main",
+            "module": "yandex_disk_rescue.cli",
             "args": [
-                "hello"
-            ],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Example App: Hello with Name",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "example_app.main",
-            "args": [
-                "hello",
-                "${input:name}"
-            ],
-            "cwd": "${workspaceFolder}",
-            "console": "integratedTerminal",
-            "justMyCode": true
-        },
-        {
-            "name": "Example App: Greet Multiple",
-            "type": "debugpy",
-            "request": "launch",
-            "module": "example_app.main",
-            "args": [
-                "greet-multiple"
+                "--help"
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
@@ -49,8 +24,7 @@
             "args": [
                 "-v",
                 "--tb=short",
-                "${workspaceFolder}/example-app/tests/",
-                "${workspaceFolder}/example-library/tests/"
+                "${workspaceFolder}/yandex-disk-rescue/tests/"
             ],
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
@@ -73,15 +47,9 @@
     ],
     "inputs": [
         {
-            "id": "name",
-            "description": "Name to greet",
-            "default": "World",
-            "type": "promptString"
-        },
-        {
             "id": "testFile",
             "description": "Test file to run",
-            "default": "example-app/tests/test_main.py",
+            "default": "yandex-disk-rescue/tests/test_cli.py",
             "type": "promptString"
         }
     ]
