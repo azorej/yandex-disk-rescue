@@ -68,7 +68,13 @@ recorded for another folder or account (`MirrorMismatchError`, exit code 2).
 - A failure record (`failures`) holds the reason the entry's last turn in the mirror failed, for files and folders
   alike. `Mirror.record_failure` replaces any earlier reason and `Mirror.clear_failure` drops it; verifying the
   entry's file (`record_verified`) drops it too, while `forget` keeps it. `MirrorEntry.failure` reads it.
-- A rescan never touches names, records or failures; removing an entry from the manifest deletes all three.
+- A quarantine record (`quarantined`) holds the copy of the entry's last download that failed verification: its
+  path relative to the destination, the reason, and the remote identity the download was for.
+  `Mirror.record_quarantined` replaces any earlier record and deletes the entry's download record (with its journal)
+  and its failure; verifying the file (`record_verified`) deletes it, while `forget` keeps it.
+  `MirrorEntry.quarantine` reads it.
+- A rescan never touches names, records, failures or quarantine records; removing an entry from the manifest deletes
+  them all.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
   in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
@@ -102,8 +108,9 @@ yandex-disk-rescue/
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
-│   │                 #   over the retry set (failed or partial files, failed folders) and the folders above it
-│   │                 #   (skip, folders, things in the way, hard-link aliases) with up to `download_connections` files in progress at once
+│   │                 #   over the retry set (failed, quarantined or partial files, failed folders) and the folders
+│   │                 #   above it (skip, hold quarantined files, folders, things in the way, hard-link aliases) with
+│   │                 #   up to `download_connections` files in progress at once
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
 │   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
@@ -113,8 +120,8 @@ yandex-disk-rescue/
 │   │                 #   a segmented file, parallel ranged fetches of its segments while hashing with
 │   │                 #   checkpoints, immediate retries after new data and one link refresh per pass, the
 │   │                 #   fallback to one stream when the host ignores a range;
-│   │                 #   verify, by reading a segmented file back; move aside what is in the way, place,
-│   │                 #   record), the rejected-name conversion of a folder or file name the destination
+│   │                 #   verify, by reading a segmented file back, quarantining a file that fails; move aside
+│   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or file name the destination
 │   │                 #   refuses, later passes over transiently failed files, failure records written as
 │   │                 #   entries fail and dropped as they succeed, the summary lines; disk work
 │   │                 #   (hashing, writes, preallocation, fsync, placement) runs in the run's worker threads,
@@ -123,8 +130,8 @@ yandex-disk-rescue/
 │   │                 #   in flight, so no descriptor is closed under a running call
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
 │   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
-│   │                 #   aside into the run's `replaced/` folder and placement, never through a link; which
-│   │                 #   errors stop the run
+│   │                 #   aside into the run's `replaced/` folder, moving a partial file into the run's
+│   │                 #   `quarantine/` folder, and placement, never through a link; which errors stop the run
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
 │   │                 #   an open file and setting its times
@@ -133,7 +140,7 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories, the manifest path
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure records per destination)
+│   │                 #   failure and quarantine records per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry

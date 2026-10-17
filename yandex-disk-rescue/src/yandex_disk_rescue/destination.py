@@ -4,7 +4,8 @@ it.
 All operations go through open folder descriptors and `localfs`, so none follows a symbolic link inside the
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
 file through the no-replace rename, and whatever stood there is first moved, never deleted, into the run's folder
-under `.yandex-disk-rescue/replaced/`.
+under `.yandex-disk-rescue/replaced/`. A downloaded file that fails verification is moved, never deleted, into the
+run's folder under `.yandex-disk-rescue/quarantine/`.
 """
 
 import errno
@@ -20,11 +21,12 @@ from typing import Self
 
 from yandex_disk_rescue import localfs
 from yandex_disk_rescue.errors import RescueError
-from yandex_disk_rescue.local_names import WORK_DIR_NAME
+from yandex_disk_rescue.local_names import WORK_DIR_NAME, rejected_name_conversion
 
 LOCK_FILE_NAME = 'lock'
 PARTIAL_DIR_NAME = 'partial'
 REPLACED_DIR_NAME = 'replaced'
+QUARANTINE_DIR_NAME = 'quarantine'
 _STAMP_FORMAT = '%Y-%m-%dT%H-%M-%SZ'
 _READ_SIZE = 1 << 20
 _PROBE_NAMES = ('probe', 'probe.renamed')
@@ -73,14 +75,15 @@ class Destination:
 
     `path` is the resolved destination. Local paths are relative to it, '/'-separated. Partial files live in
     `.yandex-disk-rescue/partial/`, named by entry id. Things moved aside go to
-    `.yandex-disk-rescue/replaced/<run start, UTC>/`, created on the first move; `replaced_folder` is that folder
-    relative to the destination once it exists.
+    `.yandex-disk-rescue/replaced/<run start, UTC>/`, and quarantined partial files to
+    `.yandex-disk-rescue/quarantine/<run start, UTC>/`, each created on its first move under a name no earlier run
+    took; `replaced_folder` and `quarantine_folder` are those folders relative to the destination once they exist.
 
     An error in the work directory that every file would meet (a full disk, an I/O error, a read-only filesystem, a
     permission error) raises `DestinationError`; other errors are the `OSError` of the call.
 
-    Every method blocks on the disk and may run in a worker thread. Moving aside creates this run's replaced folder
-    on first use, so two moves aside must not run at once.
+    Every method blocks on the disk and may run in a worker thread. Moving aside and quarantining create this run's
+    folders on first use, so no two of them may run at once.
     """
 
     def __init__(
@@ -94,13 +97,12 @@ class Destination:
         started: datetime,
     ) -> None:
         self.path = path
-        self.replaced_folder: PurePosixPath | None = None
         self._root_fd = root_fd
         self._work_fd = work_fd
         self._lock_fd = lock_fd
         self._partial_fd = partial_fd
         self._started = started
-        self._replaced_fd: int | None = None
+        self._run_folders: dict[str, tuple[int, PurePosixPath]] = {}
 
     @classmethod
     def open(cls, path: Path) -> Destination:
@@ -127,9 +129,17 @@ class Destination:
             raise
         return cls(resolved, *fds, started=started)
 
+    @property
+    def replaced_folder(self) -> PurePosixPath | None:
+        return self._run_folder(REPLACED_DIR_NAME)
+
+    @property
+    def quarantine_folder(self) -> PurePosixPath | None:
+        return self._run_folder(QUARANTINE_DIR_NAME)
+
     def close(self) -> None:
-        replaced = [] if self._replaced_fd is None else [self._replaced_fd]
-        _close_all([self._partial_fd, self._lock_fd, self._work_fd, self._root_fd, *replaced])
+        run_fds = [fd for fd, _ in self._run_folders.values()]
+        _close_all([self._partial_fd, self._lock_fd, self._work_fd, self._root_fd, *run_fds])
 
     def __enter__(self) -> Self:
         return self
@@ -225,33 +235,59 @@ class Destination:
         with ExitStack() as stack:
             source_fd = stack.enter_context(self._folder(local.parent))
             with _work_errors(self.path / WORK_DIR_NAME / REPLACED_DIR_NAME):
-                target_fd = stack.enter_context(_made_folder(self._replaced_run_fd(), local.parent))
+                target_fd = stack.enter_context(_made_folder(self._run_folder_fd(REPLACED_DIR_NAME), local.parent))
             localfs.rename_noreplace(local.name, local.name, src_dir_fd=source_fd, dst_dir_fd=target_fd)
             os.fsync(target_fd)
             os.fsync(source_fd)
 
+    def quarantine(self, entry_id: int, local: PurePosixPath) -> PurePosixPath:
+        """Move the partial file of `entry_id` to the relative path `local` in this run's quarantine folder, without
+        replacing anything, make the move durable, and return the copy's path relative to the destination.
+
+        When the filesystem refuses the file's name (`NAME_ERRNOS`), the copy gets its `rejected_name_conversion`.
+        """
+        with (
+            _work_errors(self.path / WORK_DIR_NAME / QUARANTINE_DIR_NAME),
+            _made_folder(self._run_folder_fd(QUARANTINE_DIR_NAME), local.parent) as target_fd,
+        ):
+            name = local.name
+            try:
+                localfs.rename_noreplace(str(entry_id), name, src_dir_fd=self._partial_fd, dst_dir_fd=target_fd)
+            except OSError as exc:
+                if exc.errno not in NAME_ERRNOS:
+                    raise
+                name = rejected_name_conversion(name, ())
+                localfs.rename_noreplace(str(entry_id), name, src_dir_fd=self._partial_fd, dst_dir_fd=target_fd)
+            os.fsync(target_fd)
+            os.fsync(self._partial_fd)
+        return self._run_folders[QUARANTINE_DIR_NAME][1] / local.parent / name
+
     def _partial_path(self, entry_id: int) -> Path:
         return self.path / WORK_DIR_NAME / PARTIAL_DIR_NAME / str(entry_id)
 
-    def _replaced_run_fd(self) -> int:
-        """The descriptor of this run's replaced folder, created on first use under a name no earlier run took."""
-        if self._replaced_fd is not None:
-            return self._replaced_fd
+    def _run_folder(self, kind: str) -> PurePosixPath | None:
+        return self._run_folders[kind][1] if kind in self._run_folders else None
+
+    def _run_folder_fd(self, kind: str) -> int:
+        """The descriptor of this run's folder in the work directory's `kind` folder, created on first use under a
+        name no earlier run took."""
+        if kind in self._run_folders:
+            return self._run_folders[kind][0]
         stamp = self._started.strftime(_STAMP_FORMAT)
-        with _made_folder(self._work_fd, PurePosixPath(REPLACED_DIR_NAME)) as replaced_fd:
+        with _made_folder(self._work_fd, PurePosixPath(kind)) as kind_fd:
             name, attempt = stamp, 1
             while True:
                 try:
-                    localfs.make_dir(name, dir_fd=replaced_fd)
+                    localfs.make_dir(name, dir_fd=kind_fd)
                 except FileExistsError:
                     attempt += 1
                     name = f'{stamp}-{attempt}'
                 else:
                     break
-            os.fsync(replaced_fd)
-            self._replaced_fd = localfs.open_dir(name, dir_fd=replaced_fd)
-        self.replaced_folder = PurePosixPath(WORK_DIR_NAME, REPLACED_DIR_NAME, name)
-        return self._replaced_fd
+            os.fsync(kind_fd)
+            run_fd = localfs.open_dir(name, dir_fd=kind_fd)
+        self._run_folders[kind] = (run_fd, PurePosixPath(WORK_DIR_NAME, kind, name))
+        return run_fd
 
     @contextmanager
     def _folder(self, local: PurePosixPath) -> Iterator[int]:

@@ -28,7 +28,7 @@ from yandex_disk_rescue import api, localfs, mirroring
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import Destination, PartialFile
-from yandex_disk_rescue.manifest import Manifest, Segment
+from yandex_disk_rescue.manifest import Manifest, Mirror, Segment
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
 from yandex_disk_rescue.paths import manifest_path
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
@@ -220,7 +220,7 @@ def test_a_fresh_mirror_holds_every_file_with_its_bytes_and_cloud_mtime(disk, de
     lines = result.stdout.splitlines()
     assert lines[lines.index(f'Downloading 6 files ({total}) to {dest}') :] == [
         f'Downloading 6 files ({total}) to {dest}',
-        f'Mirrored disk:/ to {dest}: 6 downloaded ({total}), 0 skipped, 0 failed',
+        f'Mirrored disk:/ to {dest}: 6 downloaded ({total}), 0 skipped, 0 quarantined, 0 failed',
         'Verified by size only (no cloud checksum): 1',
         f'  {SIZE_ONLY}',
         f'Manifest: {manifest_path()}',
@@ -242,45 +242,202 @@ def test_a_rerun_skips_verified_files_without_reading_them(disk, dest):
 
     assert rerun.exit_code == 0, rerun.output
     assert f'Downloading 0 files (0 B) to {dest}\n' in rerun.stdout
-    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 failed\n' in rerun.stdout
+    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
     assert f'Verified by size only (no cloud checksum): 1\n  {SIZE_ONLY}\n' in rerun.stdout
     assert _transfers(disk, earlier) == []
     assert all(_local(dest, path).read_bytes() == content for path, content in altered.items())
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
+def _quarantine_runs(dest) -> list:
+    folder = dest / '.yandex-disk-rescue' / 'quarantine'
+    return sorted(folder.iterdir()) if folder.is_dir() else []
+
+
+def _corrupted(content: bytes, offset: int) -> tuple[bytes, str]:
+    """The bytes the fake serves for `content` corrupted at `offset`, and the MD5 mismatch reason they fail with."""
+    corrupted = bytearray(content)
+    corrupted[offset] ^= 0xFF
+    good, bad = hashlib.md5(content).hexdigest(), hashlib.md5(corrupted).hexdigest()
+    return bytes(corrupted), f'MD5 mismatch (expected {good}, got {bad})'
+
+
+def _quarantined(run, path: str, reason: str) -> str:
+    """The `Quarantined` list of a run holding the one copy of `path` in the quarantine folder `run`."""
+    copy = PurePosixPath('.yandex-disk-rescue', 'quarantine', run.name, path.removeprefix('disk:/'))
+    return f'Quarantined: 1\n  {path}: {reason}; kept at {copy}\nDownload them again with --retry-failed.\n'
+
+
 @pytest.mark.parametrize('segmented', [False, True], ids=['one-stream', 'segmented'])
-def test_a_corrupted_download_fails_that_file_and_a_rerun_fetches_it(disk, dest, segmented):
+def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_failed(disk, dest, segmented):
     path = 'disk:/Photos/2024/a.jpg'
     # Segmented, the corrupt byte lies in the third segment and only reading the whole file back can catch it.
     content, offset, args = (SEGMENTED, 2 * MiB + 10, SEGMENTED_ARGS) if segmented else (FILES[path], 10, ())
     disk.add_file(path, content, modified=MODIFIED)
     disk.corrupt(path, offset=offset)
-    good = hashlib.md5(content).hexdigest()
-    corrupted = bytearray(content)
-    corrupted[offset] ^= 0xFF
-    bad = hashlib.md5(corrupted).hexdigest()
+    corrupted, reason = _corrupted(content, offset)
 
     result = _download(*args, str(dest))
 
     assert result.exit_code == 1
     others = sum(map(len, FILES.values())) - len(FILES[path])
-    assert f'5 downloaded ({format_size(others)}), 0 skipped, 1 failed\n' in result.stdout
-    assert f'Failed: 1\n  {path}: MD5 mismatch (expected {good}, got {bad})\n' in result.stdout
-    assert result.stderr == 'Error: 1 failed; see the list above.\n'
+    assert f'5 downloaded ({format_size(others)}), 0 skipped, 1 quarantined, 0 failed\n' in result.stdout
+    [run] = _quarantine_runs(dest)
+    assert _STAMP.fullmatch(run.name)
+    assert _quarantined(run, path, reason) in result.stdout
+    assert 'Failed' not in result.stdout
+    assert result.stderr == 'Error: 1 quarantined; see the list above.\n'
+    copy = run / 'Photos' / '2024' / 'a.jpg'
+    assert copy.read_bytes() == corrupted
+    assert copy.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     assert not _local(dest, path).exists()
-    assert list((dest / '.yandex-disk-rescue' / 'partial').iterdir()) == []
+    assert _partials(dest) == []
     assert _journal() == []
+    assert _failure_records() == []
+
+    earlier = len(disk.requests)
+    held = _download(*args, '--scan-max-age', '0', str(dest))
+
+    assert held.exit_code == 1
+    assert f'Downloading 0 files (0 B) to {dest}\n' in held.stdout
+    assert '0 downloaded (0 B), 5 skipped, 1 quarantined, 0 failed\n' in held.stdout
+    assert _quarantined(run, path, reason) in held.stdout
+    assert held.stderr == 'Error: 1 quarantined; see the list above.\n'
+    assert _transfers(disk, earlier) == []
 
     disk.repair(path)
     earlier = len(disk.requests)
-    rerun = _download(*args, str(dest))
+    retry = _download(*args, '--retry-failed', str(dest))
 
-    assert rerun.exit_code == 0, rerun.output
-    assert f'1 downloaded ({format_size(len(content))}), 5 skipped, 0 failed\n' in rerun.stdout
+    assert retry.exit_code == 0, retry.output
+    assert f'Retrying 1 failed or unfinished file ({format_size(len(content))}) in {dest}\n' in retry.stdout
+    assert f'1 downloaded ({format_size(len(content))}), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert _local(dest, path).read_bytes() == content
+    assert copy.read_bytes() == corrupted
     assert _transfers(disk, earlier) == ['/v1/disk/resources/download'] + ['/download'] * (4 if segmented else 1)
     assert sorted(_fetches(disk, path, earlier), key=str) == (SEGMENT_RANGES if segmented else [None])
+
+    again = _download(*args, str(dest))
+
+    assert again.exit_code == 0, again.output
+    assert '0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in again.stdout
+    assert 'Quarantined' not in again.stdout
+    assert _quarantine_runs(dest) == [run]
+
+
+def test_a_retry_failing_verification_again_adds_a_copy_under_its_own_run_folder(disk, dest):
+    path = 'disk:/Docs/readme.txt'
+    disk.corrupt(path, offset=0)
+    corrupted, reason = _corrupted(FILES[path], 0)
+    assert _download(str(dest)).exit_code == 1
+    [first] = _quarantine_runs(dest)
+    before = (first / 'Docs' / 'readme.txt').stat()
+
+    retry = _download('--retry-failed', str(dest))
+
+    assert retry.exit_code == 1
+    assert '0 downloaded (0 B), 0 skipped, 1 quarantined, 0 failed\n' in retry.stdout
+    [kept, second] = _quarantine_runs(dest)
+    assert kept == first
+    assert _quarantined(second, path, reason) in retry.stdout
+    assert (second / 'Docs' / 'readme.txt').read_bytes() == corrupted
+    old = first / 'Docs' / 'readme.txt'
+    assert old.read_bytes() == corrupted
+    assert (old.stat().st_ino, old.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+
+    plain = _download(str(dest))
+
+    assert plain.exit_code == 1
+    assert _quarantined(second, path, reason) in plain.stdout
+
+
+def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_with_that_failure(disk, dest):
+    path = 'disk:/Docs/readme.txt'
+    disk.corrupt(path, offset=0)
+    _, reason = _corrupted(FILES[path], 0)
+    assert _download(str(dest)).exit_code == 1
+    [run] = _quarantine_runs(dest)
+    disk.repair(path)
+    disk.inject('GET', '/download', 503, where={'path': path})
+
+    retry = _download('--retry-failed', '--download-passes', '1', str(dest))
+
+    assert retry.exit_code == 1
+    assert '0 downloaded (0 B), 0 skipped, 1 quarantined, 0 failed\n' in retry.stdout
+    shown = f'Quarantined: 1\n  {path}: {reason}; last retry: the download host 127.0.0.1 returned HTTP 503'
+    assert shown in retry.stdout
+    assert 'Failed' not in retry.stdout
+    assert [failed for failed, _ in _failure_records()] == [path]
+
+    plain = _download(str(dest))
+
+    assert plain.exit_code == 1
+    assert shown in plain.stdout
+    assert f'; kept at .yandex-disk-rescue/quarantine/{run.name}/Docs/readme.txt\n' in plain.stdout
+    assert 'Failed' not in plain.stdout
+
+
+def test_a_new_disk_version_of_a_quarantined_file_is_not_held(disk, dest):
+    path = 'disk:/Docs/readme.txt'
+    disk.corrupt(path, offset=0)
+    assert _download(str(dest)).exit_code == 1
+    [run] = _quarantine_runs(dest)
+    disk.repair(path)
+    disk.add_file(path, b'read me, edited', modified=MODIFIED)
+
+    rescanned = _download('--scan-max-age', '0', str(dest))
+
+    assert rescanned.exit_code == 0, rescanned.output
+    assert '1 downloaded (15 B), 5 skipped, 0 quarantined, 0 failed\n' in rescanned.stdout
+    assert _local(dest, path).read_bytes() == b'read me, edited'
+    assert (run / 'Docs' / 'readme.txt').exists()
+
+    again = _download(str(dest))
+
+    assert again.exit_code == 0, again.output
+    assert 'Quarantined' not in again.stdout
+
+
+def test_a_run_killed_between_quarantining_a_copy_and_recording_it_downloads_the_file_again(disk, dest, monkeypatch):
+    path = 'disk:/Docs/readme.txt'
+    disk.corrupt(path, offset=0)
+    corrupted, _ = _corrupted(FILES[path], 0)
+
+    def killed(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Mirror, 'record_quarantined', killed)
+        stopped = _download('disk:/Docs', str(dest))
+
+    assert stopped.exit_code == 130
+    assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
+    [run] = _quarantine_runs(dest)
+    copy = run / 'readme.txt'
+    assert copy.read_bytes() == corrupted
+
+    disk.repair(path)
+    rerun = _download('disk:/Docs', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert (dest / 'readme.txt').read_bytes() == FILES[path]
+    assert copy.read_bytes() == corrupted
+    assert _quarantine_runs(dest) == [run]
+
+
+def test_a_quarantined_copy_whose_name_the_destination_refuses_gets_the_converted_name(disk, dest, monkeypatch):
+    path = 'disk:/Odd/a?b.txt'
+    disk.add_file(path, b'question')
+    disk.corrupt(path, offset=0)
+    _refuse_names(monkeypatch, lambda name: '?' in name)
+
+    result = _download('disk:/Odd', str(dest))
+
+    assert result.exit_code == 1
+    [run] = _quarantine_runs(dest)
+    converted = f'a_b~{_hex("a?b.txt")}.txt'
+    assert (run / converted).read_bytes() == bytes([ord('q') ^ 0xFF]) + b'uestion'
+    assert f'; kept at .yandex-disk-rescue/quarantine/{run.name}/{converted}\n' in result.stdout
 
 
 def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by_size(disk, dest):
@@ -295,17 +452,23 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
 
     assert result.exit_code == 1
     actual = hashlib.sha256(content).hexdigest()
+    [run] = _quarantine_runs(dest)
     assert (
-        f'Mirrored disk:/Checks to {dest}: 1 downloaded (9 B), 0 skipped, 2 failed\n'
+        f'Mirrored disk:/Checks to {dest}: 1 downloaded (9 B), 0 skipped, 1 quarantined, 1 failed\n'
         'Passes: 1 of 1\n'
         'Verified by size only (no cloud checksum): 1\n'
         '  disk:/Checks/size-only.bin\n'
-        'Failed: 2\n'
-        f'  disk:/Checks/sha.bin: SHA-256 mismatch (expected {"0" * 64}, got {actual})\n'
+        'Quarantined: 1\n'
+        f'  disk:/Checks/sha.bin: SHA-256 mismatch (expected {"0" * 64}, got {actual}); '
+        f'kept at .yandex-disk-rescue/quarantine/{run.name}/sha.bin\n'
+        'Download them again with --retry-failed.\n'
+        'Failed: 1\n'
         '  disk:/Checks/short.bin: the download failed: '
     ) in result.stdout
+    assert result.stderr == 'Error: 1 failed and 1 quarantined; see the lists above.\n'
     assert (dest / 'size-only.bin').read_bytes() == bytes([ord('s') ^ 0xFF]) + b'ize only'
     assert not (dest / 'sha.bin').exists()
+    assert (run / 'sha.bin').read_bytes() == content
     assert not (dest / 'short.bin').exists()
 
 
@@ -408,7 +571,7 @@ def test_names_the_destination_refuses_are_converted_recorded_and_kept_on_a_reru
     assert _transfers(disk, earlier) == []
     assert [name for name in seen if '?' in name] == []
     assert renamed in rerun.stdout
-    assert f'Mirrored disk:/Odd to {dest}: 0 downloaded (0 B), 3 skipped, 0 failed\n' in rerun.stdout
+    assert f'Mirrored disk:/Odd to {dest}: 0 downloaded (0 B), 3 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
 
 
 def test_a_converted_name_the_destination_refuses_too_fails_that_entry_only(disk, dest, monkeypatch):
@@ -510,7 +673,7 @@ def test_a_path_deeper_than_path_max_is_mirrored(disk, removed_dest):
 
     assert result.exit_code == 0, result.output
     assert len(os.fsencode(dest / folders / 'deep.txt')) > os.pathconf(dest, 'PC_PATH_MAX')
-    assert f'Mirrored disk:/Deep to {dest}: 1 downloaded (4 B), 0 skipped, 0 failed\n' in result.stdout
+    assert f'Mirrored disk:/Deep to {dest}: 1 downloaded (4 B), 0 skipped, 0 quarantined, 0 failed\n' in result.stdout
 
 
 def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
@@ -523,7 +686,10 @@ def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
 
     assert result.exit_code == 0, result.output
     assert f'Mirrored disk:/ to {dest}: 5 downloaded ' in result.stdout
-    assert ', 1 skipped, 0 failed\nAlready on disk and verified: 1\n  disk:/Docs/readme.txt\n' in result.stdout
+    assert (
+        ', 1 skipped, 0 quarantined, 0 failed\nAlready on disk and verified: 1\n  disk:/Docs/readme.txt\n'
+        in result.stdout
+    )
     assert 'disk:/Docs/readme.txt' not in _linked(disk)
     assert readme.stat().st_ino == inode
     assert readme.stat().st_mtime_ns == _mtime_ns(MODIFIED)
@@ -534,7 +700,7 @@ def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
     rerun = _download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
-    assert '0 downloaded (0 B), 6 skipped, 0 failed\n' in rerun.stdout
+    assert '0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
     assert 'Already on disk' not in rerun.stdout
     assert _transfers(disk, earlier) == []
     assert readme.read_bytes() == b'X' * len(FILES['disk:/Docs/readme.txt'])
@@ -549,7 +715,7 @@ def test_a_mirror_whose_manifest_was_lost_is_adopted_without_any_transfer(disk, 
     result = _download(str(dest))
 
     assert result.exit_code == 0, result.output
-    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 failed\n' in result.stdout
+    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in result.stdout
     assert 'Already on disk and verified: 6\n  disk:/Docs/readme.txt\n' in result.stdout
     assert _transfers(disk, earlier) == []
     assert {path: _local(dest, path).stat().st_ino for path in FILES} == inodes
@@ -609,14 +775,16 @@ def test_a_file_changed_in_the_cloud_replaces_the_old_copy_only_once_verified(di
 
     if fault:
         assert result.exit_code == 1
-        assert f'Failed: 1\n  {path}: MD5 mismatch' in result.stdout
+        [run] = _quarantine_runs(dest)
+        assert f'Quarantined: 1\n  {path}: MD5 mismatch' in result.stdout
         assert readme.read_bytes() == FILES[path]
         assert (readme.stat().st_ino, readme.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
+        assert (run / 'Docs' / 'readme.txt').read_bytes() == bytes([ord('r') ^ 0xFF]) + b'ead me, edited'
         assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
     else:
         assert result.exit_code == 0, result.output
         [run] = _replaced_runs(dest)
-        assert '1 downloaded (15 B), 5 skipped, 0 failed\n' in result.stdout
+        assert '1 downloaded (15 B), 5 skipped, 0 quarantined, 0 failed\n' in result.stdout
         assert f'Moved aside to .yandex-disk-rescue/replaced/{run.name}/: 1\n  Docs/readme.txt\n' in result.stdout
         assert (run / 'Docs' / 'readme.txt').read_bytes() == FILES[path]
         assert readme.read_bytes() == b'read me, edited'
@@ -756,7 +924,7 @@ def test_hard_linked_untracked_copies_handled_at_once_adopt_only_one(disk, tmp_p
             f'Failed: 1\n  disk:/Pair/{other}.bin: {other}.bin is the same file as disk:/Pair/{adopted}.bin on this '
             'filesystem; it was left untouched\n'
         ) in result.stdout
-        assert ', 1 skipped, 1 failed\n' in result.stdout
+        assert ', 1 skipped, 0 quarantined, 1 failed\n' in result.stdout
         assert (dest / 'a.bin').stat().st_ino == (dest / 'b.bin').stat().st_ino
         assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
         with closing(sqlite3.connect(manifest_path())) as connection:
@@ -846,7 +1014,7 @@ def test_a_rerun_inside_the_scan_window_lists_nothing_and_a_window_of_zero_scans
     assert _reused_scan(rerun) == ('disk:/', '0 min ago')
     assert 'Scanned' not in rerun.stdout
     assert _listings(disk, earlier) == []
-    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 failed\n' in rerun.stdout
+    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
 
     earlier = len(disk.requests)
     always = _download('--scan-max-age', '0', str(dest))
@@ -915,14 +1083,26 @@ def test_a_scan_max_age_out_of_range_is_a_usage_error(disk, dest):
 
 
 @pytest.mark.parametrize(
-    ('edited', 'reason', 'rerun_reason'),
+    ('edited', 'listed', 'reason', 'rerun_reason'),
     [
-        (b'READ ME', f'MD5 mismatch (expected {hashlib.md5(b"read me").hexdigest()}, got ', 'MD5 mismatch'),
-        (b'read me, edited after the scan', 'the download host sent more than the 7 bytes requested', CHANGED),
+        (
+            b'READ ME',
+            'Quarantined',
+            f'MD5 mismatch (expected {hashlib.md5(b"read me").hexdigest()}, got ',
+            'MD5 mismatch',
+        ),
+        (
+            b'read me, edited after the scan',
+            'Failed',
+            'the download host sent more than the 7 bytes requested',
+            CHANGED,
+        ),
     ],
     ids=['same-size', 'longer'],
 )
-def test_a_file_changed_after_the_reused_scan_fails_instead_of_being_kept(disk, dest, edited, reason, rerun_reason):
+def test_a_file_changed_after_the_reused_scan_is_never_kept_as_verified(
+    disk, dest, edited, listed, reason, rerun_reason
+):
     path = 'disk:/Docs/readme.txt'
     assert runner.invoke(app, ['scan']).exit_code == 0
     disk.add_file(path, edited, modified=MODIFIED)
@@ -931,15 +1111,20 @@ def test_a_file_changed_after_the_reused_scan_fails_instead_of_being_kept(disk, 
 
     assert result.exit_code == 1
     assert _reused_scan(result)[0] == 'disk:/'
-    assert f'Failed: 1\n  {path}: {reason}' in result.stdout
+    assert f'{listed}: 1\n  {path}: {reason}' in result.stdout
     assert not _local(dest, path).exists()
 
     rerun = _download(str(dest))
 
     assert rerun.exit_code == 1
-    assert f'Failed: 1\n  {path}: {rerun_reason}' in rerun.stdout
+    assert f'{listed}: 1\n  {path}: {rerun_reason}' in rerun.stdout
     assert not _local(dest, path).exists()
     assert _partials(dest) == []
+
+    rescanned = _download('--scan-max-age', '0', str(dest))
+
+    assert rescanned.exit_code == 0, rescanned.output
+    assert _local(dest, path).read_bytes() == edited
 
 
 @pytest.mark.parametrize('args', [[], ['a', 'b', 'c']], ids=['none', 'three'])
@@ -1076,7 +1261,8 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
 
     assert rerun.exit_code == 0, rerun.output
     counts = re.search(
-        rf'Mirrored disk:/ to {re.escape(str(dest))}: (\d+) downloaded \(.+\), (\d+) skipped, 0 failed\n', rerun.stdout
+        rf'Mirrored disk:/ to {re.escape(str(dest))}: (\d+) downloaded \(.+\), (\d+) skipped, 0 quarantined, 0 failed\n',
+        rerun.stdout,
     )
     assert counts is not None, rerun.stdout
     assert int(counts[1]) + int(counts[2]) == len(FILES)
@@ -1167,7 +1353,10 @@ def test_dead_files_do_not_hold_up_the_healthy_ones(disk, dest):
 
     assert result.exit_code == 1
     stalled = ''.join(f'  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' for path in dead)
-    assert f'12 downloaded ({format_size(sum(len(p) * 100 for p in healthy))}), 0 skipped, 3 failed\n' in result.stdout
+    assert (
+        f'12 downloaded ({format_size(sum(len(p) * 100 for p in healthy))}), 0 skipped, 0 quarantined, 3 failed\n'
+        in result.stdout
+    )
     assert f'Passes: 1 of 1\nFailed: 3\n{stalled}' in result.stdout
     assert all(_local(dest, path.replace('Mixed/', '')).read_bytes() == path.encode() * 100 for path in healthy)
     started = {r.params['path']: r.started for r in disk.requests if r.path == '/download'}
@@ -1203,7 +1392,7 @@ def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, d
 
     assert result.exit_code == 0, result.output
     assert (
-        f'Mirrored disk:/Big to {dest}: 1 downloaded ({format_size(len(BIG))}), 0 skipped, 0 failed\nPasses: 2 of 7\n'
+        f'Mirrored disk:/Big to {dest}: 1 downloaded ({format_size(len(BIG))}), 0 skipped, 0 quarantined, 0 failed\nPasses: 2 of 7\n'
     ) in result.stdout
     assert (dest / 'big.bin').read_bytes() == BIG
     assert _fetches(big, BIG_PATH) == [None, _tail(300_000), _tail(300_000)]
@@ -1243,7 +1432,7 @@ def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_other
 
     assert retry.exit_code == 0, retry.output
     assert f'Retrying 1 failed or unfinished file (7 B) in {dest}\n' in retry.stdout
-    assert f'Mirrored disk:/ to {dest}: 1 downloaded (7 B), 0 skipped, 0 failed\n' in retry.stdout
+    assert f'Mirrored disk:/ to {dest}: 1 downloaded (7 B), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert [r.params['path'] for r in disk.requests[earlier:] if r.path in _CONTENT_PATHS] == [failed, failed]
     assert _local(dest, failed).read_bytes() == FILES[failed]
     assert not (dest / 'New').exists()
@@ -1255,7 +1444,7 @@ def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_other
 
     assert again.exit_code == 0, again.output
     assert f'Retrying 0 failed or unfinished files (0 B) in {dest}\n' in again.stdout
-    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 0 skipped, 0 failed\n' in again.stdout
+    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 0 skipped, 0 quarantined, 0 failed\n' in again.stdout
     assert _transfers(disk, earlier) == []
 
 
@@ -1274,7 +1463,7 @@ def test_retry_failed_makes_a_failed_folder_and_the_files_under_it(disk, dest, m
 
     assert retry.exit_code == 0, retry.output
     assert f'Retrying 1 failed or unfinished file (6 B) in {dest}\n' in retry.stdout
-    assert f'Mirrored disk:/ to {dest}: 1 downloaded (6 B), 0 skipped, 0 failed\n' in retry.stdout
+    assert f'Mirrored disk:/ to {dest}: 1 downloaded (6 B), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert (dest / 'Q?' / 'x.txt').read_bytes() == b'inside'
     assert _failure_records() == []
 
@@ -1295,9 +1484,12 @@ def test_a_corrupt_file_is_not_retried_in_a_later_pass(disk, dest):
 
     assert result.exit_code == 1
     assert 'Passes: 2 of 7\n' in result.stdout
-    [failure] = [line for line in result.stdout.splitlines() if line.startswith(f'  {corrupt}: ')]
-    assert failure.startswith(f'  {corrupt}: MD5 mismatch (expected ')
-    assert '(after' not in failure
+    assert ', 1 quarantined, 0 failed\n' in result.stdout
+    [run] = _quarantine_runs(dest)
+    [line] = [line for line in result.stdout.splitlines() if line.startswith(f'  {corrupt}: ')]
+    assert line.startswith(f'  {corrupt}: MD5 mismatch (expected ')
+    assert line.endswith(f'; kept at .yandex-disk-rescue/quarantine/{run.name}/Photos/2024/a.jpg')
+    assert '(after' not in line
     assert _linked(disk).count(corrupt) == 1
     assert _fetches(disk, deferred) == [None, None]
     assert _others_verified(dest, corrupt)
@@ -1740,7 +1932,10 @@ def test_a_file_above_the_segment_threshold_is_fetched_as_parallel_segments_tili
     result = _download(*args, 'disk:/Seg', str(dest))
 
     assert result.exit_code == 0, result.output
-    assert f'Mirrored disk:/Seg to {dest}: 1 downloaded ({format_size(size)}), 0 skipped, 0 failed\n' in result.stdout
+    assert (
+        f'Mirrored disk:/Seg to {dest}: 1 downloaded ({format_size(size)}), 0 skipped, 0 quarantined, 0 failed\n'
+        in result.stdout
+    )
     assert sorted(_fetches(disk, SEGMENTED_PATH), key=str) == ranges
     assert disk.peak_content_in_flight == peak
     assert _linked(disk) == [SEGMENTED_PATH]
@@ -1861,7 +2056,7 @@ def test_a_stalled_segment_alone_is_fetched_again_in_the_next_pass(segmented, de
 
     assert result.exit_code == 0, result.output
     assert (
-        f'Mirrored disk:/Seg to {dest}: 1 downloaded ({format_size(len(SEGMENTED))}), 0 skipped, 0 failed\n'
+        f'Mirrored disk:/Seg to {dest}: 1 downloaded ({format_size(len(SEGMENTED))}), 0 skipped, 0 quarantined, 0 failed\n'
         'Passes: 2 of 7\n'
     ) in result.stdout
     fetches = _fetches(segmented, SEGMENTED_PATH)

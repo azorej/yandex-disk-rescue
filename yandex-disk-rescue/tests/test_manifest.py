@@ -20,6 +20,7 @@ from yandex_disk_rescue.manifest import (
     ManifestError,
     Mirror,
     MirrorMismatchError,
+    Quarantine,
     RemoteIdentity,
     ScanTime,
     Segment,
@@ -337,7 +338,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 6
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -361,7 +362,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 6
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -390,8 +391,9 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 6
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
+        assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
 
 
 def test_a_mirror_is_found_again_by_its_destination(tmp_path):
@@ -794,6 +796,43 @@ def test_a_failure_survives_a_rescan_and_goes_with_its_removed_entry(tmp_path):
     assert failures == {'disk:/A/edit.txt': 'the download stalled: no data for 15 s'}
     with closing(sqlite3.connect(db)) as connection:
         assert connection.execute('SELECT entry_id FROM failures').fetchall() == [(ids['disk:/A/edit.txt'],)]
+
+
+def _quarantines(mirror: Mirror) -> dict[str, Quarantine]:
+    return {e.resource.path: e.quarantine for e in mirror.entries() if e.quarantine is not None}
+
+
+def test_a_quarantine_drops_the_download_its_journal_and_the_failure_and_verifying_drops_the_quarantine(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    older = RemoteIdentity(size=4, md5='dd', sha256='ee', modified=MODIFIED - timedelta(days=1))
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    first = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/A/keep.txt')
+    second = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T10-00-00Z/A/keep.txt')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 10, 6, 'aa')])
+        mirror.record_failure(ids[keep.path], 'the download stalled: no data for 15 s')
+        mirror.record_quarantined(ids[keep.path], older, first, 'MD5 mismatch (expected dd, got ff)')
+        mirror.record_quarantined(ids[keep.path], RemoteIdentity.of(keep), second, 'size mismatch')
+        mirror.record_quarantined(ids[edit.path], RemoteIdentity.of(edit), first.with_name('edit.txt'), 'bad')
+        quarantined = mirror.entries()
+        elsewhere = _quarantines(other)
+
+        mirror.forget(ids[edit.path])
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        after = _quarantines(mirror)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_quarantined(10_000, older, first, 'nowhere')
+
+    [entry] = [e for e in quarantined if e.resource.path == keep.path]
+    assert (entry.download, entry.failure) == (None, None)
+    assert entry.quarantine == Quarantine(RemoteIdentity.of(keep), second, 'size mismatch')
+    assert _segment_rows(db) == []
+    assert elsewhere == {}
+    assert after == {edit.path: Quarantine(RemoteIdentity.of(edit), first.with_name('edit.txt'), 'bad')}
 
 
 def _stat(ino: int, size: int = 1) -> os.stat_result:

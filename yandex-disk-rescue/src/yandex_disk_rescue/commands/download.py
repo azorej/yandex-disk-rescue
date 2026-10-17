@@ -1,5 +1,6 @@
 """`download`: scan a remote folder (unless a recent scan covers it), mirror it into a local folder with every file
-verified, or retry only the files whose last attempt failed or never finished, and summarize the run."""
+verified, or retry only the files whose last attempt failed, was quarantined or never finished, and summarize the
+run."""
 
 import asyncio
 from dataclasses import dataclass
@@ -18,9 +19,16 @@ from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tr
 from yandex_disk_rescue.units import format_size
 
 
-class FilesFailedError(RescueError):
-    def __init__(self, count: int) -> None:
-        super().__init__(f'{count} failed; see the list above.')
+class FilesNotMirroredError(RescueError):
+    """Files of the run failed or are quarantined."""
+
+    def __init__(self, failed: int, quarantined: int) -> None:
+        if failed and quarantined:
+            super().__init__(f'{failed} failed and {quarantined} quarantined; see the lists above.')
+        elif quarantined:
+            super().__init__(f'{quarantined} quarantined; see the list above.')
+        else:
+            super().__init__(f'{failed} failed; see the list above.')
 
 
 class NeverScannedError(RescueError):
@@ -50,8 +58,8 @@ def download(
         bool,
         typer.Option(
             '--retry-failed',
-            help='Download only the files whose last attempt in DEST failed or never finished, and the folders that '
-            'failed; leave everything else alone.',
+            help='Download only the files whose last attempt in DEST failed, was quarantined or never finished, and '
+            'the folders that failed; leave everything else alone.',
         ),
     ] = False,
     scan_max_age: settings.ScanMaxAge = settings.SCAN_MAX_AGE.default,
@@ -71,7 +79,7 @@ def download(
     api_url: settings.ApiUrl = settings.API_URL.default,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
-    skipped on a rerun, or with --retry-failed only the failed and unfinished ones."""
+    skipped on a rerun, or with --retry-failed only the failed, quarantined and unfinished ones."""
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
@@ -108,8 +116,8 @@ def download(
     for line in mirror_summary(report):
         typer.echo(line)
     typer.echo(f'Manifest: {manifest_path}')
-    if report.failed:
-        raise FilesFailedError(len(report.failed))
+    if report.failed or report.quarantined:
+        raise FilesNotMirroredError(len(report.failed), len(report.quarantined))
 
 
 def _split_locations(locations: list[str]) -> tuple[str, str]:

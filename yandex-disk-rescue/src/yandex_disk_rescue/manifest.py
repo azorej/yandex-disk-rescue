@@ -9,8 +9,8 @@ scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
-of a partial download (`download_segments`), and the reason the last turn of an entry failed (`failures`), all keyed
-by `entries.id`.
+of a partial download (`download_segments`), the reason the last turn of an entry failed (`failures`), and the copy
+of a download that failed verification and was moved to quarantine (`quarantined`), all keyed by `entries.id`.
 A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
 the manifest deletes its rows.
 
@@ -179,6 +179,23 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    (
+        # The identity columns are the remote file the quarantined copy was downloaded for; `copy_path` is that copy,
+        # relative to the destination, and `reason` how it failed verification.
+        """
+        CREATE TABLE quarantined (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            md5 TEXT,
+            sha256 TEXT,
+            modified TEXT NOT NULL,
+            copy_path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id)
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -255,12 +272,22 @@ class DownloadRecord:
 
 
 @dataclass(frozen=True)
+class Quarantine:
+    """A download of `identity` that failed verification for `reason`, kept at `copy` (relative to the destination)."""
+
+    identity: RemoteIdentity
+    copy: PurePosixPath
+    reason: str
+
+
+@dataclass(frozen=True)
 class MirrorEntry:
     entry_id: int
     resource: Resource
     local_path: PurePosixPath | None  # relative to the destination; `None` until a name is assigned
     download: DownloadRecord | None
     failure: str | None  # why the entry's last turn in this mirror failed; `None` once it succeeded
+    quarantine: Quarantine | None  # the last quarantined copy; `None` once the file is verified
 
 
 @dataclass(frozen=True)
@@ -513,7 +540,7 @@ class Mirror:
 
     def entries(self) -> list[MirrorEntry]:
         """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names,
-        download records and failures, read in full so no read stays open across later writes."""
+        download records, failures and quarantine records, read in full so no read stays open across later writes."""
         params = {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
         connection = self._manifest._connection
         with self._manifest._transaction('read'):
@@ -609,9 +636,9 @@ class Mirror:
     ) -> None:
         """Record the entry's file as verified against `identity`, placed at its final path with `lstat` `local`.
 
-        The record's segments and the entry's failure are deleted. Any other verified record of this mirror holding the same inode is deleted:
-        the caller has just placed this file there, so that record describes a file that is gone and whose inode
-        number was reused.
+        The record's segments, the entry's failure and its quarantine record are deleted. Any other verified record of
+        this mirror holding the same inode is deleted: the caller has just placed this file there, so that record
+        describes a file that is gone and whose inode number was reused.
         """
         self._record(entry_id, identity, 'verified', verified_by, LocalFingerprint.of(local), ())
 
@@ -623,8 +650,29 @@ class Mirror:
             ).fetchone()
         return None if row is None else _mirror_entry(row, ())
 
+    def record_quarantined(self, entry_id: int, identity: RemoteIdentity, copy: PurePosixPath, reason: str) -> None:
+        """Record that the entry's download of `identity` failed verification for `reason` and was moved to `copy`,
+        replacing any quarantine record; the entry's download record, with its segments, and its failure are
+        deleted."""
+        params = {
+            'mirror': self.id,
+            'entry': entry_id,
+            'size': identity.size,
+            'md5': identity.md5,
+            'sha256': identity.sha256,
+            'modified': _timestamp(identity.modified),
+            'copy_path': _local_path_text(copy),
+            'reason': reason,
+        }
+        connection = self._manifest._connection
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            connection.execute(_RECORD_QUARANTINE_SQL, params)
+            connection.execute('DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+            connection.execute('DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+
     def forget(self, entry_id: int) -> None:
-        """Delete the entry's download record and its segments, if any; its failure stays."""
+        """Delete the entry's download record and its segments, if any; its failure and quarantine record stay."""
         with self._manifest._transaction('update'):
             self._manifest._connection.execute(
                 'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
@@ -690,6 +738,7 @@ class Mirror:
             if state == 'verified':
                 connection.execute(_RELEASE_INO_SQL, params)
                 connection.execute('DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
+                connection.execute('DELETE FROM quarantined WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
             # The upsert updates the row in place, so no cascade deletes the old segments.
             connection.execute(
                 'DELETE FROM download_segments WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
@@ -707,13 +756,15 @@ class Mirror:
 _MIRROR_ENTRY_COLUMNS = """
     e.id, e.path, e.kind, e.size, e.md5, e.sha256, e.modified, n.local_path,
     d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino,
-    f.reason
+    f.reason,
+    q.size, q.md5, q.sha256, q.modified, q.copy_path, q.reason
 """
 _MIRROR_JOINS = """
     FROM entries e
     LEFT JOIN local_names n ON n.mirror_id = :mirror AND n.entry_id = e.id
     LEFT JOIN downloads d ON d.mirror_id = :mirror AND d.entry_id = e.id
     LEFT JOIN failures f ON f.mirror_id = :mirror AND f.entry_id = e.id
+    LEFT JOIN quarantined q ON q.mirror_id = :mirror AND q.entry_id = e.id
 """
 _MIRROR_ENTRIES_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
@@ -767,6 +818,13 @@ _RECORD_DOWNLOAD_SQL = """
 _RECORD_FAILURE_SQL = """
     INSERT INTO failures (mirror_id, entry_id, reason) VALUES (?, ?, ?)
     ON CONFLICT (mirror_id, entry_id) DO UPDATE SET reason = excluded.reason
+"""
+_RECORD_QUARANTINE_SQL = """
+    INSERT INTO quarantined (mirror_id, entry_id, size, md5, sha256, modified, copy_path, reason)
+    VALUES (:mirror, :entry, :size, :md5, :sha256, :modified, :copy_path, :reason)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET
+        size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256, modified = excluded.modified,
+        copy_path = excluded.copy_path, reason = excluded.reason
 """
 _UNENCODABLE_SQL = """
     SELECT path, kind FROM unencodable_entries
@@ -1004,7 +1062,15 @@ def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
         local_path=None if local_path is None else PurePosixPath(local_path),
         download=None if row[8] is None else _download_record(row[8:17], segments),
         failure=row[17],
+        quarantine=None if row[18] is None else _quarantine(row[18:24]),
     )
+
+
+def _quarantine(row: tuple) -> Quarantine:
+    """Build a `Quarantine` from the `quarantined` columns size, md5, sha256, modified, copy_path and reason."""
+    size, md5, sha256, modified, copy_path, reason = row
+    identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
+    return Quarantine(identity=identity, copy=PurePosixPath(copy_path), reason=reason)
 
 
 def _download_record(row: tuple, segments: tuple[Segment, ...]) -> DownloadRecord:
