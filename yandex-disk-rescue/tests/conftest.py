@@ -19,6 +19,11 @@ def isolated_environment(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
 
 
 @pytest.fixture
+def anyio_backend() -> str:
+    return 'asyncio'
+
+
+@pytest.fixture
 def fake_disk_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDiskApi]:
     """A real HTTP server on 127.0.0.1 standing in for the Yandex Disk API, wired in via YANDEX_DISK_RESCUE_API_URL."""
     api, server, thread = start_fake_disk_server()

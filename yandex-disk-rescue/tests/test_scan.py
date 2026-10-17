@@ -235,7 +235,7 @@ def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
 
     if stop == signal.SIGINT:
         assert child.returncode == 130, stderr
-        assert stderr == 'Interrupted; the manifest still holds the previous scan.\n'
+        assert stderr == 'Interrupted; the manifest holds the last completed scan.\n'
         assert stdout == ''
     else:
         assert child.returncode == -signal.SIGKILL
@@ -247,9 +247,24 @@ def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
     assert _rows() == _tree_rows(disk)
 
 
-def test_a_folder_deleted_during_the_scan_is_reported_and_recorded_as_removed(disk):
+def _now_a_file(path: str) -> FakeResponse:
+    """The listing body of `path` after it was replaced by a file of the same name."""
+    return FakeResponse.json(
+        200,
+        {
+            'name': path.rsplit('/')[-1],
+            'path': path,
+            'type': 'file',
+            'size': 1,
+            'modified': '2024-05-01T12:30:00+00:00',
+        },
+    )
+
+
+@pytest.mark.parametrize('answer', [404, _now_a_file('disk:/Photos/2024')], ids=['deleted', 'replaced-by-a-file'])
+def test_a_folder_deleted_during_the_scan_is_reported_and_recorded_as_removed(disk, answer):
     assert _scan().exit_code == 0
-    disk.inject('GET', '/v1/disk/resources', 404, where={'path': 'disk:/Photos/2024'})
+    disk.inject('GET', '/v1/disk/resources', answer, where={'path': 'disk:/Photos/2024'})
 
     result = _scan()
 
@@ -353,12 +368,20 @@ def test_a_vanished_sub_folder_is_reported_once_under_its_vanished_parent(disk, 
     assert _rows() == _tree_rows(disk)
 
 
-def test_the_scanned_folder_itself_vanishing_fails_the_scan(disk):
+@pytest.mark.parametrize(
+    ('answer', 'message'),
+    [
+        (404, "Error: Remote path 'disk:/Photos' does not exist.\n"),
+        (_now_a_file('disk:/Photos'), "Error: Remote path 'disk:/Photos' is a file, not a folder.\n"),
+    ],
+    ids=['deleted', 'replaced-by-a-file'],
+)
+def test_the_scanned_folder_itself_vanishing_fails_the_scan(disk, answer, message):
     assert _scan().exit_code == 0
     previous = _rows()
-    disk.inject('GET', '/v1/disk/resources', 404, where={'path': 'disk:/Photos', 'offset': '0'})
+    disk.inject('GET', '/v1/disk/resources', answer, where={'path': 'disk:/Photos', 'offset': '0'})
 
     result = _scan('disk:/Photos')
 
-    assert (result.exit_code, result.stderr) == (1, "Error: Remote path 'disk:/Photos' does not exist.\n")
+    assert (result.exit_code, result.stderr) == (1, message)
     assert _rows() == previous

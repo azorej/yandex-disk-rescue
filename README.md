@@ -146,16 +146,19 @@ they cannot be verified after download. The first scan of a folder prints
 changed when its kind, size, checksums or modification time differ. Each
 list of paths shows at most 20 entries, then `… and N more`.
 
-A folder deleted on the Disk while the scan runs does not stop it: the
-summary lists it under `Folders that disappeared during the scan: N`, and the
-manifest records that folder and everything under it as removed. Only the
-scanned folder itself disappearing fails the scan.
+A folder deleted on the Disk, or replaced by a file of the same name, while
+the scan runs does not stop it: the summary lists it under `Folders that
+disappeared during the scan: N`, and the manifest records that folder and
+everything under it as removed. Only the scanned folder itself disappearing
+fails the scan.
 
 The manifest only ever holds completed scans: a scan that fails or is
 interrupted (Ctrl+C, a kill, a crash) leaves the previous scan in place, and
-the next run scans again from the start. Scanning a folder replaces only
-that folder's part of the manifest. Only one run can use the manifest at a
-time; a second one fails with `Another yandex-disk-rescue run is using ...`.
+the next run scans again from the start. Ctrl+C prints `Interrupted; the
+manifest holds the last completed scan.` and exits with 130. Scanning a
+folder replaces only that folder's part of the manifest. Only one run can use
+the manifest at a time; a second one fails with `Another yandex-disk-rescue
+run is using ...`.
 Paths outside `disk:/` (such as `trash:/`) are refused.
 
 ## Exit codes

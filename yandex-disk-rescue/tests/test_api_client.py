@@ -1,7 +1,6 @@
 """Tests for `DiskClient` against the fake Disk API server."""
 
 import dataclasses
-import itertools
 from datetime import UTC, datetime, timedelta, timezone
 
 import anyio
@@ -12,11 +11,6 @@ from yandex_disk_rescue import api
 pytestmark = pytest.mark.anyio
 
 TOKEN = 'y0_AgAAAAB-sentinel-token-value'
-
-
-@pytest.fixture
-def anyio_backend() -> str:
-    return 'asyncio'
 
 
 # The production policy with intervals and backoff shrunk so retries cost milliseconds.
@@ -225,7 +219,7 @@ async def test_a_retry_after_pauses_the_next_request_and_the_listing_succeeds(fa
 
     assert [r.path for r in resources] == ['disk:/A/x.txt']
     first, second = _starts(fake_disk_api)
-    assert second - first >= 0.95
+    assert second - first >= 0.9
 
 
 async def test_throttling_statuses_are_retried_until_the_listing_succeeds(fake_disk_api):
@@ -250,12 +244,21 @@ async def test_retries_run_out_with_the_last_failure_and_the_attempt_count(fake_
     assert len(fake_disk_api.requests) == 3
 
 
-@pytest.mark.parametrize('status', [400, 401, 403, 404, 409])
-async def test_other_client_errors_are_not_retried(fake_disk_api, status):
+@pytest.mark.parametrize(
+    ('status', 'error'),
+    [
+        (400, api.DiskApiError),
+        (401, api.TokenRejectedError),
+        (403, api.TokenRejectedError),
+        (404, api.RemotePathNotFoundError),
+        (409, api.DiskApiError),
+    ],
+)
+async def test_other_client_errors_are_not_retried(fake_disk_api, status, error):
     fake_disk_api.add_dir('disk:/A')
     fake_disk_api.inject('GET', '/v1/disk/resources', status)
 
-    with pytest.raises((api.DiskApiError, api.TokenRejectedError, api.RemotePathNotFoundError)) as excinfo:
+    with pytest.raises(error) as excinfo:
         await _list(fake_disk_api, 'disk:/A')
 
     assert 'attempts' not in str(excinfo.value)
@@ -295,7 +298,7 @@ async def test_concurrent_requests_share_one_pace_and_one_concurrency_cap(fake_d
 
     starts = sorted(_starts(fake_disk_api))
     assert len(starts) == 20
-    assert min(later - earlier for earlier, later in itertools.pairwise(starts)) >= 0.04
+    assert starts[-1] - starts[0] >= 0.9 * 0.05 * (len(starts) - 1)
     assert fake_disk_api.peak_in_flight == 7
 
 

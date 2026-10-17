@@ -9,11 +9,6 @@ from yandex_disk_rescue import api
 pytestmark = pytest.mark.anyio
 
 
-@pytest.fixture
-def anyio_backend() -> str:
-    return 'asyncio'
-
-
 class FakeClock:
     """A monotonic clock that only moves when the limiter sleeps on it."""
 

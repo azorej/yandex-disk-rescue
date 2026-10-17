@@ -81,7 +81,7 @@ class ManifestError(RescueError):
 
 @dataclass(frozen=True)
 class ScanDiff:
-    added: list[str]
+    added: list[str]  # empty on a first scan, where every staged row is new
     changed: list[str]
     removed: list[str]
     first_scan: bool  # the subtree had no committed entries before this scan
@@ -144,14 +144,19 @@ class Manifest:
         return self._active_session
 
     def entries(self, account_uid: str, root: str) -> Iterator[Resource]:
-        """Return the committed entries of `account_uid` at `root` and below, ordered by path."""
+        """Yield the committed entries of `account_uid` at `root` and below ordered by path, reading as it goes.
+
+        Finish (or close) the iteration before writing to this manifest: the open read sees the database as it was
+        when the iteration started.
+        """
         _check_root(root)
         with self._errors('read'):
-            rows = self._connection.execute(
+            cursor = self._connection.execute(
                 f'SELECT {_COLUMNS} FROM entries e WHERE e.account_uid = :account AND {_SUBTREE} ORDER BY path',
                 _subtree_params(account_uid, root),
-            ).fetchall()
-        return iter(_resource(row) for row in rows)
+            )
+            for row in cursor:
+                yield _resource(row)
 
     @contextmanager
     def _errors(self, action: str) -> Iterator[None]:
@@ -218,7 +223,7 @@ class ScanSession:
         with self._manifest._transaction('update'):
             (had_entries,) = connection.execute(_HAD_ENTRIES_SQL, self._params).fetchone()
             diff = ScanDiff(
-                added=self._paths(_ADDED_SQL),
+                added=self._paths(_ADDED_SQL) if had_entries else [],
                 changed=self._paths(_CHANGED_SQL),
                 removed=self._paths(_REMOVED_SQL),
                 first_scan=not had_entries,

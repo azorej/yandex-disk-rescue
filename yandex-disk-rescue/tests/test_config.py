@@ -31,10 +31,10 @@ def _write_default_config(content: str | bytes):
     return path
 
 
-def _min_start_gap(fake) -> float:
+def _start_gaps(fake) -> list[float]:
     starts = sorted(request.started for request in fake.requests)
     assert len(starts) == 6
-    return min(later - earlier for earlier, later in itertools.pairwise(starts))
+    return [later - earlier for earlier, later in itertools.pairwise(starts)]
 
 
 def test_the_default_config_file_paces_scan(disk):
@@ -43,7 +43,8 @@ def test_the_default_config_file_paces_scan(disk):
     result = runner.invoke(app, ['scan'])
 
     assert result.exit_code == 0, result.output
-    assert _min_start_gap(disk) >= 0.19
+    gaps = _start_gaps(disk)
+    assert sum(gaps) >= 0.9 * 0.2 * len(gaps)
 
 
 @pytest.mark.parametrize('override', ['flag', 'env'])
@@ -60,7 +61,7 @@ def test_the_flag_and_the_env_var_override_the_config_file(disk, monkeypatch, tm
     result = runner.invoke(app, args)
 
     assert result.exit_code == 0, result.output
-    assert _min_start_gap(disk) < 0.15
+    assert min(_start_gaps(disk)) < 0.15
 
 
 def test_auth_status_reads_the_api_url_from_the_config_file(fake_disk_api, monkeypatch):

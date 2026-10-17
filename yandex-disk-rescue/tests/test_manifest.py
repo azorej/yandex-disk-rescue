@@ -5,6 +5,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+from contextlib import closing
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -51,9 +52,7 @@ def test_committed_scan_survives_reopen_and_a_rescan_reports_the_exact_diff(tmp_
 
     first = _scan(db, TREE)
 
-    assert first.first_scan is True
-    assert first.added == sorted(r.path for r in TREE)
-    assert (first.changed, first.removed) == ([], [])
+    assert (first.first_scan, first.added, first.changed, first.removed) == (True, [], [], [])
     assert _entries(db) == sorted(TREE, key=lambda r: r.path)
 
     rescan = [r for r in TREE if r.path not in {'disk:/A/gone.txt', 'disk:/A/edit.txt'}]
@@ -264,7 +263,12 @@ time.sleep(600)
 """
 
 
-def test_sigkill_mid_scan_keeps_the_previous_scan_and_releases_the_lock(tmp_path):
+def _staged_paths(db: Path) -> list[str]:
+    with closing(sqlite3.connect(db)) as connection:
+        return [path for (path,) in connection.execute('SELECT path FROM staged_entries ORDER BY path')]
+
+
+def test_rows_staged_before_a_sigkill_stay_on_disk_until_the_next_scan_discards_them(tmp_path):
     db = tmp_path / 'manifest.sqlite3'
     _scan(db, TREE)
     child = subprocess.Popen([sys.executable, '-c', _SCAN_UNTIL_KILLED, str(db)], stdout=subprocess.PIPE, text=True)
@@ -276,6 +280,8 @@ def test_sigkill_mid_scan_keeps_the_previous_scan_and_releases_the_lock(tmp_path
         child.wait(timeout=60)
         child.stdout.close()
 
-    assert _entries(db) == sorted(TREE, key=lambda r: r.path)
-    diff = _scan(db, TREE)
-    assert (diff.added, diff.changed, diff.removed) == ([], [], [])
+    assert _staged_paths(db) == ['disk:/staged.txt']
+    with Manifest.open(db) as manifest:
+        session = manifest.begin_scan(UID, 'disk:/')
+        assert list(session.staged()) == []
+    assert _staged_paths(db) == []

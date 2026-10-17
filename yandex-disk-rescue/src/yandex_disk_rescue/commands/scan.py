@@ -80,7 +80,7 @@ def scan(
     try:
         result = asyncio.run(_scan(token, root, base_url=api_url, limits=limits, manifest_path=manifest_path))
     except KeyboardInterrupt:
-        typer.echo('Interrupted; the manifest still holds the previous scan.', err=True)
+        typer.echo('Interrupted; the manifest holds the last completed scan.', err=True)
         raise
     for line in _summary(result, manifest_path):
         typer.echo(line)
@@ -117,9 +117,9 @@ async def _scan(token: str, root: str, *, base_url: str, limits: api.ApiLimits, 
 class _Walk:
     """Lists every folder below a root with `workers` concurrent listings, staging rows into a scan session.
 
-    A folder below the root that answers 404, on any page, has been deleted since its parent was listed: it and
-    everything under it are left out of the session, including rows of its sub-folders that other workers listed
-    before or list after it vanished.
+    A folder below the root that answers 404 or as a file, on any page, has been deleted or replaced by a file since
+    its parent was listed: it and everything under it are left out of the session, including rows of its sub-folders
+    that other workers listed before or list after it vanished.
     """
 
     def __init__(self, client: api.DiskClient, session: ScanSession, root: str, *, workers: int) -> None:
@@ -173,7 +173,7 @@ class _Walk:
                     folders.put_nowait(resource.path)
                 if len(self._batch) >= _STAGE_BATCH:
                     self._stage()
-        except api.RemotePathNotFoundError:
+        except api.RemotePathNotFoundError, api.NotAFolderError:
             if folder == self._root:
                 raise
             self._vanish(folder)

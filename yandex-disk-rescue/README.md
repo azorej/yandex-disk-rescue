@@ -37,7 +37,9 @@ as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `
   in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
   unchanged, and the next scan discards its staged rows. Rescanning a folder replaces only that folder's subtree.
   A scan can unstage a subtree before it commits (`ScanSession.discard`); `scan` does so for a folder deleted on
-  the Disk mid-scan, which the commit then records as removed.
+  the Disk or replaced by a file mid-scan, which the commit then records as removed.
+- `Manifest.entries` and `ScanSession.staged` stream rows as the caller iterates; finish the iteration before
+  writing to the same manifest.
 - One run at a time: opening the manifest takes an exclusive lock on `manifest.sqlite3.lock`, and a second run fails
   with `Another yandex-disk-rescue run is using ...`.
 - The database runs in WAL mode with `synchronous=FULL`, so it must live on a local filesystem.
