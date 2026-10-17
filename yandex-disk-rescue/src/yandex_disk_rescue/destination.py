@@ -292,8 +292,8 @@ class ExistingFile:
 
 
 class PartialFile:
-    """An open partial file at `path`: its size, reading back and cutting what it holds, positional writes, fsyncs of
-    the content written so far, then the final mtime and an fsync."""
+    """An open partial file at `path`: its size, reading back any range of what it holds, cutting or extending it
+    (`truncate`), positional writes, fsyncs of the content written so far, then the final mtime and an fsync."""
 
     def __init__(self, fd: int, path: Path) -> None:
         self._fd = fd
@@ -303,9 +303,9 @@ class PartialFile:
         with _work_errors(self._path):
             return os.fstat(self._fd).st_size
 
-    def chunks(self, end: int) -> Iterator[bytes]:
-        """The bytes `[0, end)` in order, in chunks of at most 1 MiB; the file must hold at least `end` bytes."""
-        offset = 0
+    def chunks(self, start: int, end: int) -> Iterator[bytes]:
+        """The bytes `[start, end)` in order, in chunks of at most 1 MiB; the file must hold at least `end` bytes."""
+        offset = start
         while offset < end:
             with _work_errors(self._path):
                 chunk = localfs.read(self._fd, min(_READ_SIZE, end - offset), offset)

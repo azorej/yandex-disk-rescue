@@ -6,9 +6,10 @@ account to local storage. It is a headless analogue of the Windows app
 
 > **Status: early development.** OAuth token handling
 > (`yandex-disk-rescue auth`), scanning the remote tree into a local
-> manifest (`yandex-disk-rescue scan`) and verified, one-file-at-a-time
-> mirroring (`yandex-disk-rescue download`) work. Speed and safety features
-> are being built; planned work is tracked in GitHub issues.
+> manifest (`yandex-disk-rescue scan`) and verified, parallel, resumable
+> mirroring with segmented downloads of large files
+> (`yandex-disk-rescue download`) work. Further features are being built;
+> planned work is tracked in GitHub issues.
 
 ## Goals
 
@@ -179,9 +180,21 @@ once, started in path order: the folder structure is kept, each folder is
 created before anything inside it, empty folders are created, and every file
 gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
-`--download-connections`, `--download-checkpoint-mib` and `--scan-max-age` (see
+`--download-connections`, `--download-checkpoint-mib`, `--download-segments`,
+`--download-segment-threshold-mib` and `--scan-max-age` (see
 [Configuration](#configuration)), and `--no-scan`. A file whose download host
 never answers holds one connection until it stalls and delays no other file.
+
+**Segmented files.** A file larger than `download_segment_threshold_mib` MiB
+(default 256) is downloaded as `download_segments` segments (default 4): equal
+byte ranges fetched in parallel, each with an HTTP `Range` request on a
+connection of its own, all into one partial file that is first extended to the
+file's full size. Once every segment is in, the whole file is read back and
+checked against its size and checksums. A file at or below the threshold, and
+every file when `download_segments` is `1`, is fetched as one stream and
+checked as it arrives. The segments of a download are fixed when it starts: a
+download resumed by a later pass or a later run keeps them, even when the
+options changed since.
 
 **When it scans.** `download` reuses the last completed scan of the account
 covering REMOTE_PATH — a scan of REMOTE_PATH itself or of a folder above it,
@@ -217,51 +230,56 @@ recorded size, modification time and inode. A file changed on the Disk, or
 edited or touched locally, is handled like any file already in DEST (below).
 
 **Interruptions, stalls and retries.** Every download keeps a checkpoint
-journal in the manifest: how many bytes of its partial file were flushed to
-the disk, and their SHA-256. A checkpoint is taken every
-`download_checkpoint_mib` MiB received (default 32), every 15 s while bytes
-arrive, and whenever a download attempt ends — a dropped connection, a stall,
-Ctrl+C. After a kill, a crash or a power cut, at most one checkpoint interval
-is fetched again.
+journal in the manifest: for each segment (a file fetched as one stream has
+one), how many of its bytes were flushed to the disk, and their SHA-256. A
+checkpoint is taken every `download_checkpoint_mib` MiB a segment receives
+(default 32), every 15 s while bytes arrive, and whenever a download attempt
+ends — a dropped connection, a stall, Ctrl+C. After a kill, a crash or a power
+cut, at most one checkpoint interval per segment is fetched again.
 
 A later pass or a later run asks the Disk for the file again and, when its
-size, checksums and modification time are unchanged, re-reads the confirmed
-bytes and checks them against their SHA-256. When they match, only the rest
-is fetched, with an HTTP `Range` request; bytes past the last checkpoint are
-dropped and fetched again, never trusted. Confirmed bytes that changed on
-disk, or a partial file deleted or cut short, make the file start again from
-byte 0. When the file changed in the cloud, the partial file is deleted and
-the file fails with `changed in the cloud since the scan; rerun with
+size, checksums and modification time are unchanged, re-reads each segment's
+confirmed bytes and checks them against their SHA-256. When they match, only
+the rest of the segment is fetched, with an HTTP `Range` request; bytes past
+the last checkpoint are fetched again, never trusted. A segment whose confirmed
+bytes changed on disk, or that a partial file deleted or cut short no longer
+holds, starts again from its first byte; the other segments go on from their
+checkpoints. When the file changed in the cloud, the partial file is deleted
+and the file fails with `changed in the cloud since the scan; rerun with
 --scan-max-age 0 to fetch the new version` (after a rescan, the new version
 is downloaded from the start). A partial file left for an older version is
 discarded and the file is downloaded from the start; when the download host
-ignores `Range`, the whole file is fetched again, never appended to the bytes
-kept.
+ignores `Range` for any segment, the whole file is fetched again as one
+stream, never appended to the bytes kept.
 
 - **Stalls.** A download fails as stalled (`the download stalled: no data for
   15 s`) when the download host sends nothing for `download_timeout` seconds,
   whether it is slow to answer or pauses mid-file. Only silence counts: a
-  slow but steady download never stalls, and time spent writing to DEST does
-  not count.
-- **Retries.** A download that fails after receiving new data (a cut
+  slow but steady download never stalls, and time spent writing to DEST or
+  waiting for a free connection does not count.
+- **Retries.** A segment whose download fails after receiving new data (a cut
   connection, a stall after some data) is resumed at once from where it
-  stopped, up to `download_retries` times; past that the file's last reason
-  gets `(after N attempts)`. A download that fails before any new data
-  arrives (a stall before the first byte, a refused connection, `408`, `429`
-  or `5xx`) is not retried at once.
+  stopped, up to `download_retries` times; past that its last reason gets
+  `(after N attempts)`. A download that fails before any new data arrives (a
+  stall before the first byte, a refused connection, `408`, `429` or `5xx`)
+  is not retried at once.
 - **Passes.** Files whose download failed that way, or ran out of retries,
   are resumed in another pass over the files still to download, again up to
   `download_connections` at once, each with a new download link, after a 5 s
-  pause (longer when the host sent `Retry-After`, up to 300 s). A run makes at most `download_passes` passes
+  pause (longer when the host sent `Retry-After`, up to 300 s). The other
+  segments of such a file finish first, and the next pass fetches only the
+  segments still missing. A run makes at most `download_passes` passes
   (`0`: until every file is done or Ctrl+C); a file still failing after the
   last one is reported with its last reason and `(after N passes)`. Once a
   file needed another pass, the summary shows `Passes: <used> of <limit>`. A
   checksum mismatch, a refused download, a file changed in the cloud and a
-  local write error fail the file at once; no later pass retries it.
-- **Expired links.** A download link the host rejects (`401`, `403` or
-  `410`) is replaced by a new one once per pass, and the download continues
-  from the bytes received; when the new link is rejected too, the file fails
-  with `download link rejected again after a refresh (HTTP <n>)`.
+  local write error fail the file at once, stopping its other segments; no
+  later pass retries it.
+- **Expired links.** The segments of a file share one download link per pass.
+  A link the host rejects (`401`, `403` or `410`) is replaced by a new one
+  once per pass for the whole file, and the download continues from the bytes
+  received; when the new link is rejected too, the file fails with
+  `download link rejected again after a refresh (HTTP <n>)`.
 
 **Summary.**
 
@@ -386,12 +404,23 @@ deeper than the filesystem's `PATH_MAX` is mirrored like any other.
 ### Tuning
 
 `download_connections` caps the requests to the download host in flight, and
-so the files downloading at once (one connection each). Link requests and
-look-ups go to the Disk API and are paced separately, by `api_interval_ms`
-and `api_concurrency` (see [Rate limiting](#rate-limiting)).
+so the files downloading at once (one connection each, or one per segment of
+a segmented file; the segments queue for the same connections). Link requests
+and look-ups go to the Disk API and are paced separately, by
+`api_interval_ms` and `api_concurrency` (see [Rate limiting](#rate-limiting)).
 
 Many files written at once make a hard disk seek between them. On a USB hard
 disk, start around 8 connections and raise them while the throughput grows.
+
+Segments speed up one large file on a fast link whose single connection is the
+limit; a folder of small files gains nothing from them, since its files
+already download in parallel. They cost disk work: on a filesystem without
+sparse files (HFS+, exFAT, FAT), extending the partial file to its full size
+writes zeros first, so a segmented file is written twice (zeros, then data)
+and read once more for verification. On such a disk, especially a USB hard
+disk, prefer `download_segments = 1` or `2`. The defaults (4 segments above
+256 MiB) are those of the Windows
+[Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
 A smaller `download_checkpoint_mib` means less fetched again after a crash or
 a power cut, at the cost of more flushes to the disk and more manifest
@@ -451,7 +480,9 @@ first one that sets it wins:
 | `download_retries` | `--download-retries` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | `5` | 0 to 20; immediate resumes of a download that failed after new data |
 | `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until all are done |
 | `download_connections` | `--download-connections` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | `20` | 1 to 64; requests to the download host in flight, and so files downloading at once |
-| `download_checkpoint_mib` | `--download-checkpoint-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | `32` | 1 to 1024 (MiB); bytes received between two checkpoints of a download |
+| `download_checkpoint_mib` | `--download-checkpoint-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | `32` | 1 to 1024 (MiB); bytes a segment receives between two checkpoints of a download |
+| `download_segments` | `--download-segments` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | `4` | 1 to 8; segments of a file above the segment threshold, fetched in parallel; `1` never splits |
+| `download_segment_threshold_mib` | `--download-segment-threshold-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | `256` | 1 to 65536 (MiB); a larger file is downloaded as segments |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 

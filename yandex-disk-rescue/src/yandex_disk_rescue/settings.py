@@ -125,6 +125,19 @@ DOWNLOAD_CHECKPOINT_MIB = Setting(
     'or a power cut costs at most this much fetched again.',
     _in_range(1, 1024),
 )
+DOWNLOAD_SEGMENTS = Setting(
+    'download_segments',
+    4,
+    'Segments a file larger than the segment threshold is split into, fetched in parallel into one partial file; '
+    '1 never splits.',
+    _in_range(1, 8),
+)
+DOWNLOAD_SEGMENT_THRESHOLD_MIB = Setting(
+    'download_segment_threshold_mib',
+    256,
+    'Size above which a file is downloaded as several segments, in MiB.',
+    _in_range(1, 65536),
+)
 SCAN_MAX_AGE = Setting(
     'scan_max_age',
     60,
@@ -152,6 +165,8 @@ SETTINGS: dict[str, Setting[Any]] = {
         DOWNLOAD_PASSES,
         DOWNLOAD_CONNECTIONS,
         DOWNLOAD_CHECKPOINT_MIB,
+        DOWNLOAD_SEGMENTS,
+        DOWNLOAD_SEGMENT_THRESHOLD_MIB,
         SCAN_MAX_AGE,
         CLIENT_ID,
     )
@@ -167,6 +182,8 @@ DownloadRetries = Annotated[int, DOWNLOAD_RETRIES.typer_option()]
 DownloadPasses = Annotated[int, DOWNLOAD_PASSES.typer_option()]
 DownloadConnections = Annotated[int, DOWNLOAD_CONNECTIONS.typer_option()]
 DownloadCheckpointMib = Annotated[int, DOWNLOAD_CHECKPOINT_MIB.typer_option()]
+DownloadSegments = Annotated[int, DOWNLOAD_SEGMENTS.typer_option()]
+DownloadSegmentThresholdMib = Annotated[int, DOWNLOAD_SEGMENT_THRESHOLD_MIB.typer_option()]
 ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 

@@ -29,7 +29,9 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | Immediate resumes of a download that failed after receiving new data, 0 to 20 (default 5). Same as `--download-retries`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | Passes over the files still to download, resuming those that failed transiently, 0 to 1000 (default 7; 0 until every file is done). Same as `--download-passes`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | Requests to the download host in flight, and so files downloading at once, 1 to 64 (default 20). Same as `--download-connections`. |
-| `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | MiB a download receives between two checkpoints, 1 to 1024 (default 32). Same as `--download-checkpoint-mib`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | MiB a segment of a download receives between two checkpoints, 1 to 1024 (default 32). Same as `--download-checkpoint-mib`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | Segments a file above the segment threshold is downloaded as, in parallel, 1 to 8 (default 4; 1 never splits). Same as `--download-segments`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | Size above which a file is downloaded as segments, 1 to 65536 MiB (default 256). Same as `--download-segment-threshold-mib`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
@@ -98,13 +100,16 @@ yandex-disk-rescue/
 │   │                 #   the way, hard-link aliases) with up to `download_connections` files in progress at once
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
-│   │                 #   pipeline (adopt a matching local copy, or resume a partial file from its checkpoint
-│   │                 #   journal once the cloud file is confirmed unchanged and the confirmed bytes re-hashed,
-│   │                 #   link, fetch while hashing with checkpoints, immediate retries after new data and one
-│   │                 #   link refresh, verify, move aside what is in the way, place, record), the
-│   │                 #   rejected-name conversion of a folder or file
-│   │                 #   name the destination refuses, later passes over transiently failed files, the summary
-│   │                 #   lines; disk work (hashing, writes, fsync, placement) runs in the run's worker threads,
+│   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
+│   │                 #   from its checkpoint journal once the cloud file is confirmed unchanged and each
+│   │                 #   segment's confirmed bytes re-hashed; the segment plan of a new download; one link per
+│   │                 #   file shared by its segments, preallocation of a segmented file, parallel ranged
+│   │                 #   fetches of its segments while hashing with checkpoints, immediate retries after new
+│   │                 #   data and one link refresh, the fallback to one stream when the host ignores a range;
+│   │                 #   verify, by reading a segmented file back; move aside what is in the way, place,
+│   │                 #   record), the rejected-name conversion of a folder or file name the destination
+│   │                 #   refuses, later passes over transiently failed files, the summary lines; disk work
+│   │                 #   (hashing, writes, preallocation, fsync, placement) runs in the run's worker threads,
 │   │                 #   one bounded call at a time, while the manifest and local names stay on the event loop
 │   ├── disk_threads.py # DiskThreads — the run's dedicated worker threads; a cancelled caller waits for its call
 │   │                 #   in flight, so no descriptor is closed under a running call
@@ -147,7 +152,8 @@ yandex-disk-rescue/
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
     │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
     │                       #   (`corrupt` and `repair`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
-    │                       #   `inject`ed faults (statuses, delays, `Truncate`); a `routes` override table; the
+    │                       #   `inject`ed faults (statuses, delays, `Truncate`), matched by query parameters and
+    │                       #   request headers such as `Range`; a `routes` override table; the
     │                       #   request log (start and finish times, body bytes sent); peaks of requests and of
     │                       #   content requests in flight
     ├── test_api_client.py

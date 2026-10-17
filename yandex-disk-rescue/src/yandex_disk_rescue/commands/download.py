@@ -13,7 +13,7 @@ from yandex_disk_rescue import api, auth, paths, settings
 from yandex_disk_rescue.destination import Destination, check_destination
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ScanTime
-from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, mirror_summary
+from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, TransferPolicy, mirror_summary
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -52,6 +52,10 @@ def download(
     download_passes: settings.DownloadPasses = settings.DOWNLOAD_PASSES.default,
     download_connections: settings.DownloadConnections = settings.DOWNLOAD_CONNECTIONS.default,
     download_checkpoint_mib: settings.DownloadCheckpointMib = settings.DOWNLOAD_CHECKPOINT_MIB.default,
+    download_segments: settings.DownloadSegments = settings.DOWNLOAD_SEGMENTS.default,
+    download_segment_threshold_mib: settings.DownloadSegmentThresholdMib = (
+        settings.DOWNLOAD_SEGMENT_THRESHOLD_MIB.default
+    ),
     api_interval_ms: settings.ApiIntervalMs = settings.API_INTERVAL_MS.default,
     api_concurrency: settings.ApiConcurrency = settings.API_CONCURRENCY.default,
     api_timeout: settings.ApiTimeout = settings.API_TIMEOUT.default,
@@ -83,6 +87,8 @@ def download(
                     passes=download_passes,
                     connections=download_connections,
                     checkpoint_mib=download_checkpoint_mib,
+                    segments=download_segments,
+                    segment_threshold_mib=download_segment_threshold_mib,
                 ),
                 manifest_path=manifest_path,
             )
@@ -144,13 +150,16 @@ class _ScanPolicy:
 @dataclass(frozen=True)
 class _Transfers:
     """How files are fetched: the stall timeout in seconds, the immediate retries after new data, the passes (0: no
-    limit), the requests to the download host in flight at most, the MiB received between two checkpoints."""
+    limit), the requests to the download host in flight at most, the MiB a segment receives between two checkpoints,
+    and the segments of a file larger than `segment_threshold_mib` MiB."""
 
     timeout: int
     retries: int
     passes: int
     connections: int
     checkpoint_mib: int
+    segments: int
+    segment_threshold_mib: int
 
 
 async def _run(
@@ -185,10 +194,10 @@ async def _mirror(
     files = 'file' if run.pending_files == 1 else 'files'
     typer.echo(f'Downloading {run.pending_files} {files} ({format_size(run.pending_size)}) to {destination.path}')
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
-        return await run.run(
-            client,
-            content,
+        policy = TransferPolicy(
             retries=transfers.retries,
-            passes=transfers.passes,
             checkpoint_bytes=transfers.checkpoint_mib * 2**20,
+            segments=transfers.segments,
+            segment_threshold=transfers.segment_threshold_mib * 2**20,
         )
+        return await run.run(client, content, policy, passes=transfers.passes)

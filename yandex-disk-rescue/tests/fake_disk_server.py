@@ -95,6 +95,7 @@ class FakeNode:
 @dataclass
 class _Fault:
     where: dict[str, str]
+    where_headers: dict[str, str]
     responses: deque[FakeResponse | Delay | Truncate]
 
 
@@ -220,18 +221,25 @@ class FakeDiskApi:
         route: str,
         *responses: FakeResponse | Delay | Truncate | int,
         where: dict[str, str] | None = None,
+        where_headers: dict[str, str] | None = None,
     ) -> None:
         """Answer the next matching requests with `responses` in order, then serve the route normally again.
 
-        An int is a status with a Yandex-style JSON error body. `where` matches query parameters exactly.
+        An int is a status with a Yandex-style JSON error body. `where` matches query parameters exactly, and
+        `where_headers` request headers (lower-case names), for example `{'range': 'bytes=0-1023'}`.
         """
         queue = deque(FakeResponse.error(r) if isinstance(r, int) else r for r in responses)
-        self._faults.setdefault((method, route), []).append(_Fault(where or {}, queue))
+        self._faults.setdefault((method, route), []).append(_Fault(where or {}, where_headers or {}, queue))
 
-    def _next_fault(self, method: str, path: str, params: dict[str, str]) -> FakeResponse | Delay | Truncate | None:
+    def _next_fault(self, request: RecordedRequest) -> FakeResponse | Delay | Truncate | None:
+        params = request.params
         with self._lock:
-            for fault in self._faults.get((method, path), []):
-                if fault.responses and all(params.get(k) == v for k, v in fault.where.items()):
+            for fault in self._faults.get((request.method, request.path), []):
+                if (
+                    fault.responses
+                    and all(params.get(k) == v for k, v in fault.where.items())
+                    and all(request.headers.get(k) == v for k, v in fault.where_headers.items())
+                ):
                     return fault.responses.popleft()
         return None
 
@@ -260,7 +268,7 @@ class FakeDiskApi:
             return FakeResponse.json(
                 400, {'error': 'AuthorizationNotExpected', 'description': 'The download host takes no token.'}
             )
-        fault = self._next_fault(request.method, request.path, request.params)
+        fault = self._next_fault(request)
         if isinstance(fault, FakeResponse):
             return fault
         if isinstance(fault, Delay):

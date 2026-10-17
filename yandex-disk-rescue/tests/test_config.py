@@ -17,7 +17,8 @@ runner = CliRunner()
 TOKEN = 'y0_AgAAAAB-config-sentinel-token'
 OPTIONS = (
     'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, download_retries, '
-    'download_passes, download_connections, download_checkpoint_mib, scan_max_age, client_id'
+    'download_passes, download_connections, download_checkpoint_mib, download_segments, '
+    'download_segment_threshold_mib, scan_max_age, client_id'
 )
 
 
@@ -149,6 +150,13 @@ def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, ag
         ('download_passes = -1\n', 'download_passes: must be an integer from 0 to 1000.'),
         ('download_connections = 65\n', 'download_connections: must be an integer from 1 to 64.'),
         ('download_checkpoint_mib = 0\n', 'download_checkpoint_mib: must be an integer from 1 to 1024.'),
+        ('download_segments = 0\n', 'download_segments: must be an integer from 1 to 8.'),
+        ('download_segments = 9\n', 'download_segments: must be an integer from 1 to 8.'),
+        ('download_segment_threshold_mib = 0\n', 'download_segment_threshold_mib: must be an integer from 1 to 65536.'),
+        (
+            'download_segment_threshold_mib = 65537\n',
+            'download_segment_threshold_mib: must be an integer from 1 to 65536.',
+        ),
         ('scan_max_age = 10081\n', 'scan_max_age: must be an integer from 0 to 10080.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
