@@ -7,6 +7,7 @@ import hashlib
 import os
 import random
 import re
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -369,7 +370,16 @@ def test_a_converted_name_the_destination_refuses_too_fails_that_entry_only(disk
     )
 
 
-def test_a_path_longer_than_path_max_fails_without_a_conversion(disk, dest, monkeypatch):
+@pytest.fixture
+def removed_dest(dest):
+    """`dest`, removed after the test: tools walking the temporary folder by full path fail on a tree deeper than
+    PATH_MAX."""
+    yield dest
+    shutil.rmtree(dest)
+
+
+def test_a_path_longer_than_path_max_fails_without_a_conversion(disk, removed_dest, monkeypatch):
+    dest = removed_dest
     folders = '/'.join(f'{level:02}' + 'd' * 248 for level in range(17))
     disk.add_file(f'disk:/Deep/{folders}/deep.txt', b'deep')
     seen = _refuse_names(monkeypatch, lambda name: name == 'deep.txt', code=errno.ENAMETOOLONG)
