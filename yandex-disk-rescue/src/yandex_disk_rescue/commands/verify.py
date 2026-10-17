@@ -3,12 +3,13 @@ reading the destination only, continuing an interrupted pass, and summarize what
 
 import os
 from datetime import UTC
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from yandex_disk_rescue import paths
+from yandex_disk_rescue import console, paths
 from yandex_disk_rescue.destination import ReadOnlyDestination
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ManifestMissingError, VerifyPass
@@ -41,33 +42,37 @@ def verify(
         bool,
         typer.Option('--restart', help='Start a new pass over every file instead of continuing an interrupted one.'),
     ] = False,
+    verbose: console.Verbose = False,
+    quiet: console.Quiet = False,
 ) -> None:
     """Re-hash every verified file of the mirror at DEST against the manifest, with no network and nothing written to
     DEST, and report missing, modified, corrupt, quarantined and not downloaded files. An interrupted pass continues
     where it stopped."""
-    manifest_path = paths.manifest_path()
-    try:
-        with ReadOnlyDestination.open(Path(os.path.abspath(dest))) as destination:
-            try:
-                manifest = Manifest.open_existing(manifest_path)
-            except ManifestMissingError:
-                raise NotAMirrorError(destination.path, manifest_path) from None
-            with manifest:
-                mirror = manifest.mirror_at(destination.path)
-                if mirror is None:
-                    raise NotAMirrorError(destination.path, manifest_path)
-                current = None if restart else mirror.verify_pass()
-                run = VerifyRun(mirror, destination, current or mirror.start_verify_pass())
-                typer.echo(_start_line(run, current, destination.path))
-                report = run.run()
-    except KeyboardInterrupt:
-        typer.echo('Interrupted; rerun verify to continue where it stopped.', err=True)
-        raise
-    for line in verify_summary(report):
-        typer.echo(line)
-    typer.echo(f'Manifest: {manifest_path}')
-    if report.problems:
-        raise ProblemsFoundError(report)
+    options = console.output_options(verbose=verbose, quiet=quiet)
+    path = Path(os.path.abspath(dest))
+    with console.command_output('verify', options, details={'dest': path, 'restart': restart}) as output:
+        manifest_path = paths.manifest_path()
+        try:
+            with ReadOnlyDestination.open(path) as destination:
+                try:
+                    manifest = Manifest.open_existing(manifest_path)
+                except ManifestMissingError:
+                    raise NotAMirrorError(destination.path, manifest_path) from None
+                with manifest:
+                    mirror = manifest.mirror_at(destination.path)
+                    if mirror is None:
+                        raise NotAMirrorError(destination.path, manifest_path)
+                    current = None if restart else mirror.verify_pass()
+                    run = VerifyRun(mirror, destination, current or mirror.start_verify_pass())
+                    output.line(_start_line(run, current, destination.path))
+                    report = run.run()
+        except KeyboardInterrupt:
+            typer.echo('Interrupted; rerun verify to continue where it stopped.', err=True)
+            raise
+        output.summary(partial(verify_summary, report))
+        output.footer(manifest_path)
+        if report.problems:
+            raise ProblemsFoundError(report)
 
 
 def _start_line(run: VerifyRun, continued: VerifyPass | None, destination: Path) -> str:

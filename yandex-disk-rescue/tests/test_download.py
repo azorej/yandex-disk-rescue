@@ -29,6 +29,7 @@ from mirror_tree import (
     TOKEN,
     corrupted_bytes,
     local_file,
+    log_messages,
     quarantine_runs,
     replaced_runs,
     run_download,
@@ -42,7 +43,7 @@ from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import Destination, PartialFile
 from yandex_disk_rescue.manifest import Manifest, Mirror, Segment
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
-from yandex_disk_rescue.paths import manifest_path
+from yandex_disk_rescue.paths import log_path, manifest_path
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -245,6 +246,7 @@ def test_a_fresh_mirror_holds_every_file_with_its_bytes_and_cloud_mtime(disk, de
         'Verified by size only (no cloud checksum): 1',
         f'  {SIZE_ONLY}',
         f'Manifest: {manifest_path()}',
+        f'Log: {log_path()}',
     ]
     assert lines[0].startswith('Scanned disk:/: 6 files, 4 folders')
     if redirect:
@@ -1205,6 +1207,7 @@ def test_an_unusable_destination_or_partial_folder_is_a_usage_error_that_creates
     assert [p.name for p in existing.rglob('*')] == ['inside']
     assert list(partial_root.iterdir()) == []
     assert not manifest_path().exists()
+    assert not log_path().exists()
     assert disk.requests == []
 
 
@@ -2615,6 +2618,7 @@ def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_th
 
     assert child.returncode == 130, stderr
     assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert log_messages()[-1] == 'download interrupted (exit 130)'
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
     assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]

@@ -142,6 +142,7 @@ Changes since the last scan: 5 added, 2 changed, 1 removed
   ~ disk:/Photos/edited.jpg
   - disk:/Photos/gone.jpg
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 The counts and the size cover everything below the scanned folder. Files
@@ -458,6 +459,7 @@ Download them again with --retry-failed (add --scan-max-age 0 if they changed on
 Failed: 1
   disk:/Photos/gone.jpg: removed from the Disk after the scan
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 Every list is in path order, whatever the order the files finished in, and
@@ -679,6 +681,7 @@ Quarantined: 1
 Not downloaded: 1
   disk:/Photos/new.jpg: not downloaded yet
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 Every list is in path order and shows at most 20 entries, then `… and N
@@ -710,12 +713,60 @@ counts as intact, and the files after the cursor are read as usual.
 `verify --restart DEST` drops the pass in progress and starts a new one over
 every file.
 
+## Output and logs
+
+`scan`, `download` and `verify` write to two channels:
+
+- **stdout** carries the report: the start lines, the scan summary, the
+  final summary, then the `Manifest:` and `Log:` lines. Nothing else is ever
+  written there, so `> report.txt` keeps exactly the report.
+- **stderr** carries the notices and the result: the `Error: …` or
+  `Interrupted; …` line a run ends with.
+
+`-q` / `--quiet` leaves only that result line on stderr. `-v` / `--verbose`
+also logs DEBUG records to the log file. Neither changes stdout, and giving
+both is a usage error (exit `2`).
+
+**The log file.** Every run of `scan`, `download` and `verify` appends to
+`$XDG_STATE_HOME/yandex-disk-rescue/yandex-disk-rescue.log`
+(`~/.local/state/yandex-disk-rescue/yandex-disk-rescue.log` when
+`XDG_STATE_HOME` is unset or not an absolute path), whatever `-q` says:
+
+```
+2026-10-17T09:30:00.123Z INFO download[12345] download started: version 0.1.0, pid 12345; remote_path=disk:/Photos, dest=/mnt/backup, …
+2026-10-17T09:41:12.456Z INFO download[12345] Summary:
+2026-10-17T09:41:12.456Z INFO download[12345] Mirrored disk:/Photos to /mnt/backup: 1234 downloaded (12.3 GiB), …
+2026-10-17T09:41:12.457Z INFO download[12345] download completed (exit 0)
+```
+
+- Each line starts with the UTC time, the level, the command and its pid; a
+  multi-line record (a summary, a traceback) gets that prefix on every line,
+  so `grep` always shows when and which run wrote a line.
+- A run logs its start (the version and every argument and option value),
+  its full summary with every list complete (no `… and N more`), and its
+  end: `completed (exit 0)`, `failed (exit N): <error>`,
+  `interrupted (exit 130)`, or an unexpected error with its traceback.
+- The level is INFO, DEBUG with `-v`.
+- The file is rotated at 10 MiB, keeping five older files (`.1` is the most
+  recent, `.5` the oldest). Every file is mode 0600 in the 0700 state
+  directory.
+- The log never holds the OAuth token or a download link.
+- A usage error (exit `2` before the command starts, such as a wrong number
+  of paths or `-v` with `-q`) writes nothing to the log.
+
+A log file that cannot be opened stops the command before it does anything:
+`Error: Could not open the log file <path>: <reason>.` (exit `1`). A write
+that fails later (the state disk full, an I/O error) never stops the run:
+stderr gets one `Warning: could not write the log file <path>: <reason>;
+logging to it is off for this run.`, even with `-q`, and the report ends with
+`Log: <path> (incomplete: <reason>)`.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success; for `download`, every file of the folder is verified at its final path; for `verify`, every file of the mirror is verified and intact |
-| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
 | `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers; for `verify` a DEST that is not an existing folder or is not a mirror recorded in the manifest |
 | `130` | Interrupted with Ctrl+C |
 

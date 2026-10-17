@@ -38,7 +38,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | Existing folder, an absolute path outside DEST, below which `download` keeps DEST's partial files (in `<folder>/<key>/`) and copies each finished one to DEST; empty counts as unset (default: partial files in DEST). Same as `--partial-dir`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
-| `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
+| `XDG_STATE_HOME` | Parent of the state directory holding the manifest and the log file (default `~/.local/state`). |
 
 ## Manifest
 
@@ -185,9 +185,14 @@ yandex-disk-rescue/
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
 │   │                 #   an open file and setting its times; the free space of a folder's filesystem
+│   ├── console.py    # The output of scan, download and verify: `-v`/`-q`, the report lines on stdout, the run
+│   │                 #   wrapped in `command_output` (log file and notice handlers attached for the run, its start
+│   │                 #   and end records, `LogFileError`), the full summary logged, the `Manifest:` and `Log:` lines
+│   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
+│   │                 #   one notice when a write fails) and the timestamped notices on stderr
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
-│   ├── paths.py      # XDG config and state directories, the manifest path
+│   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
 │   │                 #   failure and quarantine records, verify findings, the verify pass and the folder of the
@@ -220,7 +225,7 @@ yandex-disk-rescue/
     │                       #   `/dev/shm`, another filesystem than `dest`'s)
     ├── mirror_tree.py      # The tree the download and verify tests mirror; running `download`, running a command
     │                       #   in a child process and waiting on it, the local path of a Disk file, the replaced
-    │                       #   and quarantine run folders, a corrupted copy of bytes
+    │                       #   and quarantine run folders, a corrupted copy of bytes, the messages of the log file
     ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
@@ -237,6 +242,7 @@ yandex-disk-rescue/
     ├── test_download.py
     ├── test_local_names.py
     ├── test_manifest.py
+    ├── test_output.py
     ├── test_rate_limiter.py
     ├── test_scan.py
     ├── test_transfer.py

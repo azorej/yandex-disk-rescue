@@ -101,23 +101,23 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
     return ScanResult(root=root.path, totals=totals, vanished=walk.vanished, unencodable=walk.unencodable, diff=diff)
 
 
-def scan_summary(result: ScanResult) -> list[str]:
+def scan_summary(result: ScanResult, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a scan: totals, files without a checksum, vanished folders, entries left out for their
-    names, and the changes."""
+    names, and the changes; each list shows its first `limit` members (`None`: all)."""
     totals, diff = result.totals, result.diff
     lines = [
         f'Scanned {result.root}: {_plural(totals.files, "file")}, {_plural(totals.folders, "folder")}, '
         f'{format_size(totals.size)}',
         f'Files without a cloud checksum: {totals.without_checksum.count}',
-        *listed('', totals.without_checksum.smallest, totals.without_checksum.count, ''),
+        *listed('', totals.without_checksum.smallest, totals.without_checksum.count, '', limit=limit),
     ]
     if result.vanished:
         lines.append(f'Folders that disappeared during the scan: {len(result.vanished)}')
-        lines += listed('', result.vanished, len(result.vanished), '')
+        lines += listed('', result.vanished, len(result.vanished), '', limit=limit)
     if result.unencodable:
         lines.append(f'Not recorded, the name is not valid Unicode: {len(result.unencodable)}')
         shown = [display_path(resource.path) for resource in result.unencodable]
-        lines += listed('', shown, len(shown), '')
+        lines += listed('', shown, len(shown), '', limit=limit)
     if diff.first_scan:
         lines.append(f'First scan of {result.root}')
     else:
@@ -125,9 +125,9 @@ def scan_summary(result: ScanResult) -> list[str]:
             f'Changes since the last scan: {len(diff.added)} added, {len(diff.changed)} changed, '
             f'{len(diff.removed)} removed'
         )
-        lines += listed('+ ', diff.added, len(diff.added), ' added')
-        lines += listed('~ ', diff.changed, len(diff.changed), ' changed')
-        lines += listed('- ', diff.removed, len(diff.removed), ' removed')
+        lines += listed('+ ', diff.added, len(diff.added), ' added', limit=limit)
+        lines += listed('~ ', diff.changed, len(diff.changed), ' changed', limit=limit)
+        lines += listed('- ', diff.removed, len(diff.removed), ' removed', limit=limit)
     return lines
 
 
@@ -136,11 +136,12 @@ def display_path(path: str) -> str:
     return path.encode('utf-8', 'backslashreplace').decode('utf-8')
 
 
-def listed(marker: str, shown: Sequence[str], count: int, what: str) -> list[str]:
-    """Indented lines for the first `SHOWN_PATHS` of `shown`, then `… and N more<what>` when `count` exceeds them."""
-    lines = [f'  {marker}{path}' for path in shown[:SHOWN_PATHS]]
-    if count > SHOWN_PATHS:
-        lines.append(f'  … and {count - SHOWN_PATHS} more{what}')
+def listed(marker: str, shown: Sequence[str], count: int, what: str, *, limit: int | None) -> list[str]:
+    """Indented lines for the first `limit` of `shown` (all of them for `None`), then `… and N more<what>` when
+    `count` exceeds the lines shown."""
+    lines = [f'  {marker}{path}' for path in (shown if limit is None else shown[:limit])]
+    if count > len(lines):
+        lines.append(f'  … and {count - len(lines)} more{what}')
     return lines
 
 

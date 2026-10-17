@@ -8,12 +8,13 @@ from datetime import UTC
 
 import pytest
 from fake_disk_server import Delay, FakeResponse
+from mirror_tree import log_messages
 from typer.testing import CliRunner
 from yandex_disk_rescue import scanning
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.manifest import Manifest
-from yandex_disk_rescue.paths import state_dir
+from yandex_disk_rescue.paths import log_path, state_dir
 from yandex_disk_rescue.units import format_size
 
 runner = CliRunner()
@@ -82,6 +83,7 @@ def test_first_scan_records_the_tree_and_summarizes_it(disk):
         '  disk:/Photos/old.bmp\n'
         'First scan of disk:/\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert _rows() == _tree_rows(disk)
     assert all(r.headers['authorization'] == f'OAuth {TOKEN}' for r in disk.requests)
@@ -104,6 +106,7 @@ def test_a_rescan_lists_exactly_what_was_added_changed_and_removed(disk):
         '  ~ disk:/Docs/readme.txt\n'
         '  - disk:/Photos/old.bmp\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert _rows() == _tree_rows(disk)
 
@@ -157,6 +160,7 @@ def test_long_path_lists_are_cut_after_twenty_entries(disk):
         + '  … and 5 more\n'
         'First scan of disk:/Bulk\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert second.exit_code == 0, second.output
     assert second.stdout.splitlines()[23:] == [
@@ -165,6 +169,15 @@ def test_long_path_lists_are_cut_after_twenty_entries(disk):
         '  … and 4 more changed',
         '  - disk:/Bulk/00.raw',
         f'Manifest: {_manifest_path()}',
+        f'Log: {log_path()}',
+    ]
+    logged = log_messages()
+    assert logged[-1] == 'scan completed (exit 0)'
+    changes = logged.index('Changes since the last scan: 0 added, 24 changed, 1 removed')
+    assert logged[changes:-1] == [
+        'Changes since the last scan: 0 added, 24 changed, 1 removed',
+        *(f'  ~ disk:/Bulk/{index:02}.raw' for index in range(1, 25)),
+        '  - disk:/Bulk/00.raw',
     ]
 
 
@@ -297,6 +310,7 @@ def test_a_folder_deleted_during_the_scan_is_reported_and_recorded_as_removed(di
         '  - disk:/Photos/2024/b.jpg\n'
         '  - disk:/Photos/2024/c.jpg\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     disk.remove('disk:/Photos/2024')
     assert _rows() == _tree_rows(disk)

@@ -1,8 +1,9 @@
 """The Disk tree the `download` and `verify` tests mirror (the `disk` fixture in `conftest.py` serves it), and helpers
-to run `download`, run a command in a child process, and look at its destination."""
+to run `download`, run a command in a child process, look at its destination, and read the log file."""
 
 import hashlib
 import os
+import re
 import subprocess
 import time
 from datetime import UTC, datetime
@@ -10,6 +11,7 @@ from datetime import UTC, datetime
 import pytest
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.paths import log_path
 
 runner = CliRunner()
 
@@ -74,3 +76,16 @@ def corrupted_bytes(content: bytes, offset: int) -> tuple[bytes, str]:
     flipped[offset] ^= 0xFF
     good, bad = hashlib.md5(content).hexdigest(), hashlib.md5(flipped).hexdigest()
     return bytes(flipped), f'MD5 mismatch (expected {good}, got {bad})'
+
+
+LOG_LINE = re.compile(
+    r'(?P<time>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z) (?P<level>[A-Z]+) (?P<command>[a-z]+)\[(?P<pid>\d+)\] '
+)
+
+
+def log_messages(path=None) -> list[str]:
+    """The message of every line of the log file (default: the current one), each line checked for its prefix."""
+    lines = (path or log_path()).read_text(encoding='utf-8').splitlines()
+    for line in lines:
+        assert LOG_LINE.match(line), line
+    return [LOG_LINE.sub('', line, count=1) for line in lines]

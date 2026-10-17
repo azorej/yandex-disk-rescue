@@ -32,7 +32,7 @@ from yandex_disk_rescue import localfs, verifying
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import ReadOnlyDestination
 from yandex_disk_rescue.manifest import Mirror
-from yandex_disk_rescue.paths import manifest_path
+from yandex_disk_rescue.paths import log_path, manifest_path
 from yandex_disk_rescue.units import format_size
 
 CORRUPT = 'disk:/Photos/2024/a.jpg'
@@ -166,7 +166,10 @@ def test_a_complete_mirror_is_intact_with_no_token_and_no_network(
 
     assert result.exit_code == 0, result.output
     assert result.stdout == (
-        f'Verifying 6 files ({TOTAL}) in {dest}\n' + _intact_lines(dest, 6) + f'Manifest: {manifest_path()}\n'
+        f'Verifying 6 files ({TOTAL}) in {dest}\n'
+        + _intact_lines(dest, 6)
+        + f'Manifest: {manifest_path()}\n'
+        + f'Log: {log_path()}\n'
     )
     assert result.stderr == ''
     assert len(disk.requests) == earlier
@@ -203,6 +206,7 @@ def test_each_kind_of_damage_is_reported_and_recorded_and_a_link_is_never_follow
         f'Modified: 2\n  {CYRILLIC}: {linked_reason}\n  {EDITED}: {edited_reason}\n'
         f'Corrupt: 1\n  {CORRUPT}: {corrupt_reason}\n'
         f'Manifest: {manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert result.stderr == 'Error: 4 problems found; see the lists above.\n'
     assert _findings() == [
@@ -327,6 +331,7 @@ def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_
         _intact_lines(dest, 5, corrupt=1)
         + f'Corrupt: 1\n  {CORRUPT}: {finding}; repair quarantined: {quarantine_reason}; kept at {copy}\n'
         + f'Manifest: {manifest_path()}\n'
+        + f'Log: {log_path()}\n'
     ) in again.stdout
     assert 'Quarantined:' not in again.stdout
     assert again.stderr == 'Error: 1 problem found; see the list above.\n'
@@ -477,7 +482,7 @@ def test_a_destination_that_is_not_a_recorded_mirror_folder_is_a_usage_error_and
 
     dest.mkdir()
     no_manifest = _verify(str(dest))
-    created = manifest_path().parent.exists()
+    created = manifest_path().exists()
     assert runner.invoke(app, ['scan']).exit_code == 0
     unrecorded = _verify(str(dest))
 

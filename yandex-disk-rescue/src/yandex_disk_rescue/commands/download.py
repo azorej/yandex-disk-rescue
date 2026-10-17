@@ -5,12 +5,13 @@ found broken, and summarize the run."""
 import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from yandex_disk_rescue import api, auth, paths, settings
+from yandex_disk_rescue import api, auth, console, paths, settings
 from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ScanTime
@@ -79,49 +80,73 @@ def download(
     api_timeout: settings.ApiTimeout = settings.API_TIMEOUT.default,
     api_retries: settings.ApiRetries = settings.API_RETRIES.default,
     api_url: settings.ApiUrl = settings.API_URL.default,
+    verbose: console.Verbose = False,
+    quiet: console.Quiet = False,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
     skipped on a rerun, or with --retry-failed only the failed, quarantined, unfinished and broken ones."""
+    options = console.output_options(verbose=verbose, quiet=quiet)
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
     partial_folder = check_partial_dir(partial_dir, destination)
-    token = auth.get_token()
     limits = settings.api_limits(
         interval_ms=api_interval_ms, concurrency=api_concurrency, timeout=api_timeout, retries=api_retries
     )
-    manifest_path = paths.manifest_path()
-    try:
-        report = asyncio.run(
-            _run(
-                token,
-                root,
-                destination,
-                partial_dir=partial_folder,
-                base_url=api_url,
-                limits=limits,
-                scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
-                retry_failed=retry_failed,
-                transfers=_Transfers(
-                    timeout=download_timeout,
-                    retries=download_retries,
-                    passes=download_passes,
-                    connections=download_connections,
-                    checkpoint_mib=download_checkpoint_mib,
-                    segments=download_segments,
-                    segment_threshold_mib=download_segment_threshold_mib,
-                ),
-                manifest_path=manifest_path,
+    transfers = _Transfers(
+        timeout=download_timeout,
+        retries=download_retries,
+        passes=download_passes,
+        connections=download_connections,
+        checkpoint_mib=download_checkpoint_mib,
+        segments=download_segments,
+        segment_threshold_mib=download_segment_threshold_mib,
+    )
+    details = {
+        'remote_path': root,
+        'dest': destination,
+        'no_scan': no_scan,
+        'retry_failed': retry_failed,
+        'scan_max_age': scan_max_age,
+        'download_timeout': download_timeout,
+        'download_retries': download_retries,
+        'download_passes': download_passes,
+        'download_connections': download_connections,
+        'download_checkpoint_mib': download_checkpoint_mib,
+        'download_segments': download_segments,
+        'download_segment_threshold_mib': download_segment_threshold_mib,
+        'api_interval_ms': api_interval_ms,
+        'api_concurrency': api_concurrency,
+        'api_timeout': api_timeout,
+        'api_retries': api_retries,
+        'api_url': api_url,
+    }
+    with console.command_output('download', options, details=details) as output:
+        token = auth.get_token()
+        manifest_path = paths.manifest_path()
+        try:
+            report = asyncio.run(
+                _run(
+                    token,
+                    root,
+                    destination,
+                    output,
+                    partial_dir=partial_folder,
+                    base_url=api_url,
+                    limits=limits,
+                    scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
+                    retry_failed=retry_failed,
+                    transfers=transfers,
+                    manifest_path=manifest_path,
+                )
             )
-        )
-    except KeyboardInterrupt:
-        typer.echo('Interrupted; rerun to continue the download.', err=True)
-        raise
-    for line in mirror_summary(report):
-        typer.echo(line)
-    typer.echo(f'Manifest: {manifest_path}')
-    if report.failed or report.quarantined:
-        raise FilesNotMirroredError(len(report.failed), len(report.quarantined))
+        except KeyboardInterrupt:
+            typer.echo('Interrupted; rerun to continue the download.', err=True)
+            raise
+        output.summary(partial(mirror_summary, report))
+        output.footer(manifest_path)
+        if report.failed or report.quarantined:
+            raise FilesNotMirroredError(len(report.failed), len(report.quarantined))
 
 
 def _split_locations(locations: list[str]) -> tuple[str, str]:
@@ -187,6 +212,7 @@ async def _run(
     token: str,
     root: str,
     destination_path: Path,
+    output: console.Output,
     *,
     partial_dir: Path | None,
     base_url: str,
@@ -204,35 +230,40 @@ async def _run(
             with Destination.open(destination_path, partial_dir=partial_dir) as destination:
                 mirror = manifest.mirror(account.uid, scan_root.path, destination.path)
                 if reused is None:
-                    for line in scan_summary(await scan_tree(client, manifest, account, scan_root)):
-                        typer.echo(line)
+                    output.summary(partial(scan_summary, await scan_tree(client, manifest, account, scan_root)))
                 else:
-                    typer.echo(reused)
+                    output.line(reused)
                 run = MirrorRun(mirror, destination, retry_failed=retry_failed)
-                return await _mirror(client, run, destination, transfers, retry_failed=retry_failed)
+                return await _mirror(client, run, destination, output, transfers, retry_failed=retry_failed)
 
 
 async def _mirror(
-    client: api.DiskClient, run: MirrorRun, destination: Destination, transfers: _Transfers, *, retry_failed: bool
+    client: api.DiskClient,
+    run: MirrorRun,
+    destination: Destination,
+    output: console.Output,
+    transfers: _Transfers,
+    *,
+    retry_failed: bool,
 ) -> MirrorReport:
     files = 'file' if run.pending_files == 1 else 'files'
     size = format_size(run.pending_size)
     if retry_failed:
-        typer.echo(
+        output.line(
             f'Retrying {run.pending_files} failed, quarantined, unfinished or broken {files} ({size}) in '
             f'{destination.path}'
         )
     else:
-        typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
+        output.line(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     if (move := run.partial_move) is not None and move.downloads:
         if move.missing:
-            typer.echo(
+            output.line(
                 f'The partial folder of the last run, {move.source}, is missing; its downloads in progress start '
                 'again from their first byte.'
             )
         else:
             downloads = 'download' if move.downloads == 1 else 'downloads'
-            typer.echo(
+            output.line(
                 f'Moving the confirmed bytes ({format_size(move.size)}) of {move.downloads} {downloads} in progress '
                 f'from {move.source} to {move.target}'
             )

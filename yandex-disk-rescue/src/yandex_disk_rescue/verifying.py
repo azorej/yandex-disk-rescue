@@ -47,7 +47,7 @@ from yandex_disk_rescue.mirroring import (
     size_mismatch,
     unencodable_reason,
 )
-from yandex_disk_rescue.scanning import display_path, listed
+from yandex_disk_rescue.scanning import SHOWN_PATHS, display_path, listed
 
 # The longest a pass keeps its cursor uncommitted while files are checked: a killed pass reads again at most the files
 # checked in this time, and the one in flight.
@@ -182,9 +182,9 @@ class VerifyRun:
             self._mirror.clear_finding(entry.entry_id)
 
 
-def verify_summary(report: VerifyReport) -> list[str]:
+def verify_summary(report: VerifyReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a check: the counts, the files checked by size only, then each kind of problem with its
-    reasons."""
+    reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
         f'Verified {report.destination} ({report.remote_root}): {report.intact} intact, {len(report.missing)} missing, '
         f'{len(report.modified)} modified, {len(report.corrupt)} corrupt, {len(report.quarantined)} quarantined, '
@@ -192,18 +192,20 @@ def verify_summary(report: VerifyReport) -> list[str]:
     ]
     if report.size_only:
         lines.append(f'Checked by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', report.size_only, len(report.size_only), '')
+        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
     for title, problems in (('Missing', report.missing), ('Modified', report.modified), ('Corrupt', report.corrupt)):
-        lines += _problem_lines(title, [f'{problem.path}: {problem.reason}' for problem in problems])
-    lines += _problem_lines('Quarantined', [f'{q.path}: {q.reason}; kept at {q.copy}' for q in report.quarantined])
+        lines += _problem_lines(title, [f'{problem.path}: {problem.reason}' for problem in problems], limit)
     lines += _problem_lines(
-        'Not downloaded', [f'{problem.path}: {problem.reason}' for problem in report.not_downloaded]
+        'Quarantined', [f'{q.path}: {q.reason}; kept at {q.copy}' for q in report.quarantined], limit
+    )
+    lines += _problem_lines(
+        'Not downloaded', [f'{problem.path}: {problem.reason}' for problem in report.not_downloaded], limit
     )
     return lines
 
 
-def _problem_lines(title: str, shown: list[str]) -> list[str]:
-    return [f'{title}: {len(shown)}', *listed('', shown, len(shown), '')] if shown else []
+def _problem_lines(title: str, shown: list[str], limit: int | None) -> list[str]:
+    return [f'{title}: {len(shown)}', *listed('', shown, len(shown), '', limit=limit)] if shown else []
 
 
 def _finding(entry: MirrorEntry, destination: ReadOnlyDestination) -> Finding | None:
