@@ -282,6 +282,38 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
     assert _findings() == []
 
 
+def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_finding_with_the_repair(disk, dest):
+    assert run_download(str(dest)).exit_code == 0
+    local = _flip_keeping_mtime(local_file(dest, CORRUPT), 10)
+    assert _verify(str(dest)).exit_code == 1
+    finding = _md5_mismatch(FILES[CORRUPT], local)
+    assert _findings() == [(CORRUPT, 'corrupt', finding)]
+    disk.corrupt(CORRUPT, offset=0)
+    _, quarantine_reason = corrupted_bytes(FILES[CORRUPT], 0)
+
+    repair = run_download('--retry-failed', str(dest))
+
+    assert repair.exit_code == 1, repair.output
+    assert '0 downloaded (0 B), 0 skipped, 1 quarantined, 0 failed\n' in repair.stdout
+    assert local_file(dest, CORRUPT).read_bytes() == local
+    assert _findings() == [(CORRUPT, 'corrupt', finding)]
+
+    again = _verify(str(dest))
+
+    assert again.exit_code == 1, again.output
+    assert (
+        _intact_lines(dest, 5, corrupt=1)
+        + f'Corrupt: 1\n  {CORRUPT}: {finding}; repair quarantined: {quarantine_reason}\n'
+        + f'Manifest: {manifest_path()}\n'
+    ) in again.stdout
+    assert 'Quarantined:' not in again.stdout
+    assert again.stderr == 'Error: 1 problem found; see the list above.\n'
+
+
+def _md5_mismatch(expected: bytes, got: bytes) -> str:
+    return f'MD5 mismatch (expected {_md5(expected)}, got {_md5(got)})'
+
+
 def _snapshot(root) -> dict[str, tuple]:
     """Every path below `root` and `root` itself, with its kind, size, mode, inode, mtime, ctime and content (a link's
     target), never following a link; not the access time, which reads may change."""

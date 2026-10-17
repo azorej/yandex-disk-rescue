@@ -9,8 +9,9 @@ its size, then every checksum the record has; a match is *intact*. Each finding 
 as it is made, an intact file drops its earlier finding, and `download` fetches again every file with a finding.
 
 Any other file is reported without being read: under its finding when it has one (the copy `verify` found is still at
-its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. Paths
-with no manifest entry are never opened, listed or reported.
+its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. A file
+listed under its finding whose quarantine record is for its current identity has its repair quarantined, and its line
+says so with the quarantine reason. Paths with no manifest entry are never opened, listed or reported.
 
 A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C, a
 kill or an unreadable destination continues where its committed cursor stands, and its report covers the whole pass.
@@ -89,9 +90,13 @@ class VerifyReport:
     def lists_with_problems(self) -> int:
         return sum(1 for problems in self._lists() if problems)
 
-    def add(self, path: str, finding: Finding) -> None:
+    def add(self, entry: MirrorEntry, finding: Finding) -> None:
+        """List `entry` under `finding`, with the reason its current quarantine record holds, if any."""
+        reason = finding.reason
+        if is_held(entry):
+            reason = f'{reason}; repair quarantined: {held_copy(entry, None).reason}'
         {'missing': self.missing, 'modified': self.modified, 'corrupt': self.corrupt}[finding.kind].append(
-            Problem(path, finding.reason)
+            Problem(entry.resource.path, reason)
         )
 
     def _lists(self) -> tuple[list[Problem] | list[QuarantinedFile], ...]:
@@ -150,7 +155,7 @@ class VerifyRun:
             if time.monotonic() - self._committed_at >= CURSOR_SECONDS:
                 self._commit_cursor()
         elif entry.finding is not None:
-            report.add(entry.resource.path, entry.finding)
+            report.add(entry, entry.finding)
         elif entry.entry_id in self._verified:
             _count_intact(entry, report)
         elif is_held(entry):
@@ -168,7 +173,7 @@ class VerifyRun:
         finding = _finding(entry, self._destination)
         if finding is not None:
             self._mirror.record_finding(entry.entry_id, finding)
-            report.add(entry.resource.path, finding)
+            report.add(entry, finding)
             return
         _count_intact(entry, report)
         if entry.finding is not None:

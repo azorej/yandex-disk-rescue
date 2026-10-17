@@ -334,11 +334,12 @@ ending with `; last retry: <reason>`.
 files with a failure record, a quarantine record, a download that started
 and never finished (for example one stopped by Ctrl+C) or a
 [`verify`](#verifying-a-mirror) finding (missing, modified or corrupt), and
-the folders with a failure record. Files never started are not in it; a plain `download` gets them. The
-scan step runs as usual; the retry set is fixed once it is done. The run then
-visits only the retry set and the folders above its members, in path order,
-with the usual passes and rules, and never looks at any other path of DEST:
-those files are neither checked nor counted. It starts with
+the folders with a failure record. Files never started are not in it; a
+plain `download` gets them. The scan step runs as usual; the retry set is
+fixed once it is done. The run then visits only the retry set and the
+folders above its members, in path order, with the usual passes and rules,
+and never looks at any other path of DEST: those files are neither checked
+nor counted. It starts with
 
 ```
 Retrying 3 failed, quarantined, unfinished or broken files (1.5 GiB) in /mnt/backup
@@ -346,10 +347,9 @@ Retrying 3 failed, quarantined, unfinished or broken files (1.5 GiB) in /mnt/bac
 
 in place of `Downloading …`, and its summary and exit code are those of a
 normal run over the retry set. With nothing to retry it prints `Retrying 0
-failed, quarantined, unfinished or broken files (0 B)`, downloads nothing and exits
-`0`. Entries
-whose names are not valid Unicode have no record; they fail every run,
-`--retry-failed` included.
+failed, quarantined, unfinished or broken files (0 B)`, downloads nothing
+and exits `0`. Entries whose names are not valid Unicode have no record;
+they fail every run, `--retry-failed` included.
 
 **Summary.**
 
@@ -537,17 +537,23 @@ Each file of the mirror, as of the last scan, is one of:
   be read (`could not read <path>: <reason>`).
 - **Quarantined:** its last download [failed the check](#downloading) and is
   kept in `quarantine/`; listed with the reason and the copy's path.
+
+A file with a finding (missing, modified or corrupt) is listed under its
+finding even when a later download of it was quarantined: the finding
+describes the copy at its path, and the line ends with `; repair
+quarantined: <quarantine reason>`.
 - **Not downloaded:** no verified copy of the current Disk version: never
   downloaded, failed (with the reason), unfinished, changed on the Disk since
   it was downloaded, or a name that is not valid Unicode.
 
 Only files with a verified copy of their current Disk version are read; the
-others are listed from the manifest. A file found missing, modified or corrupt is recorded
-in the manifest at once, and the next `download` (a plain one, `--no-scan`
-or `--retry-failed`) downloads it again without reading the bad copy and moves that copy
-aside to `replaced/`. A file `verify` finds intact again drops its finding.
-Paths of DEST with no Disk counterpart (local-only files, `.DS_Store`, …) are
-never opened, listed or reported, and folders are not checked.
+others are listed from the manifest. A file found missing, modified or
+corrupt is recorded in the manifest at once, and the next `download` (a
+plain one, `--no-scan` or `--retry-failed`) downloads it again without
+reading the bad copy and moves that copy aside to `replaced/`. A file
+`verify` finds intact again drops its finding. Paths of DEST with no Disk
+counterpart (local-only files, `.DS_Store`, …) are never opened, listed or
+reported, and folders are not checked.
 
 A read error usually means that one file is damaged, and the file is reported
 as corrupt. When DEST itself cannot be read any more, such as a disk unplugged

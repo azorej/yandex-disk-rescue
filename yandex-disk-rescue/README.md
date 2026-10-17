@@ -140,14 +140,16 @@ yandex-disk-rescue/
 │   │                 #   checkpoints, immediate retries after new data and one link refresh per pass, the
 │   │                 #   fallback to one stream when the host ignores a range;
 │   │                 #   verify, by reading a segmented file back, quarantining a file that fails; move aside
-│   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or file name the destination
-│   │                 #   refuses, later passes over transiently failed files, failure records written as
-│   │                 #   entries fail and dropped as they succeed, the summary lines; disk work
-│   │                 #   (hashing, writes, preallocation, fsync, placement) runs in the run's worker threads,
-│   │                 #   one bounded call at a time, while the manifest and local names stay on the event loop
+│   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
+│   │                 #   file name the destination refuses, later passes over transiently failed files,
+│   │                 #   failure records written as entries fail and dropped as they succeed, the summary
+│   │                 #   lines; disk work (hashing, writes, preallocation, fsync, placement) runs in the
+│   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
+│   │                 #   stay on the event loop
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
 │   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each
-│   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded);
+│   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded;
+│   │                 #   a finding with a quarantined repair stays under its finding, with the repair);
 │   │                 #   stopping when the destination itself becomes unreadable; the pass's cursor, committed
 │   │                 #   every `CURSOR_SECONDS` and when it stops, so a later part reads only the files after
 │   │                 #   it while the report covers the whole pass; the summary lines
