@@ -2,12 +2,23 @@
 
 import json
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from types import TracebackType
 from typing import Self
 
 import httpx
+from tenacity import (
+    AsyncRetrying,
+    RetryCallState,
+    RetryError,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 from yandex_disk_rescue.api.errors import DiskApiError, NotAFolderError, RemotePathNotFoundError, TokenRejectedError
+from yandex_disk_rescue.api.limiter import AdaptiveLimiter, parse_retry_after
 from yandex_disk_rescue.api.models import Account, MalformedBodyError, Resource, parse_account, parse_folder_page
 from yandex_disk_rescue.api.remote_paths import normalize_remote_path
 from yandex_disk_rescue.auth import validate_token
@@ -26,20 +37,49 @@ _LISTING_FIELDS = ','.join(
 )
 
 
+@dataclass(frozen=True)
+class ApiLimits:
+    """Pacing, timeout and retry policy of one `DiskClient`; `interval`, `timeout` and the backoff are seconds."""
+
+    interval: float
+    concurrency: int
+    timeout: float
+    retries: int
+    backoff_initial: float = 0.5
+    backoff_max: float = 30.0
+
+
+class _TransientFailure(Exception):
+    """One attempt failed in a way worth retrying; `message` is the user-facing text for it."""
+
+    def __init__(self, message: str, *, retry_after: float | None) -> None:
+        super().__init__(message)
+        self.message = message
+        self.retry_after = retry_after
+
+
 class DiskClient:
     """An async context manager that owns one `httpx.AsyncClient` authorized with the token.
 
     The token is checked for header safety on construction, before any request (`InvalidTokenError`).
-    Every request maps 401/403 to `TokenRejectedError` and other failures to `DiskApiError` whose
-    message never includes the request headers or the token.
+    Every request goes through one `AdaptiveLimiter`; transport errors and throttling responses (429, 408,
+    5xx) are retried up to `limits.retries` times, waiting `Retry-After` or an exponential backoff with
+    jitter. Every request maps 401/403 to `TokenRejectedError` and other failures to `DiskApiError` whose
+    message never includes the request headers or the token, and ends with ` (after N attempts)` when
+    more than one attempt was made.
     """
 
-    def __init__(self, token: str, *, base_url: str, timeout: float) -> None:
+    def __init__(self, token: str, *, base_url: str, limits: ApiLimits) -> None:
         self._base_url = base_url
+        self._limits = limits
+        self._limiter = AdaptiveLimiter(interval=limits.interval, concurrency=limits.concurrency)
+        self._backoff = wait_exponential_jitter(
+            initial=limits.backoff_initial, max=limits.backoff_max, jitter=limits.backoff_initial
+        )
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip('/'),
             headers={'Authorization': f'OAuth {validate_token(token)}'},
-            timeout=timeout,
+            timeout=limits.timeout,
         )
 
     async def __aenter__(self) -> Self:
@@ -90,11 +130,42 @@ class DiskClient:
                 )
 
     async def _get(self, api_path: str, params: dict[str, str | int], *, context: str | None) -> httpx.Response:
+        retrying = AsyncRetrying(
+            stop=stop_after_attempt(self._limits.retries + 1),
+            wait=self._wait,
+            retry=retry_if_exception_type(_TransientFailure),
+        )
         try:
-            return await self._http.get(api_path, params=params)
-        except httpx.TransportError as exc:
-            message = f'Could not reach the Yandex Disk API at {self._base_url}: {_transport_failure(exc)}'
+            return await retrying(self._attempt, api_path, params)
+        except RetryError as exc:
+            failure = exc.last_attempt.exception()
+            if not isinstance(failure, _TransientFailure):
+                raise
+            attempts = exc.last_attempt.attempt_number
+            message = failure.message if attempts == 1 else f'{failure.message} (after {attempts} attempts)'
             raise DiskApiError(_in_context(message, context)) from None
+
+    async def _attempt(self, api_path: str, params: dict[str, str | int]) -> httpx.Response:
+        async with self._limiter.slot():
+            try:
+                response = await self._http.get(api_path, params=params)
+            except httpx.TransportError as exc:
+                reason = _transport_failure(exc, timeout=self._limits.timeout)
+                raise _TransientFailure(
+                    f'Could not reach the Yandex Disk API at {self._base_url}: {reason}', retry_after=None
+                ) from None
+        if not _is_throttling(response.status_code):
+            self._limiter.succeeded()
+            return response
+        retry_after = parse_retry_after(response.headers.get('Retry-After'), now=datetime.now(UTC))
+        self._limiter.throttled(retry_after)
+        raise _TransientFailure(_status_failure(response), retry_after=retry_after)
+
+    def _wait(self, state: RetryCallState) -> float:
+        failure = state.outcome.exception() if state.outcome else None
+        if isinstance(failure, _TransientFailure) and failure.retry_after is not None:
+            return failure.retry_after
+        return self._backoff(state)
 
     @staticmethod
     def _raise_for_status(response: httpx.Response, *, context: str | None) -> None:
@@ -109,20 +180,28 @@ class DiskClient:
                 "permissions. Run 'yandex-disk-rescue auth login' to store a token with Disk access."
             )
         if not response.is_success:
-            message = f'Yandex Disk API returned HTTP {response.status_code}: {_error_description(response)}'
-            raise DiskApiError(_in_context(message, context))
+            raise DiskApiError(_in_context(_status_failure(response), context))
 
 
-def _transport_failure(exc: httpx.TransportError) -> str:
+def _is_throttling(status: int) -> bool:
+    return status in (httpx.codes.TOO_MANY_REQUESTS, httpx.codes.REQUEST_TIMEOUT) or 500 <= status <= 599
+
+
+def _status_failure(response: httpx.Response) -> str:
+    return f'Yandex Disk API returned HTTP {response.status_code}: {_error_description(response)}'
+
+
+def _transport_failure(exc: httpx.TransportError, *, timeout: float) -> str:
     """Describe a transport error without echoing the request, whose headers carry the token.
 
     Only errors raised by the connection, the server or the URL scheme keep their text; anything else
-    (such as httpx refusing to build the request) is reported by its type alone.
+    (such as httpx refusing to build the request) is reported by its type alone. Timeouts get their own
+    text because httpx raises them with an empty message.
     """
-    if isinstance(
-        exc, httpx.NetworkError | httpx.TimeoutException | httpx.RemoteProtocolError | httpx.UnsupportedProtocol
-    ):
-        return str(exc)
+    if isinstance(exc, httpx.TimeoutException):
+        return f'the request timed out after {timeout:g} s ({type(exc).__name__})'
+    if isinstance(exc, httpx.NetworkError | httpx.RemoteProtocolError | httpx.UnsupportedProtocol):
+        return str(exc) or type(exc).__name__
     return f'the request could not be sent ({type(exc).__name__})'
 
 

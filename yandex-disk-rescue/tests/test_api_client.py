@@ -1,12 +1,13 @@
 """Tests for `DiskClient` against the fake Disk API server."""
 
-import socket
+import dataclasses
+import itertools
 from datetime import UTC, datetime, timedelta, timezone
 
 import anyio
 import pytest
-from fake_disk_server import Delay
-from yandex_disk_rescue import api, auth
+from fake_disk_server import Delay, FakeResponse
+from yandex_disk_rescue import api
 
 pytestmark = pytest.mark.anyio
 
@@ -18,21 +19,17 @@ def anyio_backend() -> str:
     return 'asyncio'
 
 
-def _client(fake_disk_api, token: str = TOKEN) -> api.DiskClient:
-    return api.DiskClient(token, base_url=fake_disk_api.base_url, timeout=auth.API_TIMEOUT_SECONDS)
+# The production policy with intervals and backoff shrunk so retries cost milliseconds.
+FAST = api.ApiLimits(interval=0.001, concurrency=7, timeout=5, retries=5, backoff_initial=0.001, backoff_max=0.01)
 
 
-async def _list(fake_disk_api, path: str) -> list[api.Resource]:
-    async with _client(fake_disk_api) as client:
+def _client(fake_disk_api, token: str = TOKEN, **limits: float) -> api.DiskClient:
+    return api.DiskClient(token, base_url=fake_disk_api.base_url, limits=dataclasses.replace(FAST, **limits))
+
+
+async def _list(fake_disk_api, path: str, **limits: float) -> list[api.Resource]:
+    async with _client(fake_disk_api, **limits) as client:
         return [resource async for resource in client.list_folder(path)]
-
-
-@pytest.fixture
-def closed_port_url() -> str:
-    with socket.socket() as probe:
-        probe.bind(('127.0.0.1', 0))
-        port = probe.getsockname()[1]
-    return f'http://127.0.0.1:{port}'
 
 
 def _listing_requests(fake_disk_api) -> list[dict[str, str]]:
@@ -120,9 +117,9 @@ async def test_list_folder_reports_a_status_error_with_the_path(fake_disk_api):
     fake_disk_api.add_dir('disk:/B')
     fake_disk_api.inject('GET', '/v1/disk/resources', 503, where={'path': 'disk:/A'})
 
-    assert await _list(fake_disk_api, 'disk:/B') == []
+    assert await _list(fake_disk_api, 'disk:/B', retries=0) == []
     with pytest.raises(api.DiskApiError) as excinfo:
-        await _list(fake_disk_api, 'disk:/A')
+        await _list(fake_disk_api, 'disk:/A', retries=0)
     assert str(excinfo.value) == 'Could not list disk:/A: Yandex Disk API returned HTTP 503: Injected HTTP 503'
     assert await _list(fake_disk_api, 'disk:/A') == []
 
@@ -164,17 +161,109 @@ async def test_list_folder_rejects_an_unexpected_body(fake_disk_api, body, reaso
     )
 
 
-async def test_list_folder_reports_an_unreachable_api_with_the_path(closed_port_url):
-    client = api.DiskClient(TOKEN, base_url=closed_port_url, timeout=auth.API_TIMEOUT_SECONDS)
+@pytest.mark.parametrize(('retries', 'suffix'), [(0, ''), (2, ' (after 3 attempts)')])
+async def test_list_folder_reports_an_unreachable_api_with_the_path(closed_port_url, retries, suffix):
+    client = api.DiskClient(TOKEN, base_url=closed_port_url, limits=dataclasses.replace(FAST, retries=retries))
 
     with pytest.raises(api.DiskApiError) as excinfo:
         async with client:
             [resource async for resource in client.list_folder('disk:/A')]
 
-    assert str(excinfo.value).startswith(
-        f'Could not list disk:/A: Could not reach the Yandex Disk API at {closed_port_url}: '
+    message = str(excinfo.value)
+    assert message.startswith(f'Could not list disk:/A: Could not reach the Yandex Disk API at {closed_port_url}: ')
+    assert message.endswith(suffix)
+    assert ('attempts)' in message) == bool(suffix)
+    assert TOKEN not in message
+
+
+def _starts(fake_disk_api) -> list[float]:
+    return [r.started for r in fake_disk_api.requests]
+
+
+async def test_a_retry_after_pauses_the_next_request_and_the_listing_succeeds(fake_disk_api):
+    fake_disk_api.add_file('disk:/A/x.txt', b'x')
+    fake_disk_api.inject('GET', '/v1/disk/resources', FakeResponse.error(429, {'Retry-After': '1'}))
+
+    resources = await _list(fake_disk_api, 'disk:/A')
+
+    assert [r.path for r in resources] == ['disk:/A/x.txt']
+    first, second = _starts(fake_disk_api)
+    assert second - first >= 0.95
+
+
+async def test_throttling_statuses_are_retried_until_the_listing_succeeds(fake_disk_api):
+    fake_disk_api.add_file('disk:/A/x.txt', b'x')
+    fake_disk_api.inject('GET', '/v1/disk/resources', 503, 503, 503)
+
+    assert [r.path for r in await _list(fake_disk_api, 'disk:/A', retries=3)] == ['disk:/A/x.txt']
+    assert len(fake_disk_api.requests) == 4
+
+
+@pytest.mark.parametrize('status', [503, 500, 429, 408])
+async def test_retries_run_out_with_the_last_failure_and_the_attempt_count(fake_disk_api, status):
+    fake_disk_api.add_dir('disk:/A')
+    fake_disk_api.inject('GET', '/v1/disk/resources', status, status, status, status)
+
+    with pytest.raises(api.DiskApiError) as excinfo:
+        await _list(fake_disk_api, 'disk:/A', retries=2)
+
+    assert str(excinfo.value) == (
+        f'Could not list disk:/A: Yandex Disk API returned HTTP {status}: Injected HTTP {status} (after 3 attempts)'
     )
-    assert TOKEN not in str(excinfo.value)
+    assert len(fake_disk_api.requests) == 3
+
+
+@pytest.mark.parametrize('status', [400, 401, 403, 404, 409])
+async def test_other_client_errors_are_not_retried(fake_disk_api, status):
+    fake_disk_api.add_dir('disk:/A')
+    fake_disk_api.inject('GET', '/v1/disk/resources', status)
+
+    with pytest.raises((api.DiskApiError, api.TokenRejectedError, api.RemotePathNotFoundError)) as excinfo:
+        await _list(fake_disk_api, 'disk:/A')
+
+    assert 'attempts' not in str(excinfo.value)
+    assert len(fake_disk_api.requests) == 1
+
+
+async def test_a_timed_out_request_is_retried(fake_disk_api):
+    fake_disk_api.add_file('disk:/A/x.txt', b'x')
+    fake_disk_api.inject('GET', '/v1/disk/resources', Delay(0.6))
+
+    assert [r.path for r in await _list(fake_disk_api, 'disk:/A', timeout=0.2)] == ['disk:/A/x.txt']
+    assert len(fake_disk_api.requests) == 2
+
+
+async def test_a_request_that_always_times_out_names_the_timeout(fake_disk_api):
+    fake_disk_api.add_dir('disk:/A')
+    fake_disk_api.inject('GET', '/v1/disk/resources', Delay(0.6), Delay(0.6), Delay(0.6))
+
+    with pytest.raises(api.DiskApiError) as excinfo:
+        await _list(fake_disk_api, 'disk:/A', timeout=0.2, retries=2)
+
+    assert str(excinfo.value) == (
+        f'Could not list disk:/A: Could not reach the Yandex Disk API at {fake_disk_api.base_url}: '
+        'the request timed out after 0.2 s (ReadTimeout) (after 3 attempts)'
+    )
+
+
+async def test_concurrent_requests_share_one_pace_and_one_concurrency_cap(fake_disk_api):
+    folders = [f'disk:/F{index:02}' for index in range(20)]
+    for folder in folders:
+        fake_disk_api.add_dir(folder)
+        fake_disk_api.inject('GET', '/v1/disk/resources', Delay(0.5), where={'path': folder})
+
+    async with _client(fake_disk_api, interval=0.05, concurrency=7) as client, anyio.create_task_group() as group:
+        for folder in folders:
+            group.start_soon(_drain, client, folder)
+
+    starts = sorted(_starts(fake_disk_api))
+    assert len(starts) == 20
+    assert min(later - earlier for earlier, later in itertools.pairwise(starts)) >= 0.04
+    assert fake_disk_api.peak_in_flight == 7
+
+
+async def _drain(client: api.DiskClient, folder: str) -> None:
+    assert [resource async for resource in client.list_folder(folder)] == []
 
 
 async def test_account_returns_the_uid_and_login(fake_disk_api):

@@ -12,11 +12,6 @@ from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.paths import config_dir
 
 TOKEN_ENV_VAR = 'YANDEX_DISK_RESCUE_TOKEN'
-API_URL_ENV_VAR = 'YANDEX_DISK_RESCUE_API_URL'
-DEFAULT_API_URL = 'https://cloud-api.yandex.net'
-API_TIMEOUT_SECONDS = 30.0
-CLIENT_ID_ENV_VAR = 'YANDEX_DISK_RESCUE_CLIENT_ID'
-DEFAULT_CLIENT_ID = '9e2a0382c430429c9d57913b61d7d48f'
 REQUESTED_SCOPES = ('cloud_api:disk.read', 'cloud_api:disk.info')
 AUTHORIZE_ENDPOINT = 'https://oauth.yandex.ru/authorize'
 
@@ -194,10 +189,6 @@ def delete_token() -> bool:
     except FileNotFoundError:
         return False
     return True
-
-
-def api_base_url() -> str:
-    return os.environ.get(API_URL_ENV_VAR) or DEFAULT_API_URL
 
 
 def _fsync_dir(directory: Path) -> None:

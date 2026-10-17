@@ -39,7 +39,8 @@ yandex-disk-rescue auth login
 It prints a Yandex ID URL on stderr. Open it in a browser, sign in and allow
 access; Yandex then shows a token. Paste it at the hidden `Paste the token`
 prompt (the whole address-bar URL containing `access_token=` works too). The
-token is checked with one request to the Disk API and saved only if Yandex
+token is checked with a request to the Disk API, paced and retried as
+described in [Rate limiting](#rate-limiting), and saved only if Yandex
 accepts it:
 
 ```
@@ -91,8 +92,8 @@ The token is never accepted as a command-line argument (it would show in
 `ps` and shell history), and the tool never prints it.
 
 `yandex-disk-rescue auth status` shows where the token comes from, the Yandex
-login it belongs to and the Disk usage, after checking it with one request to
-the Disk API:
+login it belongs to and the Disk usage, after checking it with a request to
+the Disk API (paced and retried as described in [Rate limiting](#rate-limiting)):
 
 ```
 Token: file /home/user/.config/yandex-disk-rescue/token
@@ -112,6 +113,34 @@ when there is no file, and warns if `YANDEX_DISK_RESCUE_TOKEN` still provides
 a token. Deleting the file does not revoke the token at Yandex (that needs a
 client secret the tool does not have): revoke the app's access in Yandex ID
 at <https://id.yandex.com/personal/data-access>.
+
+## Rate limiting
+
+Every Disk API request of a command goes through one shared limiter:
+
+- Request starts are at least the current interval apart (base:
+  `--api-interval-ms`, default 50, 25 to 1000), and at most
+  `--api-concurrency` requests (default 7, 1 to 30) are in flight.
+- A throttling response is `429`, `408` or any `5xx`. Each one doubles the
+  current interval, up to 2 s or 8 times the base, whichever is larger.
+  Every 10 consecutive successful responses halve it again, never below the
+  base.
+- When a throttling response carries `Retry-After` (seconds or an HTTP
+  date), every request start pauses until then, for at most 300 s.
+
+A request that fails with a transport error (including a timeout,
+`--api-timeout`, default 30 s, 1 to 300) or a throttling response is retried
+up to `--api-retries` times (default 5, 0 to 20). Each retry waits
+`Retry-After` when the server sent one, otherwise an exponential backoff with
+jitter from 0.5 s up to 30 s. Other `4xx` responses are not retried. When
+the retries run out, the error names the last failure and ends with
+`(after N attempts)`.
+
+Each option can also be set with an environment variable named after it:
+`YANDEX_DISK_RESCUE_API_INTERVAL_MS`, `YANDEX_DISK_RESCUE_API_CONCURRENCY`,
+`YANDEX_DISK_RESCUE_API_TIMEOUT` and `YANDEX_DISK_RESCUE_API_RETRIES`; the
+option wins. A value outside its range, from either source, is a usage
+error (exit `2`).
 
 ## Quick start
 

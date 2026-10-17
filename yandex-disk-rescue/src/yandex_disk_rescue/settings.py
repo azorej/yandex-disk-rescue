@@ -1,0 +1,101 @@
+"""The registry of options: every option's name, flag, env var, default and validation.
+
+A command takes an option by annotating a parameter with the entry's `Annotated` type and defaulting it to
+the entry's `default`. Validation runs on the value from every source; a violation is a usage error (exit 2)
+naming the option and the values it accepts.
+"""
+
+import re
+import urllib.parse
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Annotated, Any
+
+import typer
+
+from yandex_disk_rescue.api import ApiLimits
+
+ENV_VAR_PREFIX = 'YANDEX_DISK_RESCUE_'
+
+
+@dataclass(frozen=True)
+class Setting[T]:
+    """One option. `name` is also its config-file key; the flag and env var are derived from it.
+
+    `check` returns why a value is invalid, phrased to follow "must", or None for a valid value.
+    """
+
+    name: str
+    default: T
+    help: str
+    check: Callable[[T], str | None]
+    hidden: bool = False
+
+    @property
+    def flag(self) -> str:
+        return '--' + self.name.replace('_', '-')
+
+    @property
+    def env_var(self) -> str:
+        return ENV_VAR_PREFIX + self.name.upper()
+
+    def typer_option(self) -> Any:
+        return typer.Option(
+            self.flag, envvar=self.env_var, callback=self._validated, help=self.help, hidden=self.hidden
+        )
+
+    def _validated(self, value: T) -> T:
+        if (reason := self.check(value)) is not None:
+            raise typer.BadParameter(reason)
+        return value
+
+
+def _in_range(low: int, high: int) -> Callable[[int], str | None]:
+    def check(value: int) -> str | None:
+        return None if low <= value <= high else f'must be an integer from {low} to {high}.'
+
+    return check
+
+
+def _http_url(value: str) -> str | None:
+    parts = urllib.parse.urlsplit(value)
+    if parts.scheme in ('http', 'https') and parts.netloc:
+        return None
+    return 'must be an http:// or https:// URL.'
+
+
+def _client_id(value: str) -> str | None:
+    if re.fullmatch(r'[0-9a-f]{32}', value):
+        return None
+    return 'must be 32 lowercase hexadecimal characters (the ClientID of a Yandex OAuth app).'
+
+
+API_INTERVAL_MS = Setting(
+    'api_interval_ms',
+    50,
+    'Minimum gap between the starts of two Disk API requests, in milliseconds.',
+    _in_range(25, 1000),
+)
+API_CONCURRENCY = Setting('api_concurrency', 7, 'Maximum number of Disk API requests in flight.', _in_range(1, 30))
+API_TIMEOUT = Setting('api_timeout', 30, 'Timeout of one Disk API request, in seconds.', _in_range(1, 300))
+API_RETRIES = Setting(
+    'api_retries', 5, 'Retries of a Disk API request after a transport error or a throttling status.', _in_range(0, 20)
+)
+API_URL = Setting('api_url', 'https://cloud-api.yandex.net', 'Base URL of the Disk REST API.', _http_url, hidden=True)
+CLIENT_ID = Setting(
+    'client_id',
+    '9e2a0382c430429c9d57913b61d7d48f',
+    'ClientID of the Yandex OAuth app to authorize; the default is the built-in app.',
+    _client_id,
+)
+
+ApiIntervalMs = Annotated[int, API_INTERVAL_MS.typer_option()]
+ApiConcurrency = Annotated[int, API_CONCURRENCY.typer_option()]
+ApiTimeout = Annotated[int, API_TIMEOUT.typer_option()]
+ApiRetries = Annotated[int, API_RETRIES.typer_option()]
+ApiUrl = Annotated[str, API_URL.typer_option()]
+ClientId = Annotated[str, CLIENT_ID.typer_option()]
+
+
+def api_limits(*, interval_ms: int, concurrency: int, timeout: int, retries: int) -> ApiLimits:
+    return ApiLimits(interval=interval_ms / 1000, concurrency=concurrency, timeout=timeout, retries=retries)

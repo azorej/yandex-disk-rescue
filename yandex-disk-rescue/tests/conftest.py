@@ -1,6 +1,7 @@
 """Shared fixtures for the yandex-disk-rescue tests."""
 
 import os
+import socket
 from collections.abc import Iterator
 
 import pytest
@@ -28,3 +29,12 @@ def fake_disk_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDiskApi]:
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.fixture
+def closed_port_url() -> str:
+    """The URL of a 127.0.0.1 port nothing listens on, so a connection to it is refused."""
+    with socket.socket() as probe:
+        probe.bind(('127.0.0.1', 0))
+        port = probe.getsockname()[1]
+    return f'http://127.0.0.1:{port}'

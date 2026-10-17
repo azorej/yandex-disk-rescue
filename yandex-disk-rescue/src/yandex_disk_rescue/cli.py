@@ -2,13 +2,12 @@
 
 import asyncio
 import os
-import re
 from typing import Annotated, Any
 
 import typer
 import typer.core
 
-from yandex_disk_rescue import __version__, api, auth
+from yandex_disk_rescue import __version__, api, auth, settings
 from yandex_disk_rescue.errors import RescueError
 
 
@@ -33,7 +32,6 @@ auth_app = typer.Typer(help='Manage the Yandex OAuth token.', no_args_is_help=Tr
 app.add_typer(auth_app, name='auth')
 
 REVOKE_URL = 'https://id.yandex.com/personal/data-access'
-CLIENT_ID_PATTERN = re.compile(r'[0-9a-f]{32}')
 
 
 def _print_version(value: bool) -> None:
@@ -52,22 +50,14 @@ def main(
     """Download everything from a Yandex Disk account: resumable, verified, rate-limit aware."""
 
 
-def _validate_client_id(value: str) -> str:
-    if not CLIENT_ID_PATTERN.fullmatch(value):
-        raise typer.BadParameter('must be 32 lowercase hexadecimal characters (the ClientID of a Yandex OAuth app).')
-    return value
-
-
 @auth_app.command()
 def login(
-    client_id: Annotated[
-        str,
-        typer.Option(
-            envvar=auth.CLIENT_ID_ENV_VAR,
-            callback=_validate_client_id,
-            help='ClientID of the Yandex OAuth app to authorize; the default is the built-in app.',
-        ),
-    ] = auth.DEFAULT_CLIENT_ID,
+    client_id: settings.ClientId = settings.CLIENT_ID.default,
+    api_interval_ms: settings.ApiIntervalMs = settings.API_INTERVAL_MS.default,
+    api_concurrency: settings.ApiConcurrency = settings.API_CONCURRENCY.default,
+    api_timeout: settings.ApiTimeout = settings.API_TIMEOUT.default,
+    api_retries: settings.ApiRetries = settings.API_RETRIES.default,
+    api_url: settings.ApiUrl = settings.API_URL.default,
 ) -> None:
     """Get a token in the browser, check it against the Disk API and store it."""
     typer.echo('Open this URL in a browser, sign in to Yandex and allow access:', err=True)
@@ -76,7 +66,10 @@ def login(
     typer.echo('', err=True)
     typer.echo('Yandex then shows a token. Copy it (or the whole address-bar URL) and paste it here.', err=True)
     token = auth.token_from_paste(typer.prompt('Paste the token', hide_input=True, err=True))
-    account = asyncio.run(_account_of(token))
+    limits = settings.api_limits(
+        interval_ms=api_interval_ms, concurrency=api_concurrency, timeout=api_timeout, retries=api_retries
+    )
+    account = asyncio.run(_account_of(token, base_url=api_url, limits=limits))
     path = auth.save_token(token)
     typer.echo(f'Logged in as {account.login}. Token saved to {path}.')
     if auth.TOKEN_ENV_VAR in os.environ:
@@ -97,10 +90,19 @@ def logout() -> None:
 
 
 @auth_app.command()
-def status() -> None:
+def status(
+    api_interval_ms: settings.ApiIntervalMs = settings.API_INTERVAL_MS.default,
+    api_concurrency: settings.ApiConcurrency = settings.API_CONCURRENCY.default,
+    api_timeout: settings.ApiTimeout = settings.API_TIMEOUT.default,
+    api_retries: settings.ApiRetries = settings.API_RETRIES.default,
+    api_url: settings.ApiUrl = settings.API_URL.default,
+) -> None:
     """Show where the token comes from and the Yandex account it belongs to."""
     token = auth.resolve_token()
-    account = asyncio.run(_account_of(token.value))
+    limits = settings.api_limits(
+        interval_ms=api_interval_ms, concurrency=api_concurrency, timeout=api_timeout, retries=api_retries
+    )
+    account = asyncio.run(_account_of(token.value, base_url=api_url, limits=limits))
     if token.source is auth.TokenSource.ENV:
         typer.echo(f'Token: environment variable {auth.TOKEN_ENV_VAR}')
     else:
@@ -112,8 +114,8 @@ def status() -> None:
     typer.echo(usage)
 
 
-async def _account_of(token: str) -> api.Account:
-    async with api.DiskClient(token, base_url=auth.api_base_url(), timeout=auth.API_TIMEOUT_SECONDS) as client:
+async def _account_of(token: str, *, base_url: str, limits: api.ApiLimits) -> api.Account:
+    async with api.DiskClient(token, base_url=base_url, limits=limits) as client:
         return await client.account()
 
 
