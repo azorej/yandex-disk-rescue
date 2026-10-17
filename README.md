@@ -4,10 +4,10 @@ A Linux command-line tool that downloads everything from a Yandex Disk
 account to local storage. It is a headless analogue of the Windows app
 [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
-> **Status: early development.** The CLI skeleton exists
-> (`yandex-disk-rescue --help`, `--version`) with OAuth token handling under
-> `yandex-disk-rescue auth`. Download features are being built. Planned work
-> is tracked in GitHub issues.
+> **Status: early development.** OAuth token handling
+> (`yandex-disk-rescue auth`) and scanning the remote tree into a local
+> manifest (`yandex-disk-rescue scan`) work. Downloads are being built.
+> Planned work is tracked in GitHub issues.
 
 ## Goals
 
@@ -103,8 +103,7 @@ Disk usage: 1.5 GiB of 10.0 GiB used (15.0%)
 
 It exits `0` when Yandex accepts the token and `1` otherwise (no token, a
 malformed or unreadable token, a token Yandex rejects, an unreachable API or an unexpected response), with an
-`Error: ...` line on stderr. Every command reports such failures the same
-way; usage errors exit `2`.
+`Error: ...` line on stderr (see [Exit codes](#exit-codes)).
 
 ### Logging out
 
@@ -113,6 +112,56 @@ when there is no file, and warns if `YANDEX_DISK_RESCUE_TOKEN` still provides
 a token. Deleting the file does not revoke the token at Yandex (that needs a
 client secret the tool does not have): revoke the app's access in Yandex ID
 at <https://id.yandex.com/personal/data-access>.
+
+## Scanning a folder
+
+```bash
+yandex-disk-rescue scan              # the whole Disk (disk:/)
+yandex-disk-rescue scan disk:/Photos # one folder; /Photos and Photos mean the same
+```
+
+`scan` lists the folder and everything below it through the Disk API, up to
+`--api-concurrency` folders at a time and paced as described in
+[Rate limiting](#rate-limiting) (it takes the same `--api-*` options as
+`auth status`). It records every file and folder (path, kind, size, MD5,
+SHA-256, modification time) in the manifest,
+`$XDG_STATE_HOME/yandex-disk-rescue/manifest.sqlite3`
+(`~/.local/state/yandex-disk-rescue/manifest.sqlite3` when `XDG_STATE_HOME`
+is unset or not an absolute path), and prints a summary:
+
+```
+Scanned disk:/Photos: 1234 files, 56 folders, 12.3 GiB
+Files without a cloud checksum: 1
+  disk:/Photos/old.bmp
+Changes since the last scan: 5 added, 2 changed, 1 removed
+  + disk:/Photos/new.jpg
+  ~ disk:/Photos/edited.jpg
+  - disk:/Photos/gone.jpg
+Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+```
+
+The counts and the size cover everything below the scanned folder. Files
+without a cloud checksum have neither an MD5 nor a SHA-256 in the API, so
+they cannot be verified after download. The first scan of a folder prints
+`First scan of disk:/Photos` instead of the changes; a file counts as
+changed when its kind, size, checksums or modification time differ. Each
+list of paths shows at most 20 entries, then `… and N more`.
+
+The manifest only ever holds completed scans: a scan that fails or is
+interrupted (Ctrl+C, a kill, a crash) leaves the previous scan in place, and
+the next run scans again from the start. Scanning a folder replaces only
+that folder's part of the manifest. Only one run can use the manifest at a
+time; a second one fails with `Another yandex-disk-rescue run is using ...`.
+Paths outside `disk:/` (such as `trash:/`) are refused.
+
+## Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Success |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run |
+| `2` | Invalid input: a usage error, an option value out of range, a remote path outside `disk:/` |
+| `130` | Interrupted with Ctrl+C |
 
 ## Rate limiting
 

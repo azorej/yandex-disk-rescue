@@ -63,25 +63,31 @@ def parse_folder_page(content: bytes) -> FolderPage:
     total = _byte_count(embedded, 'total', '_embedded.total')
     return FolderPage(
         kind=kind,
-        items=tuple(_resource(item, f'_embedded.items[{index}]') for index, item in enumerate(items)),
+        items=tuple(_resource(item, f'_embedded.items[{index}].') for index, item in enumerate(items)),
         total=total,
     )
 
 
-def _resource(item: object, name: str) -> Resource:
+def parse_resource(content: bytes) -> Resource:
+    """Parse the `GET /v1/disk/resources` body of one file or folder below the root."""
+    return _resource(_json_object(content), '')
+
+
+def _resource(item: object, prefix: str) -> Resource:
+    """Parse one resource object; `prefix` locates it in the body for error messages (`''` for the body itself)."""
     if not isinstance(item, dict):
-        raise MalformedBodyError(f'{name} is not an object')
-    path = _non_empty_string(item, 'path', f'{name}.path')
+        raise MalformedBodyError(f'{prefix.removesuffix(".")} is not an object')
+    path = _non_empty_string(item, 'path', f'{prefix}path')
     if not path.startswith(ROOT) or path == ROOT:
-        raise MalformedBodyError(f'{name}.path is not a disk:/ path below the root')
-    kind = _kind(item, f'{name}.type')
+        raise MalformedBodyError(f'{prefix}path is not a disk:/ path below the root')
+    kind = _kind(item, f'{prefix}type')
     return Resource(
         path=path.rstrip('/'),
         kind=kind,
-        size=_byte_count(item, 'size', f'{name}.size') if kind == 'file' else None,
-        md5=_optional_string(item, 'md5', f'{name}.md5'),
-        sha256=_optional_string(item, 'sha256', f'{name}.sha256'),
-        modified=_timestamp(item, 'modified', f'{name}.modified'),
+        size=_byte_count(item, 'size', f'{prefix}size') if kind == 'file' else None,
+        md5=_optional_string(item, 'md5', f'{prefix}md5'),
+        sha256=_optional_string(item, 'sha256', f'{prefix}sha256'),
+        modified=_timestamp(item, 'modified', f'{prefix}modified'),
     )
 
 

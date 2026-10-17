@@ -16,7 +16,8 @@ class RemotePathNotFoundError(RescueError):
 
 
 class NotAFolderError(RescueError):
-    pass
+    def __init__(self, path: str) -> None:
+        super().__init__(f"Remote path '{path}' is a file, not a folder.")
 
 
 class UnsupportedPathError(RescueError):

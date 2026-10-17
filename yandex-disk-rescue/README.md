@@ -5,6 +5,8 @@ The command-line application, a Typer CLI installed as `yandex-disk-rescue`.
 ```bash
 uv run yandex-disk-rescue --help
 uv run yandex-disk-rescue --version
+uv run yandex-disk-rescue auth status
+uv run yandex-disk-rescue scan disk:/Photos
 ```
 
 Tests: `mise run test -- yandex-disk-rescue/tests`.
@@ -27,7 +29,8 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 
 The manifest is a SQLite database at `$XDG_STATE_HOME/yandex-disk-rescue/manifest.sqlite3` (a 0600 file in a 0700
 directory). For each account (keyed by the Disk user uid) it stores every file and folder of each scanned remote
-folder: path, kind, size, MD5, SHA-256 and modification time.
+folder: path, kind, size, MD5, SHA-256 and modification time. A scanned folder other than `disk:/` is a row too,
+as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `disk:/` wrote; `disk:/` has no row.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
   in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
@@ -44,13 +47,17 @@ folder: path, kind, size, MD5, SHA-256 and modification time.
 yandex-disk-rescue/
 ├── src/yandex_disk_rescue/
 │   ├── __init__.py   # Package version (read from installed metadata)
-│   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the `auth` commands
+│   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the `auth` commands,
+│   │                 #   registration of the commands in `commands/`
+│   ├── commands/
+│   │   └── scan.py   # `scan`: concurrent walk of a remote folder into the manifest, the summary
+│   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
-│   └── api/          # DiskClient — every Disk API request: the account check, paged folder listing,
+│   └── api/          # DiskClient — every Disk API request: the account check, one resource, paged folder listing,
 │                     #   error mapping (401/403, other statuses, transport errors, malformed bodies), `disk:/` paths;
 │                     #   the shared AdaptiveLimiter (pacing, concurrency cap, Retry-After) and bounded retries
 └── tests/
@@ -62,5 +69,6 @@ yandex-disk-rescue/
     ├── test_auth.py
     ├── test_cli.py
     ├── test_manifest.py
-    └── test_rate_limiter.py
+    ├── test_rate_limiter.py
+    └── test_scan.py
 ```

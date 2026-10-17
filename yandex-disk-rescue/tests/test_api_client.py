@@ -112,6 +112,43 @@ async def test_list_folder_of_a_file_is_not_a_folder(fake_disk_api):
     assert str(excinfo.value) == "Remote path 'disk:/notes.txt' is a file, not a folder."
 
 
+async def test_resource_returns_a_file_or_folder_as_the_api_names_it(fake_disk_api):
+    fake_disk_api.add_dir('disk:/Photos', modified=datetime(2023, 6, 7, 8, 9, 10, tzinfo=UTC))
+    fake_disk_api.add_file(
+        'disk:/Photos/a.jpg', b'abc', sha256=None, modified=datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+    )
+
+    async with _client(fake_disk_api) as client:
+        folder = await client.resource('Photos/')
+        file = await client.resource('/Photos/a.jpg')
+        with pytest.raises(api.RemotePathNotFoundError, match=r"^Remote path 'disk:/Photos/b\.jpg' does not exist\.$"):
+            await client.resource('disk:/Photos/b.jpg')
+
+    assert folder == api.Resource('disk:/Photos', 'dir', None, None, None, datetime(2023, 6, 7, 8, 9, 10, tzinfo=UTC))
+    assert file == api.Resource(
+        'disk:/Photos/a.jpg',
+        'file',
+        3,
+        '900150983cd24fb0d6963f7d28e17f72',
+        None,
+        datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC),
+    )
+    assert {r.params['fields'] for r in fake_disk_api.requests} == {'path,type,size,md5,sha256,modified'}
+
+
+async def test_resource_reports_a_malformed_body_with_the_path(fake_disk_api):
+    fake_disk_api.route_json('GET', '/v1/disk/resources', 200, {'path': 'disk:/A', 'type': 'dir'})
+
+    async with _client(fake_disk_api) as client:
+        with pytest.raises(api.DiskApiError) as excinfo:
+            await client.resource('disk:/A')
+
+    assert str(excinfo.value) == (
+        'Could not read disk:/A: Yandex Disk API returned an unexpected response to GET /v1/disk/resources: '
+        'modified is missing or not an ISO 8601 timestamp with a UTC offset.'
+    )
+
+
 async def test_list_folder_reports_a_status_error_with_the_path(fake_disk_api):
     fake_disk_api.add_dir('disk:/A')
     fake_disk_api.add_dir('disk:/B')

@@ -19,17 +19,26 @@ from tenacity import (
 
 from yandex_disk_rescue.api.errors import DiskApiError, NotAFolderError, RemotePathNotFoundError, TokenRejectedError
 from yandex_disk_rescue.api.limiter import AdaptiveLimiter, parse_retry_after
-from yandex_disk_rescue.api.models import Account, MalformedBodyError, Resource, parse_account, parse_folder_page
-from yandex_disk_rescue.api.remote_paths import normalize_remote_path
+from yandex_disk_rescue.api.models import (
+    Account,
+    MalformedBodyError,
+    Resource,
+    parse_account,
+    parse_folder_page,
+    parse_resource,
+)
+from yandex_disk_rescue.api.remote_paths import ROOT, normalize_remote_path
 from yandex_disk_rescue.auth import validate_token
 
 ACCOUNT_PATH = '/v1/disk/'
 RESOURCES_PATH = '/v1/disk/resources'
 PAGE_LIMIT = 1000
+_RESOURCE_KEYS = ('path', 'type', 'size', 'md5', 'sha256', 'modified')
+_RESOURCE_FIELDS = ','.join(_RESOURCE_KEYS)
 _LISTING_FIELDS = ','.join(
     [
         'type',
-        *(f'_embedded.items.{key}' for key in ('path', 'type', 'size', 'md5', 'sha256', 'modified')),
+        *(f'_embedded.items.{key}' for key in _RESOURCE_KEYS),
         '_embedded.total',
         '_embedded.limit',
         '_embedded.offset',
@@ -99,6 +108,24 @@ class DiskClient:
         except MalformedBodyError as exc:
             raise _unexpected_response(ACCOUNT_PATH, str(exc), context=None) from None
 
+    async def resource(self, path: str) -> Resource:
+        """Return the file or folder at `path`, which must be below the root `disk:/`, as the API names it.
+
+        Raises `RemotePathNotFoundError` when the path does not exist.
+        """
+        target = normalize_remote_path(path)
+        if target == ROOT:
+            raise ValueError('the root disk:/ has no resource record; list it with list_folder')
+        context = f'Could not read {target}'
+        response = await self._get(RESOURCES_PATH, {'path': target, 'fields': _RESOURCE_FIELDS}, context=context)
+        if response.status_code == httpx.codes.NOT_FOUND:
+            raise RemotePathNotFoundError(f"Remote path '{target}' does not exist.")
+        self._raise_for_status(response, context=context)
+        try:
+            return parse_resource(response.content)
+        except MalformedBodyError as exc:
+            raise _unexpected_response(RESOURCES_PATH, str(exc), context=context) from None
+
     async def list_folder(self, path: str) -> AsyncIterator[Resource]:
         """Yield every direct child of the folder at `path`, sorted by name, one `limit`/`offset` page at a time.
 
@@ -118,7 +145,7 @@ class DiskClient:
             except MalformedBodyError as exc:
                 raise _unexpected_response(RESOURCES_PATH, str(exc), context=context) from None
             if page.kind == 'file':
-                raise NotAFolderError(f"Remote path '{folder}' is a file, not a folder.")
+                raise NotAFolderError(folder)
             for resource in page.items:
                 yield resource
             offset += len(page.items)

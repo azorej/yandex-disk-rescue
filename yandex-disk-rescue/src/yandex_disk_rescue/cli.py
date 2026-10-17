@@ -8,7 +8,9 @@ import typer
 import typer.core
 
 from yandex_disk_rescue import __version__, api, auth, settings
+from yandex_disk_rescue.commands import scan
 from yandex_disk_rescue.errors import RescueError
+from yandex_disk_rescue.units import format_size
 
 
 class RescueErrorGroup(typer.core.TyperGroup):
@@ -30,6 +32,7 @@ app = typer.Typer(
 )
 auth_app = typer.Typer(help='Manage the Yandex OAuth token.', no_args_is_help=True)
 app.add_typer(auth_app, name='auth')
+app.command()(scan.scan)
 
 REVOKE_URL = 'https://id.yandex.com/personal/data-access'
 
@@ -108,7 +111,7 @@ def status(
     else:
         typer.echo(f'Token: file {auth.token_path()}')
     typer.echo(f'Account: {account.login}')
-    usage = f'Disk usage: {_format_size(account.used_space)} of {_format_size(account.total_space)} used'
+    usage = f'Disk usage: {format_size(account.used_space)} of {format_size(account.total_space)} used'
     if account.total_space:
         usage += f' ({account.used_space / account.total_space:.1%})'
     typer.echo(usage)
@@ -117,17 +120,6 @@ def status(
 async def _account_of(token: str, *, base_url: str, limits: api.ApiLimits) -> api.Account:
     async with api.DiskClient(token, base_url=base_url, limits=limits) as client:
         return await client.account()
-
-
-def _format_size(size: int) -> str:
-    if size < 1024:
-        return f'{size} B'
-    value = float(size)
-    for unit in ('KiB', 'MiB', 'GiB', 'TiB', 'PiB'):
-        value /= 1024
-        if round(value, 1) < 1024 or unit == 'PiB':
-            break
-    return f'{value:.1f} {unit}'
 
 
 if __name__ == '__main__':
