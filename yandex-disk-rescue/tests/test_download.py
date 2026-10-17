@@ -3084,7 +3084,9 @@ async def test_a_cancelled_run_waits_for_the_write_in_flight_before_closing_the_
     assert len(written) == 2
     [partial] = _partials(dest)
     assert [stat.st_ino for stat in open_after_write] == [partial.stat().st_ino] * 2
-    assert partial.read_bytes() == BIG[: len(written[0]) + len(written[1])]
+    held = len(written[0]) + len(written[1])
+    assert partial.read_bytes() == BIG[:held]
+    assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
 
 
 @pytest.mark.anyio

@@ -41,6 +41,25 @@ class DiskThreads:
             await _settled(future)
             raise
 
+    async def run_then[T, *Ts](self, call: Callable[[*Ts], T], *args: *Ts, then: Callable[[T], None]) -> None:
+        """Run `call(*args)` in a worker thread, then `then(result)` on the event loop; the call's exception propagates
+        unchanged, with `then` not called.
+
+        When the awaiting task is cancelled, a call not yet started is dropped; a running one is waited for, and once
+        it has returned `then` gets its result before `CancelledError` propagates, so what the call did is accounted
+        for.
+        """
+        future = self._executor.submit(call, *args)
+        try:
+            result = await asyncio.wrap_future(future)
+        except asyncio.CancelledError:
+            future.cancel()
+            await _settled(future)
+            if not future.cancelled() and future.exception() is None:
+                then(future.result())
+            raise
+        then(result)
+
 
 async def _settled[T](future: Future[T]) -> None:
     loop = asyncio.get_running_loop()

@@ -1325,8 +1325,9 @@ class _Stream:
     """One segment `[start, end)` of a file in one turn.
 
     Its bytes `[start, written)` are in the partial file, and `sha256` is their SHA-256 (`None` while there are none).
-    Both change together on the event loop once a write has returned, so a checkpoint taken while a write is still in
-    flight never claims its bytes. `hasher` goes on hashing the bytes written next: for a segment that is the whole
+    Both change together on the event loop once a write has returned, also when the task is cancelled while it runs,
+    so a checkpoint taken while a write is still in flight never claims its bytes and one taken on cancellation claims
+    every byte written. `hasher` goes on hashing the bytes written next: for a segment that is the whole
     file, the file's `Digest`.
     """
 
@@ -1357,8 +1358,13 @@ class _Stream:
         self.sha256 = self.hasher.sha256()
 
     async def write(self, partial: PartialFile, threads: DiskThreads, offset: int, chunk: bytes) -> None:
-        sha256 = await threads.run(_write_hashed, self.hasher, partial, offset, chunk)
-        self.written, self.sha256 = offset + len(chunk), sha256
+        """Write `chunk` at `offset` and hash it; a write that returned is counted in `written` and `sha256` also when
+        the task is cancelled while it runs."""
+
+        def advance(sha256: str) -> None:
+            self.written, self.sha256 = offset + len(chunk), sha256
+
+        await threads.run_then(_write_hashed, self.hasher, partial, offset, chunk, then=advance)
 
 
 def _write_hashed(digest: Digest | _RangeDigest, partial: PartialFile, offset: int, chunk: bytes) -> str:
