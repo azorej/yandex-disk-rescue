@@ -80,10 +80,12 @@ yandex-disk-rescue/
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries (skip, folders, things in
-│   │                 #   the way, hard-link aliases), the per-file pipeline (link, fetch into a partial file while
-│   │                 #   hashing, verify, place, record), the summary lines
+│   │                 #   the way, hard-link aliases), the per-file pipeline (adopt a matching local copy, or link,
+│   │                 #   fetch into a partial file while hashing, verify, move aside what is in the way, place,
+│   │                 #   record), the summary lines
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
-│   │                 #   RENAME_NOREPLACE probe, partial files, folder creation and placement, never through a link
+│   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
+│   │                 #   aside into the run's `replaced/` folder and placement, never through a link
 │   ├── localfs.py    # Name-creating syscalls relative to folder descriptors: open without following links, mkdir,
 │   │                 #   renameat2(RENAME_NOREPLACE) through ctypes
 │   ├── units.py      # format_size — binary-unit byte counts for command output

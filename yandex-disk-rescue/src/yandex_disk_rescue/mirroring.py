@@ -4,7 +4,9 @@ summarizing a run.
 A file is verified before it reaches its final path: the bytes go to a partial file while their MD5 and SHA-256
 are computed, the size and every checksum the cloud provides are checked, and only then is the file moved into
 place without replacing anything. A verified file whose record and `lstat` fingerprint still match is skipped
-without being read.
+without being read. Any other file already at a final path is hashed: one matching the cloud is adopted as it is,
+and anything else there is moved aside once the new version is verified. Paths with no cloud counterpart are never
+looked at.
 """
 
 import errno
@@ -51,9 +53,22 @@ class MirrorReport:
     downloaded: int = 0
     downloaded_size: int = 0
     skipped: int = 0
+    adopted: list[str] = field(default_factory=list)
     size_only: list[str] = field(default_factory=list)
     renamed: list[tuple[str, PurePosixPath]] = field(default_factory=list)
+    moved_aside: list[PurePosixPath] = field(default_factory=list)
+    replaced_folder: PurePosixPath | None = None
     failed: list[Failure] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class FileOutcome:
+    """How a file came to be verified at its final path: `adopted` when the copy already there matched the cloud,
+    `moved_aside` when something else stood there and was moved to the replaced folder."""
+
+    verified_by: VerifiedBy
+    adopted: bool
+    moved_aside: bool
 
 
 class Digest:
@@ -71,24 +86,23 @@ class Digest:
         self._sha256.update(chunk)
         self.size += len(chunk)
 
-    def verify(self, identity: RemoteIdentity) -> VerifiedBy:
-        """Check the size, then the MD5 and the SHA-256 the cloud provides; raises `FileFailed` on a mismatch."""
+    def mismatch(self, identity: RemoteIdentity) -> str | None:
+        """How the bytes differ from `identity`: the size, then the MD5 and the SHA-256 the cloud provides."""
         if self.size != identity.size:
-            raise FileFailed(f'size mismatch (expected {identity.size} bytes, got {self.size})')
+            return f'size mismatch (expected {identity.size} bytes, got {self.size})'
         for name, expected, actual in (
             ('MD5', identity.md5, self._md5.hexdigest()),
             ('SHA-256', identity.sha256, self._sha256.hexdigest()),
         ):
             if expected is not None and expected.lower() != actual:
-                raise FileFailed(f'{name} mismatch (expected {expected}, got {actual})')
-        match (identity.md5 is not None, identity.sha256 is not None):
-            case (True, True):
-                return 'md5+sha256'
-            case (True, False):
-                return 'md5'
-            case (False, True):
-                return 'sha256'
-        return 'size'
+                return f'{name} mismatch (expected {expected}, got {actual})'
+        return None
+
+    def verify(self, identity: RemoteIdentity) -> VerifiedBy:
+        """The verification method of `identity`; raises `FileFailed` when the bytes do not match it."""
+        if (reason := self.mismatch(identity)) is not None:
+            raise FileFailed(reason)
+        return _method(identity)
 
 
 class MirrorRun:
@@ -129,6 +143,7 @@ class MirrorRun:
                 _note_verified(report, entry, _recorded_method(entry))
             else:
                 await self._download(entry, client, content, report)
+        report.replaced_folder = self._destination.replaced_folder
         report.failed += [Failure(display_path(r.path), _unencodable_reason(r)) for r in self._unencodable]
         report.failed.sort(key=lambda failure: failure.path)
         return report
@@ -140,7 +155,11 @@ class MirrorRun:
             with _local_errors(self._destination, local):
                 if self._destination.make_folder(local):
                     return
-            reason = f'{local} already exists and is not a folder written by this mirror; it was left untouched'
+                self._destination.move_aside(local)
+                report.moved_aside.append(local)
+                if self._destination.make_folder(local):
+                    return
+            reason = f'{local} was created again as something other than a folder while it was being moved aside'
         except FileFailed as failed:
             reason = failed.reason
         blocked[local] = reason
@@ -150,15 +169,21 @@ class MirrorRun:
         self, entry: MirrorEntry, client: api.DiskClient, content: api.ContentClient, report: MirrorReport
     ) -> None:
         try:
-            verified_by = await download_file(
+            outcome = await download_file(
                 entry, client=client, content=content, mirror=self._mirror, destination=self._destination
             )
         except FileFailed as failed:
             report.failed.append(Failure(entry.resource.path, failed.reason))
             return
-        report.downloaded += 1
-        report.downloaded_size += entry.resource.size or 0
-        _note_verified(report, entry, verified_by)
+        if outcome.adopted:
+            report.skipped += 1
+            report.adopted.append(entry.resource.path)
+        else:
+            report.downloaded += 1
+            report.downloaded_size += entry.resource.size or 0
+        if outcome.moved_aside:
+            report.moved_aside.append(_local_path(entry))
+        _note_verified(report, entry, outcome.verified_by)
 
 
 async def download_file(
@@ -168,9 +193,13 @@ async def download_file(
     content: api.ContentClient,
     mirror: Mirror,
     destination: Destination,
-) -> VerifiedBy:
-    """Download the file `entry` to its local path and record it as verified; the only state it touches is the
-    mirror's records and the destination.
+) -> FileOutcome:
+    """Make the file `entry` verified at its local path and record it; the only state it touches is the mirror's
+    records and the destination.
+
+    A file already at the local path is adopted when its content matches the cloud. Otherwise the file is
+    downloaded and verified first, and only then is whatever stands at the local path moved aside and the new file
+    placed. A path that is the same file as another entry's verified copy is never adopted, moved or replaced.
 
     Raises `FileFailed` when this file cannot be mirrored, `DestinationError` when the destination cannot be
     written at all, and the API errors that stop the run (`TokenRejectedError`, `DiskApiError`).
@@ -180,22 +209,65 @@ async def download_file(
     with _local_errors(destination, local):
         existing = destination.lstat(local)
         if existing is not None:
-            raise FileFailed(_in_the_way(entry, local, existing, mirror, destination))
+            if reason := _alias(entry, local, existing, mirror, destination):
+                raise FileFailed(reason)
+            if (verified_by := _adopt(entry, local, identity, existing, mirror, destination)) is not None:
+                return FileOutcome(verified_by, adopted=True, moved_aside=False)
         mirror.record_partial(entry.entry_id, identity)
         href = await _download_link(client, entry.resource.path)
         verified_by = await _fetch_verified(
             entry, identity, href, content=content, mirror=mirror, destination=destination
         )
+        moved_aside = _clear_the_way(entry, local, mirror, destination)
         try:
             placed = destination.place(entry.entry_id, local)
         except FileExistsError:
-            existing = destination.lstat(local)
             _discard(entry, mirror, destination)
-            if existing is None:
-                raise
-            raise FileFailed(_in_the_way(entry, local, existing, mirror, destination)) from None
+            raise FileFailed(f'something else was created at {local} while the file was being placed') from None
         mirror.record_verified(entry.entry_id, identity, verified_by, placed)
+    return FileOutcome(verified_by, adopted=False, moved_aside=moved_aside)
+
+
+def _adopt(
+    entry: MirrorEntry,
+    local: PurePosixPath,
+    identity: RemoteIdentity,
+    existing: os.stat_result,
+    mirror: Mirror,
+    destination: Destination,
+) -> VerifiedBy | None:
+    """Hash the regular file `existing` at `local` and, when it matches `identity`, give it the cloud mtime and
+    record it as verified; `None` when it is not such a file or does not match."""
+    if not stat.S_ISREG(existing.st_mode) or existing.st_size != identity.size:
+        return None
+    digest = Digest()
+    with destination.existing_file(local) as file:
+        opened = file.stat()
+        if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
+            return None
+        for chunk in file.chunks():
+            digest.update(digest.size, chunk)
+        if digest.mismatch(identity) is not None:
+            return None
+        file.set_mtime(_mtime_ns(identity.modified))
+        adopted = file.stat()
+    verified_by = _method(identity)
+    mirror.record_verified(entry.entry_id, identity, verified_by, adopted)
+    destination.remove_partial(entry.entry_id)
     return verified_by
+
+
+def _clear_the_way(entry: MirrorEntry, local: PurePosixPath, mirror: Mirror, destination: Destination) -> bool:
+    """Move whatever stands at `local` aside so the verified partial file can be placed; `True` when something was
+    moved."""
+    existing = destination.lstat(local)
+    if existing is None:
+        return False
+    if reason := _alias(entry, local, existing, mirror, destination):
+        _discard(entry, mirror, destination)
+        raise FileFailed(reason)
+    destination.move_aside(local)
+    return True
 
 
 async def _fetch_verified(
@@ -233,17 +305,25 @@ async def _fetch_verified(
 
 
 def mirror_summary(report: MirrorReport) -> list[str]:
-    """The lines reporting a run: the counts, size-only files, renamed entries and failures with their reasons."""
+    """The lines reporting a run: the counts, adopted and size-only files, renamed entries, what was moved aside,
+    and failures with their reasons."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.failed)} failed'
     ]
+    if report.adopted:
+        lines.append(f'Already on disk and verified: {len(report.adopted)}')
+        lines += listed('', report.adopted, len(report.adopted), '')
     if report.size_only:
         lines.append(f'Verified by size only (no cloud checksum): {len(report.size_only)}')
         lines += listed('', report.size_only, len(report.size_only), '')
     if report.renamed:
         lines.append(f'Renamed for the destination: {len(report.renamed)}')
         shown = [f'{remote} -> {local}' for remote, local in report.renamed]
+        lines += listed('', shown, len(shown), '')
+    if report.moved_aside:
+        lines.append(f'Moved aside to {report.replaced_folder}/: {len(report.moved_aside)}')
+        shown = [str(local) for local in report.moved_aside]
         lines += listed('', shown, len(shown), '')
     if report.failed:
         lines.append(f'Failed: {len(report.failed)}')
@@ -273,19 +353,18 @@ def _is_current(entry: MirrorEntry, destination: Destination) -> bool:
     return placed is not None and stat.S_ISREG(placed.st_mode) and LocalFingerprint.of(placed) == record.local
 
 
-def _in_the_way(
+def _alias(
     entry: MirrorEntry, local: PurePosixPath, existing: os.stat_result, mirror: Mirror, destination: Destination
-) -> str:
-    ino = existing.st_ino
-    record = entry.download
-    if record is not None and record.local is not None and record.local.ino == ino:
-        return f'{local} is a copy verified earlier that no longer matches the Disk; it was left untouched'
-    owner = mirror.verified_owner(ino)
-    if owner is not None and owner.entry_id != entry.entry_id and owner.local_path is not None:
-        owner_copy = destination.lstat(owner.local_path)
-        if owner_copy is not None and owner_copy.st_ino == ino:
-            return f'{local} is the same file as {owner.resource.path} on this filesystem; it was left untouched'
-    return f'{local} already exists and was not written by this mirror; it was left untouched'
+) -> str | None:
+    """The failure reason when `existing` is the verified copy of another entry, still at that entry's own path (a
+    hard link, or a name the filesystem folds onto another); `None` otherwise."""
+    owner = mirror.verified_owner(existing.st_ino)
+    if owner is None or owner.entry_id == entry.entry_id or owner.local_path is None:
+        return None
+    owner_copy = destination.lstat(owner.local_path)
+    if owner_copy is None or owner_copy.st_ino != existing.st_ino:
+        return None
+    return f'{local} is the same file as {owner.resource.path} on this filesystem; it was left untouched'
 
 
 async def _download_link(client: api.DiskClient, path: str) -> str:
@@ -333,6 +412,17 @@ def _blocked_by(local: PurePosixPath, blocked: dict[PurePosixPath, str]) -> str 
 def _note_verified(report: MirrorReport, entry: MirrorEntry, verified_by: VerifiedBy) -> None:
     if verified_by == 'size':
         report.size_only.append(entry.resource.path)
+
+
+def _method(identity: RemoteIdentity) -> VerifiedBy:
+    match (identity.md5 is not None, identity.sha256 is not None):
+        case (True, True):
+            return 'md5+sha256'
+        case (True, False):
+            return 'md5'
+        case (False, True):
+            return 'sha256'
+    return 'size'
 
 
 def _recorded_method(entry: MirrorEntry) -> VerifiedBy:

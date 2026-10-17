@@ -185,21 +185,26 @@ files. Placing a file never replaces anything at its final path.
 
 **Reruns.** A file verified by an earlier run is skipped without being read
 again when its Disk metadata is unchanged and the local file still has the
-recorded size, modification time and inode. Anything else is downloaded
-again. A transfer error fails that file; rerun to fetch it.
+recorded size, modification time and inode. A file changed on the Disk, or
+edited or touched locally, is handled like any file already in DEST (below).
+A transfer error fails that file; rerun to fetch it.
 
 **Summary.**
 
 ```
 Downloading 120 files (1.2 GiB) to /mnt/backup/Photos
-Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 2 failed
+Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 1 failed
+Already on disk and verified: 40
+  disk:/Photos/2023/beach.jpg
+  …
 Verified by size only (no cloud checksum): 1
   disk:/Photos/old.bmp
 Renamed for the destination: 1
   disk:/Photos/a.txt -> a~1a2b3c4d.txt
-Failed: 2
+Moved aside to .yandex-disk-rescue/replaced/2026-10-17T09-30-00Z/: 1
+  notes.txt
+Failed: 1
   disk:/Photos/bad.jpg: MD5 mismatch (expected …, got …)
-  disk:/Photos/notes.txt: notes.txt already exists and was not written by this mirror; it was left untouched
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 ```
 
@@ -207,14 +212,33 @@ Each list shows at most 20 entries, then `… and N more`. When anything
 failed, the run ends with `Error: N failed; see the list above.` and exit
 code `1`; a rerun retries exactly what is not verified yet.
 
-**Files already in DEST.** A file or folder at a path the mirror needs that
-this mirror did not write is left untouched, and that entry (and, for a
-folder, everything below it) is reported as failed. The same holds for a
-symbolic link inside DEST: the tool never writes through one. A path that is
-the same file as another mirrored file (a hard link, or a name that a case-
-or normalization-insensitive filesystem treats as the same) is never
-replaced. A Disk entry whose name is not valid Unicode cannot be requested
-from the API; it is reported as failed.
+**Files already in DEST.** DEST may already hold files, for example an
+earlier copy made by hand. A regular file at the path of a Disk file is read
+and hashed; when its size and every Disk checksum match, it is *adopted*: it
+is not downloaded, it gets the Disk modification time and it counts as
+skipped, listed under `Already on disk and verified`. (A file the Disk has no
+checksum for is adopted when its size matches.) Anything else at a path the
+mirror needs — a file with other content, a folder where a file must go, a
+file where a folder must go, or a symbolic link — is *moved aside*. Where a
+file must go, that happens only after the new file is downloaded and
+verified, so a failed download leaves the old one where it was. It moves,
+with its relative path kept, to
+`DEST/.yandex-disk-rescue/replaced/<run start, UTC, YYYY-MM-DDTHH-MM-SSZ>/`,
+and the summary lists it. Each run that moves something gets its own folder
+(a `-2`, `-3`, … suffix when an earlier run started in the same second). A
+symbolic link is moved as the link itself; the tool never follows one inside
+DEST and never writes to its target. DEST itself may be a link.
+
+**Nothing is deleted.** The tool never deletes or truncates anything outside
+`DEST/.yandex-disk-rescue/partial/`. Files and folders that are not on the
+Disk are left alone: a path with no Disk counterpart, such as `.DS_Store`,
+`.Spotlight-V100/`, `.Trashes/` or your own files inside a mirrored folder,
+is never opened, moved or reported, and the tool never lists a folder to find
+work. A path that is the same file as another mirrored file (a hard link, or
+a name that a case- or normalization-insensitive filesystem treats as the
+same) is never adopted, moved or replaced; it is reported as failed. A Disk
+entry whose name is not valid Unicode cannot be requested from the API; it is
+reported as failed.
 
 **The destination.** DEST may exist; if it does not, only its last component
 is created, so a mistyped mount point fails instead of filling another disk.
@@ -222,9 +246,9 @@ A DEST that is not a folder or whose parent does not exist, or a DEST
 starting with `disk:` (swapped arguments), is a usage error (exit `2`). A
 destination mirrors exactly one remote folder of one account; downloading
 another folder into it is refused. `DEST/.yandex-disk-rescue/` is the tool's
-work directory: it holds partial files and a lock, so only one run at a time
-can use a destination (`Another yandex-disk-rescue run is using DEST`), even
-runs with different manifests. The destination's filesystem must support
+work directory: it holds partial files, the `replaced/` folder and a lock, so
+only one run at a time can use a destination (`Another yandex-disk-rescue run
+is using DEST`), even runs with different manifests. The destination's filesystem must support
 renaming without replacing (`RENAME_NOREPLACE`; ext4, xfs, btrfs, tmpfs and
 HFS+ do); the run stops at the start otherwise. A full disk, an I/O error, a
 read-only filesystem or a permission error stops the run with

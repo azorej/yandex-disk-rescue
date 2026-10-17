@@ -3,7 +3,8 @@ it.
 
 All operations go through open folder descriptors and `localfs`, so none follows a symbolic link inside the
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
-file through the no-replace rename.
+file through the no-replace rename, and whatever stood there is first moved, never deleted, into the run's folder
+under `.yandex-disk-rescue/replaced/`.
 """
 
 import errno
@@ -12,6 +13,7 @@ import os
 import stat
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Self
@@ -22,6 +24,9 @@ from yandex_disk_rescue.local_names import WORK_DIR_NAME
 
 LOCK_FILE_NAME = 'lock'
 PARTIAL_DIR_NAME = 'partial'
+REPLACED_DIR_NAME = 'replaced'
+_STAMP_FORMAT = '%Y-%m-%dT%H-%M-%SZ'
+_READ_SIZE = 1 << 20
 _PROBE_NAMES = ('probe', 'probe.renamed')
 # Errors that no other file of the run would escape: the run stops instead of failing every file in turn.
 FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES, errno.EPERM})
@@ -63,15 +68,22 @@ class Destination:
     """An open destination holding its run lock; use `Destination.open` as a context manager.
 
     `path` is the resolved destination. Local paths are relative to it, '/'-separated. Partial files live in
-    `.yandex-disk-rescue/partial/`, named by entry id.
+    `.yandex-disk-rescue/partial/`, named by entry id. Things moved aside go to
+    `.yandex-disk-rescue/replaced/<run start, UTC>/`, created on the first move; `replaced_folder` is that folder
+    relative to the destination once it exists.
     """
 
-    def __init__(self, path: Path, root_fd: int, work_fd: int, lock_fd: int, partial_fd: int) -> None:
+    def __init__(
+        self, path: Path, root_fd: int, work_fd: int, lock_fd: int, partial_fd: int, started: datetime
+    ) -> None:
         self.path = path
+        self.replaced_folder: PurePosixPath | None = None
         self._root_fd = root_fd
         self._work_fd = work_fd
         self._lock_fd = lock_fd
         self._partial_fd = partial_fd
+        self._started = started
+        self._replaced_fd: int | None = None
 
     @classmethod
     def open(cls, path: Path) -> Destination:
@@ -81,6 +93,7 @@ class Destination:
         Raises `RescueError` when another run holds the lock and `DestinationError` when the destination cannot be
         written or lacks the no-replace rename.
         """
+        started = datetime.now(UTC)
         fds: list[int] = []
         try:
             resolved = _create_last_component(path)
@@ -95,10 +108,11 @@ class Destination:
         except BaseException:
             _close_all(fds)
             raise
-        return cls(resolved, *fds)
+        return cls(resolved, *fds, started=started)
 
     def close(self) -> None:
-        _close_all([self._partial_fd, self._lock_fd, self._work_fd, self._root_fd])
+        replaced = [] if self._replaced_fd is None else [self._replaced_fd]
+        _close_all([self._partial_fd, self._lock_fd, self._work_fd, self._root_fd, *replaced])
 
     def __enter__(self) -> Self:
         return self
@@ -171,6 +185,46 @@ class Destination:
             return os.stat(local.name, dir_fd=parent_fd, follow_symlinks=False)
 
     @contextmanager
+    def existing_file(self, local: PurePosixPath) -> Iterator[ExistingFile]:
+        """Open the file at `local` for reading without following a link; the caller checks what it opened."""
+        with self._folder(local.parent) as parent_fd:
+            fd = os.open(local.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=parent_fd)
+        try:
+            yield ExistingFile(fd)
+        finally:
+            os.close(fd)
+
+    def move_aside(self, local: PurePosixPath) -> None:
+        """Move whatever is at `local` (a file, a folder with everything in it, or a link itself, never its target)
+        to the same relative path in this run's replaced folder, without replacing anything, and make the move
+        durable."""
+        run_fd = self._replaced_run_fd()
+        with self._folder(local.parent) as source_fd, _made_folder(run_fd, local.parent) as target_fd:
+            localfs.rename_noreplace(local.name, local.name, src_dir_fd=source_fd, dst_dir_fd=target_fd)
+            os.fsync(target_fd)
+            os.fsync(source_fd)
+
+    def _replaced_run_fd(self) -> int:
+        """The descriptor of this run's replaced folder, created on first use under a name no earlier run took."""
+        if self._replaced_fd is not None:
+            return self._replaced_fd
+        stamp = self._started.strftime(_STAMP_FORMAT)
+        with _made_folder(self._work_fd, PurePosixPath(REPLACED_DIR_NAME)) as replaced_fd:
+            name, attempt = stamp, 1
+            while True:
+                try:
+                    localfs.make_dir(name, dir_fd=replaced_fd)
+                except FileExistsError:
+                    attempt += 1
+                    name = f'{stamp}-{attempt}'
+                else:
+                    break
+            os.fsync(replaced_fd)
+            self._replaced_fd = localfs.open_dir(name, dir_fd=replaced_fd)
+        self.replaced_folder = PurePosixPath(WORK_DIR_NAME, REPLACED_DIR_NAME, name)
+        return self._replaced_fd
+
+    @contextmanager
     def _folder(self, local: PurePosixPath) -> Iterator[int]:
         """An open descriptor of the folder `local`, every component opened without following a link."""
         fd = self._root_fd
@@ -184,6 +238,25 @@ class Destination:
         finally:
             if fd != self._root_fd:
                 os.close(fd)
+
+
+class ExistingFile:
+    """An open file found at a final path: its status, its content, and setting its modification time."""
+
+    def __init__(self, fd: int) -> None:
+        self._fd = fd
+
+    def stat(self) -> os.stat_result:
+        return os.fstat(self._fd)
+
+    def chunks(self) -> Iterator[bytes]:
+        while chunk := os.read(self._fd, _READ_SIZE):
+            yield chunk
+
+    def set_mtime(self, mtime_ns: int) -> None:
+        """Set the modification time, keeping the access time, and flush it to the disk."""
+        os.utime(self._fd, ns=(self.stat().st_atime_ns, mtime_ns))
+        os.fsync(self._fd)
 
 
 class PartialFile:
@@ -203,6 +276,29 @@ class PartialFile:
         """Set the modification time and flush the content and metadata to the disk."""
         os.utime(self._fd, ns=(mtime_ns, mtime_ns))
         os.fsync(self._fd)
+
+
+@contextmanager
+def _made_folder(base_fd: int, local: PurePosixPath) -> Iterator[int]:
+    """An open descriptor of the folder `local` below `base_fd`, creating each missing component, never following a
+    link."""
+    fd = base_fd
+    try:
+        for part in local.parts:
+            parent_fd = fd
+            try:
+                localfs.make_dir(part, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+            else:
+                os.fsync(parent_fd)
+            fd = localfs.open_dir(part, dir_fd=parent_fd)
+            if parent_fd != base_fd:
+                os.close(parent_fd)
+        yield fd
+    finally:
+        if fd != base_fd:
+            os.close(fd)
 
 
 def _create_last_component(path: Path) -> Path:
