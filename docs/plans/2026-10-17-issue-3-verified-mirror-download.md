@@ -184,7 +184,10 @@ Three cases abort the run (exit 1):
 
 - **Contract:**
   - A new non-command module `yandex_disk_rescue/scanning.py`. Its public API is
-    `async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Account, root: str) -> ScanResult`
+    `async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Account, root: ScanRoot) -> ScanResult`, with
+    `async def resolve_scan_root(client, root: str) -> ScanRoot` run *before* `Manifest.open`, so an
+    invalid root never creates a manifest (as built in Stage 1, 86f746c; worker count from
+    `DiskClient.limits`)
     and `def scan_summary(result: ScanResult) -> list[str]`.
     - `scan_tree` covers the #2 walk, including Stage 6's vanished folders, and the commit.
     - `scan_summary` returns every line of today's output except `Manifest: <path>`.
@@ -493,7 +496,9 @@ Three cases abort the run (exit 1):
        exit 1 with `Another yandex-disk-rescue run is using <DEST>; wait for it to finish and try
        again.` This guards against two runs with different manifests (different `XDG_STATE_HOME`)
        deleting each other's partials, which the manifest lock cannot see.
-    4. **Scan and map.** Open the manifest and run `scan_tree`, printing the `scan_summary` lines.
+    4. **Scan and map.** `resolve_scan_root` first, then open the manifest (its path moves from
+       `commands/scan.py`'s `MANIFEST_FILE_NAME` to a shared `paths.manifest_path()`; commands never
+       import each other) and run `scan_tree`, printing the `scan_summary` lines.
        Then call `mirror()`, run `map_local_names` against the stored names, then `assign_names`.
     5. **Work directory.** Create `DEST/.yandex-disk-rescue/partial/`. Delete files there that have
        no `partial` record (crash leftovers and files removed from the cloud). Print
