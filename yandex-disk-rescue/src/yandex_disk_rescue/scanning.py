@@ -55,11 +55,13 @@ class ScanTotals:
 @dataclass(frozen=True)
 class ScanResult:
     """A committed scan: its root as the API spells it, the totals of the recorded rows, the topmost folders that
-    vanished during the walk (sorted), and the changes against the previous scan."""
+    vanished during the walk (sorted), the entries left out because their names are not valid Unicode (sorted by
+    path), and the changes against the previous scan."""
 
     root: str
     totals: ScanTotals
     vanished: tuple[str, ...]
+    unencodable: tuple[api.Resource, ...]
     diff: ScanDiff
 
 
@@ -81,7 +83,9 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
 
     A folder root is itself a manifest row, as the API names it (so a scan of `disk:/A` keeps the `disk:/A` row a
     scan of `disk:/` wrote); the root `disk:/` has no row. Neither is counted in the totals, which cover exactly the
-    rows the commit records. Folders are listed with `client.limits.concurrency` concurrent listings; the first
+    rows the commit records. An entry whose path is not valid Unicode (the API can send a lone UTF-16 surrogate in a
+    JSON escape) cannot be stored or requested again: it is left out of the session, a folder is not listed, and
+    the result names it. Folders are listed with `client.limits.concurrency` concurrent listings; the first
     failed listing stops the walk, is raised, and leaves the manifest unchanged.
     """
     session = manifest.begin_scan(account.uid, root.path)
@@ -94,21 +98,26 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
         if resource.path != root.path:
             totals.count(resource)
     diff = session.commit()
-    return ScanResult(root=root.path, totals=totals, vanished=walk.vanished, diff=diff)
+    return ScanResult(root=root.path, totals=totals, vanished=walk.vanished, unencodable=walk.unencodable, diff=diff)
 
 
 def scan_summary(result: ScanResult) -> list[str]:
-    """The lines reporting a scan: totals, files without a checksum, vanished folders, and the changes."""
+    """The lines reporting a scan: totals, files without a checksum, vanished folders, entries left out for their
+    names, and the changes."""
     totals, diff = result.totals, result.diff
     lines = [
         f'Scanned {result.root}: {_plural(totals.files, "file")}, {_plural(totals.folders, "folder")}, '
         f'{format_size(totals.size)}',
         f'Files without a cloud checksum: {totals.without_checksum.count}',
-        *_listed('', totals.without_checksum.smallest, totals.without_checksum.count, ''),
+        *listed('', totals.without_checksum.smallest, totals.without_checksum.count, ''),
     ]
     if result.vanished:
         lines.append(f'Folders that disappeared during the scan: {len(result.vanished)}')
-        lines += _listed('', result.vanished, len(result.vanished), '')
+        lines += listed('', result.vanished, len(result.vanished), '')
+    if result.unencodable:
+        lines.append(f'Not recorded, the name is not valid Unicode: {len(result.unencodable)}')
+        shown = [display_path(resource.path) for resource in result.unencodable]
+        lines += listed('', shown, len(shown), '')
     if diff.first_scan:
         lines.append(f'First scan of {result.root}')
     else:
@@ -116,9 +125,22 @@ def scan_summary(result: ScanResult) -> list[str]:
             f'Changes since the last scan: {len(diff.added)} added, {len(diff.changed)} changed, '
             f'{len(diff.removed)} removed'
         )
-        lines += _listed('+ ', diff.added, len(diff.added), ' added')
-        lines += _listed('~ ', diff.changed, len(diff.changed), ' changed')
-        lines += _listed('- ', diff.removed, len(diff.removed), ' removed')
+        lines += listed('+ ', diff.added, len(diff.added), ' added')
+        lines += listed('~ ', diff.changed, len(diff.changed), ' changed')
+        lines += listed('- ', diff.removed, len(diff.removed), ' removed')
+    return lines
+
+
+def display_path(path: str) -> str:
+    """`path` safe to print: a lone surrogate, which no output encoding takes, is shown as `\\udcxx`."""
+    return path.encode('utf-8', 'backslashreplace').decode('utf-8')
+
+
+def listed(marker: str, shown: Sequence[str], count: int, what: str) -> list[str]:
+    """Indented lines for the first `SHOWN_PATHS` of `shown`, then `… and N more<what>` when `count` exceeds them."""
+    lines = [f'  {marker}{path}' for path in shown[:SHOWN_PATHS]]
+    if count > SHOWN_PATHS:
+        lines.append(f'  … and {count - SHOWN_PATHS} more{what}')
     return lines
 
 
@@ -137,6 +159,12 @@ class _Walk:
         self._workers = workers
         self._batch: list[api.Resource] = []
         self._vanished: set[str] = set()
+        self._unencodable: dict[str, api.Resource] = {}
+
+    @property
+    def unencodable(self) -> tuple[api.Resource, ...]:
+        """The entries left out because their paths are not valid Unicode, sorted by path."""
+        return tuple(self._unencodable[path] for path in sorted(self._unencodable))
 
     @property
     def vanished(self) -> tuple[str, ...]:
@@ -176,6 +204,9 @@ class _Walk:
                     return
                 if resource.path in self._vanished:
                     continue
+                if not _is_unicode(resource.path):
+                    self._unencodable[resource.path] = resource
+                    continue
                 self._batch.append(resource)
                 if resource.kind == 'dir':
                     folders.put_nowait(resource.path)
@@ -200,6 +231,7 @@ class _Walk:
             return
         self._vanished = {path for path in self._vanished if not _within(path, folder)} | {folder}
         self._batch = [resource for resource in self._batch if not _within(resource.path, folder)]
+        self._unencodable = {path: r for path, r in self._unencodable.items() if not _within(path, folder)}
         self._session.discard(folder)
 
     def _stage(self) -> None:
@@ -207,15 +239,16 @@ class _Walk:
         self._batch = []
 
 
+def _is_unicode(path: str) -> bool:
+    try:
+        path.encode('utf-8')
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _within(path: str, folder: str) -> bool:
     return path == folder or path.startswith(folder + '/')
-
-
-def _listed(marker: str, shown: Sequence[str], count: int, what: str) -> list[str]:
-    lines = [f'  {marker}{path}' for path in shown[:SHOWN_PATHS]]
-    if count > SHOWN_PATHS:
-        lines.append(f'  … and {count - SHOWN_PATHS} more{what}')
-    return lines
 
 
 def _plural(count: int, noun: str) -> str:

@@ -93,6 +93,12 @@ API_RETRIES = Setting(
     'api_retries', 5, 'Retries of a Disk API request after a transport error or a throttling status.', _in_range(0, 20)
 )
 API_URL = Setting('api_url', 'https://cloud-api.yandex.net', 'Base URL of the Disk REST API.', _http_url, hidden=True)
+DOWNLOAD_TIMEOUT = Setting(
+    'download_timeout',
+    60,
+    'Timeout of connecting to the download host and of each read from it, in seconds.',
+    _in_range(1, 600),
+)
 CLIENT_ID = Setting(
     'client_id',
     '9e2a0382c430429c9d57913b61d7d48f',
@@ -102,7 +108,7 @@ CLIENT_ID = Setting(
 
 SETTINGS: dict[str, Setting[Any]] = {
     setting.name: setting
-    for setting in (API_INTERVAL_MS, API_CONCURRENCY, API_TIMEOUT, API_RETRIES, API_URL, CLIENT_ID)
+    for setting in (API_INTERVAL_MS, API_CONCURRENCY, API_TIMEOUT, API_RETRIES, API_URL, DOWNLOAD_TIMEOUT, CLIENT_ID)
 }
 
 ApiIntervalMs = Annotated[int, API_INTERVAL_MS.typer_option()]
@@ -110,6 +116,7 @@ ApiConcurrency = Annotated[int, API_CONCURRENCY.typer_option()]
 ApiTimeout = Annotated[int, API_TIMEOUT.typer_option()]
 ApiRetries = Annotated[int, API_RETRIES.typer_option()]
 ApiUrl = Annotated[str, API_URL.typer_option()]
+DownloadTimeout = Annotated[int, DOWNLOAD_TIMEOUT.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 
 

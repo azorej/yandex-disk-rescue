@@ -10,8 +10,6 @@ from yandex_disk_rescue import api, auth, paths, settings
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.scanning import ScanResult, resolve_scan_root, scan_summary, scan_tree
 
-MANIFEST_FILE_NAME = 'manifest.sqlite3'
-
 
 def scan(
     remote_path: Annotated[
@@ -33,7 +31,7 @@ def scan(
     limits = settings.api_limits(
         interval_ms=api_interval_ms, concurrency=api_concurrency, timeout=api_timeout, retries=api_retries
     )
-    manifest_path = paths.state_dir() / MANIFEST_FILE_NAME
+    manifest_path = paths.manifest_path()
     try:
         result = asyncio.run(_run(token, root, base_url=api_url, limits=limits, manifest_path=manifest_path))
     except KeyboardInterrupt:

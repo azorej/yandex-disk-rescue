@@ -118,7 +118,7 @@ class FakeDiskApi:
 
     A download link is `<base_url>/download?path=<disk:/ path>&link=<n>`, numbered from 1 in issue order.
     The download host serves the file's current content, honouring one `bytes=a-b` or `bytes=a-` range.
-    Its faults: `corrupt`, `expire_links`, `ignore_range` (200 with the full body for any range),
+    Its faults: `corrupt` (undone by `repair`), `expire_links`, `ignore_range` (200 with the full body for any range),
     `redirect_downloads` (`/download` answers 302 to `/storage` with the same query, which serves the bytes,
     as the real host redirects to a storage host), `chunk_delay`, and the `Truncate` fault for `inject`.
     """
@@ -191,6 +191,10 @@ class FakeDiskApi:
     def corrupt(self, path: str, offset: int) -> None:
         """Flip every bit of the served byte at `offset` of a file; its metadata keeps the true checksums."""
         self._corruptions.setdefault(_tree_key(path), set()).add(offset)
+
+    def repair(self, path: str) -> None:
+        """Serve the true bytes of a file `corrupt` changed again."""
+        self._corruptions.pop(_tree_key(path), None)
 
     def expire_links(self, status: int = 410) -> None:
         """Make every download link issued so far answer `status`; links issued later work."""

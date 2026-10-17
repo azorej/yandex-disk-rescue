@@ -183,7 +183,7 @@ class DiskClient:
         if status == httpx.codes.NOT_FOUND:
             raise RemotePathNotFoundError(f"Remote path '{target}' does not exist.")
         if response.is_client_error and status != httpx.codes.UNAUTHORIZED:
-            raise DownloadRefusedError(_in_context(_status_failure(response), context))
+            raise DownloadRefusedError(target, _status_failure(response))
         self._raise_for_status(response, context=context)
         try:
             return parse_download_link(response.content)

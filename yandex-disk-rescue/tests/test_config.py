@@ -4,6 +4,7 @@ import itertools
 import urllib.parse
 
 import pytest
+from fake_disk_server import Delay
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.paths import config_dir
@@ -11,7 +12,7 @@ from yandex_disk_rescue.paths import config_dir
 runner = CliRunner()
 
 TOKEN = 'y0_AgAAAAB-config-sentinel-token'
-OPTIONS = 'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, client_id'
+OPTIONS = 'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, client_id'
 
 
 @pytest.fixture
@@ -94,6 +95,16 @@ def test_auth_login_reads_the_client_id_from_the_config_file(fake_disk_api, tmp_
     assert urllib.parse.parse_qs(urllib.parse.urlsplit(url).query)['client_id'] == [expected_client_id]
 
 
+def test_download_reads_the_download_timeout_from_the_config_file(disk, tmp_path):
+    _write_default_config('download_timeout = 1\n')
+    disk.inject('GET', '/download', Delay(2), where={'path': 'disk:/A/file.txt'})
+
+    result = runner.invoke(app, ['download', 'disk:/A', str(tmp_path / 'dest')])
+
+    assert result.exit_code == 1
+    assert '  disk:/A/file.txt: the download failed: the request timed out after 1 s (ReadTimeout)\n' in result.stdout
+
+
 @pytest.mark.parametrize(
     ('text', 'reason'),
     [
@@ -103,12 +114,13 @@ def test_auth_login_reads_the_client_id_from_the_config_file(fake_disk_api, tmp_
         ('api_retries = true\n', 'api_retries: must be an integer.'),
         ('api_url = 8080\n', 'api_url: must be a string.'),
         ('api_url = "ftp://example.com"\n', 'api_url: must be an http:// or https:// URL.'),
+        ('download_timeout = 0\n', 'download_timeout: must be an integer from 1 to 600.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
         (b'client_id = "\xff"\n', 'is not UTF-8 text.'),
     ],
 )
-@pytest.mark.parametrize('command', [['scan'], ['auth', 'status'], ['auth', 'logout']])
+@pytest.mark.parametrize('command', [['scan'], ['download', 'dest'], ['auth', 'status'], ['auth', 'logout']])
 def test_an_invalid_config_file_is_a_usage_error_naming_the_path_and_the_key(fake_disk_api, command, text, reason):
     path = _write_default_config(text)
 

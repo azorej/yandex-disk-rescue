@@ -7,6 +7,7 @@ uv run yandex-disk-rescue --help
 uv run yandex-disk-rescue --version
 uv run yandex-disk-rescue auth status
 uv run yandex-disk-rescue scan disk:/Photos
+uv run yandex-disk-rescue download disk:/Photos /tmp/photos
 ```
 
 Tests: `mise run test -- yandex-disk-rescue/tests`.
@@ -23,6 +24,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_API_CONCURRENCY` | Maximum Disk API requests in flight, 1 to 30 (default 7). Same as `--api-concurrency`. |
 | `YANDEX_DISK_RESCUE_API_TIMEOUT` | Timeout of one Disk API request, 1 to 300 s (default 30). Same as `--api-timeout`. |
 | `YANDEX_DISK_RESCUE_API_RETRIES` | Retries after a transport error or a throttling status, 0 to 20 (default 5). Same as `--api-retries`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | Timeout of connecting to the download host and of each read from it, 1 to 600 s (default 60). Same as `--download-timeout`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
 
@@ -72,12 +74,21 @@ yandex-disk-rescue/
 │   │                 #   (config-file values as Click's default_map), the `auth` commands, registration of
 │   │                 #   the commands in `commands/`
 │   ├── commands/
-│   │   └── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
+│   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
+│   │   └── download.py # The `download` command: arguments, scan, destination, mirror run, summary, exit code
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
-│   │                 #   scan session (folders that vanish mid-walk), the commit, the summary lines
+│   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
+│   │                 #   commit, the summary lines
+│   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries (skip, folders, things in
+│   │                 #   the way, hard-link aliases), the per-file pipeline (link, fetch into a partial file while
+│   │                 #   hashing, verify, place, record), the summary lines
+│   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
+│   │                 #   RENAME_NOREPLACE probe, partial files, folder creation and placement, never through a link
+│   ├── localfs.py    # Name-creating syscalls relative to folder descriptors: open without following links, mkdir,
+│   │                 #   renameat2(RENAME_NOREPLACE) through ctypes
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
-│   ├── paths.py      # XDG config and state directories
+│   ├── paths.py      # XDG config and state directories, the manifest path
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names and download records per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
@@ -102,13 +113,14 @@ yandex-disk-rescue/
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
     │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
-    │                       #   (`corrupt`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
+    │                       #   (`corrupt` and `repair`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
     │                       #   `inject`ed faults (statuses, delays, `Truncate`); a `routes` override table; the
     │                       #   request log
     ├── test_api_client.py
     ├── test_auth.py
     ├── test_cli.py
     ├── test_config.py
+    ├── test_download.py
     ├── test_local_names.py
     ├── test_manifest.py
     ├── test_rate_limiter.py

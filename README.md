@@ -5,9 +5,10 @@ account to local storage. It is a headless analogue of the Windows app
 [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
 > **Status: early development.** OAuth token handling
-> (`yandex-disk-rescue auth`) and scanning the remote tree into a local
-> manifest (`yandex-disk-rescue scan`) work. Downloads are being built.
-> Planned work is tracked in GitHub issues.
+> (`yandex-disk-rescue auth`), scanning the remote tree into a local
+> manifest (`yandex-disk-rescue scan`) and verified, one-file-at-a-time
+> mirroring (`yandex-disk-rescue download`) work. Speed and safety features
+> are being built; planned work is tracked in GitHub issues.
 
 ## Goals
 
@@ -161,13 +162,107 @@ the manifest at a time; a second one fails with `Another yandex-disk-rescue
 run is using ...`.
 Paths outside `disk:/` (such as `trash:/`) are refused.
 
+## Downloading
+
+```bash
+yandex-disk-rescue download /mnt/backup              # the whole Disk into /mnt/backup
+yandex-disk-rescue download disk:/Photos ~/Photos    # one folder
+```
+
+`download [REMOTE_PATH] DEST` first scans REMOTE_PATH (default `disk:/`)
+exactly as [`scan`](#scanning-a-folder) does and prints the scan summary.
+It then mirrors that folder into DEST, one file at a time: the folder
+structure is kept, empty folders are created, and every file gets the
+modification time it has on the Disk. It takes the `--api-*` options and
+`--download-timeout` (see [Configuration](#configuration)).
+
+**Verified.** A file reaches its final path only after its size and every
+checksum the Disk has for it (MD5 and SHA-256) match the downloaded bytes.
+Until then it is written to `DEST/.yandex-disk-rescue/partial/`; a file that
+fails the check is deleted from there and reported. A file with neither
+checksum on the Disk can only be checked by its size; the summary lists such
+files. Placing a file never replaces anything at its final path.
+
+**Reruns.** A file verified by an earlier run is skipped without being read
+again when its Disk metadata is unchanged and the local file still has the
+recorded size, modification time and inode. Anything else is downloaded
+again. A transfer error fails that file; rerun to fetch it.
+
+**Summary.**
+
+```
+Downloading 120 files (1.2 GiB) to /mnt/backup/Photos
+Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 2 failed
+Verified by size only (no cloud checksum): 1
+  disk:/Photos/old.bmp
+Renamed for the destination: 1
+  disk:/Photos/a.txt -> a~1a2b3c4d.txt
+Failed: 2
+  disk:/Photos/bad.jpg: MD5 mismatch (expected …, got …)
+  disk:/Photos/notes.txt: notes.txt already exists and was not written by this mirror; it was left untouched
+Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+```
+
+Each list shows at most 20 entries, then `… and N more`. When anything
+failed, the run ends with `Error: N failed; see the list above.` and exit
+code `1`; a rerun retries exactly what is not verified yet.
+
+**Files already in DEST.** A file or folder at a path the mirror needs that
+this mirror did not write is left untouched, and that entry (and, for a
+folder, everything below it) is reported as failed. The same holds for a
+symbolic link inside DEST: the tool never writes through one. A path that is
+the same file as another mirrored file (a hard link, or a name that a case-
+or normalization-insensitive filesystem treats as the same) is never
+replaced. A Disk entry whose name is not valid Unicode cannot be requested
+from the API; it is reported as failed.
+
+**The destination.** DEST may exist; if it does not, only its last component
+is created, so a mistyped mount point fails instead of filling another disk.
+A DEST that is not a folder or whose parent does not exist, or a DEST
+starting with `disk:` (swapped arguments), is a usage error (exit `2`). A
+destination mirrors exactly one remote folder of one account; downloading
+another folder into it is refused. `DEST/.yandex-disk-rescue/` is the tool's
+work directory: it holds partial files and a lock, so only one run at a time
+can use a destination (`Another yandex-disk-rescue run is using DEST`), even
+runs with different manifests. The destination's filesystem must support
+renaming without replacing (`RENAME_NOREPLACE`; ext4, xfs, btrfs, tmpfs and
+HFS+ do); the run stops at the start otherwise. A full disk, an I/O error, a
+read-only filesystem or a permission error stops the run with
+`Error: Could not write <path>: <reason>.`
+
+**Failures that stop the run.** A token Yandex rejects, and a Disk API error
+that persists past the API retries (an outage), stop the run; files already
+verified stay verified, and a rerun picks up where it stopped. Ctrl+C prints
+`Interrupted; rerun to continue the download.` and exits with 130.
+
+### Local file names
+
+Names are kept exactly as the Disk has them, with no Unicode normalization
+and no character substitution, with two exceptions:
+
+- **Long names.** A name longer than 255 UTF-8 bytes, or than 255 UTF-16
+  units in its decomposed (NFD) form (the HFS+ limit), is shortened: the
+  extension is kept, the rest is cut, and `~<8 hex digits>` derived from the
+  full name is added.
+- **Colliding siblings.** Siblings whose names differ only in case, Unicode
+  normalization or invisible formatting characters would land on one file on
+  a case-insensitive disk (HFS+, APFS, exFAT, NTFS). The first in code-point
+  order (or the one that already has the name in this mirror) keeps it; the
+  others get the `~<hex>` suffix. The rule is the same on every filesystem,
+  so on ext4 too `a.txt` next to `A.txt` becomes `a~<hex>.txt`, and a mirror
+  can later be copied to a case-insensitive disk without loss. The name
+  `.yandex-disk-rescue` at the top of DEST is reserved.
+
+Once given, a local name is kept on later runs. The summary lists every
+entry whose local name differs from its Disk name.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
-| `0` | Success |
-| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run |
-| `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/` |
+| `0` | Success; for `download`, every file of the folder is verified at its final path |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run; for `download` also one or more failed files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run |
+| `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, and a DEST already mirroring another remote folder or account |
 | `130` | Interrupted with Ctrl+C |
 
 ## Rate limiting
@@ -211,10 +306,12 @@ first one that sets it wins:
 | `api_timeout` | `--api-timeout` | `YANDEX_DISK_RESCUE_API_TIMEOUT` | `30` | 1 to 300 (s) |
 | `api_retries` | `--api-retries` | `YANDEX_DISK_RESCUE_API_RETRIES` | `5` | 0 to 20 |
 | `api_url` | `--api-url` (hidden) | `YANDEX_DISK_RESCUE_API_URL` | `https://cloud-api.yandex.net` | an `http://` or `https://` URL |
+| `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `60` | 1 to 600 (s); bounds connecting to the download host and each read |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
-(`auth login`, `auth status`, `scan`); `client_id` applies to `auth login`.
+(`auth login`, `auth status`, `scan`, `download`); `download_timeout`
+applies to `download` and `client_id` to `auth login`.
 
 The config file is `$XDG_CONFIG_HOME/yandex-disk-rescue/config.toml`
 (`~/.config/yandex-disk-rescue/config.toml` when `XDG_CONFIG_HOME` is unset

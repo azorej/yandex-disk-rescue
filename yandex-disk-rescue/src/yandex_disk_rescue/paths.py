@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 
 APP_DIR_NAME = 'yandex-disk-rescue'
+MANIFEST_FILE_NAME = 'manifest.sqlite3'
 
 
 def config_dir() -> Path:
@@ -14,6 +15,11 @@ def config_dir() -> Path:
 def state_dir() -> Path:
     """Return `$XDG_STATE_HOME/yandex-disk-rescue` (default `~/.local/state/yandex-disk-rescue`) without creating it."""
     return _xdg_dir('XDG_STATE_HOME', '.local/state')
+
+
+def manifest_path() -> Path:
+    """Return the manifest database path in the state directory, without creating anything."""
+    return state_dir() / MANIFEST_FILE_NAME
 
 
 def _xdg_dir(env_var: str, default_under_home: str) -> Path:
