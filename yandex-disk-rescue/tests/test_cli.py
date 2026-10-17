@@ -22,6 +22,7 @@ def test_help_describes_the_tool():
     assert result.exit_code == 0
     assert 'Download everything from a Yandex Disk account' in result.stdout
     assert 'scan' in result.stdout
+    assert 'download' in result.stdout
 
 
 def test_installed_console_script_runs():

@@ -17,13 +17,20 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-from yandex_disk_rescue.api.errors import DiskApiError, NotAFolderError, RemotePathNotFoundError, TokenRejectedError
+from yandex_disk_rescue.api.errors import (
+    DiskApiError,
+    DownloadRefusedError,
+    NotAFolderError,
+    RemotePathNotFoundError,
+    TokenRejectedError,
+)
 from yandex_disk_rescue.api.limiter import AdaptiveLimiter, parse_retry_after
 from yandex_disk_rescue.api.models import (
     Account,
     MalformedBodyError,
     Resource,
     parse_account,
+    parse_download_link,
     parse_folder_page,
     parse_resource,
 )
@@ -32,6 +39,7 @@ from yandex_disk_rescue.auth import validate_token
 
 ACCOUNT_PATH = '/v1/disk/'
 RESOURCES_PATH = '/v1/disk/resources'
+DOWNLOAD_LINK_PATH = '/v1/disk/resources/download'
 PAGE_LIMIT = 1000
 _RESOURCE_KEYS = ('path', 'type', 'size', 'md5', 'sha256', 'modified')
 _RESOURCE_FIELDS = ','.join(_RESOURCE_KEYS)
@@ -73,7 +81,8 @@ class DiskClient:
     The token is checked for header safety on construction, before any request (`InvalidTokenError`).
     Every request goes through one `AdaptiveLimiter`; transport errors and throttling responses (429, 408,
     5xx) are retried up to `limits.retries` times, waiting `Retry-After` or an exponential backoff with
-    jitter. Every request maps 401/403 to `TokenRejectedError` and other failures to `DiskApiError` whose
+    jitter. Every request maps 401 (and 403, except on `download_link`) to `TokenRejectedError` and other
+    failures to `DiskApiError` whose
     message never includes the request headers or the token, and ends with ` (after N attempts)` when
     more than one attempt was made.
     """
@@ -90,6 +99,10 @@ class DiskClient:
             headers={'Authorization': f'OAuth {validate_token(token)}'},
             timeout=limits.timeout,
         )
+
+    @property
+    def limits(self) -> ApiLimits:
+        return self._limits
 
     async def __aenter__(self) -> Self:
         return self
@@ -156,6 +169,27 @@ class DiskClient:
                     RESOURCES_PATH, f'an empty page at offset {offset} of {page.total} items', context=context
                 )
 
+    async def download_link(self, path: str) -> str:
+        """Return the signed link to fetch the file at `path` with a plain GET and no token.
+
+        Raises `RemotePathNotFoundError` for a missing path and `DownloadRefusedError` for any other
+        non-throttling 4xx but 401: on this endpoint a 403 refuses one file, not the token.
+        """
+        target = normalize_remote_path(path)
+        context = f'Could not download {target}'
+        params = {'path': target, 'fields': 'href,method,templated'}
+        response = await self._get(DOWNLOAD_LINK_PATH, params, context=context)
+        status = response.status_code
+        if status == httpx.codes.NOT_FOUND:
+            raise RemotePathNotFoundError(f"Remote path '{target}' does not exist.")
+        if response.is_client_error and status != httpx.codes.UNAUTHORIZED:
+            raise DownloadRefusedError(target, _status_failure(response))
+        self._raise_for_status(response, context=context)
+        try:
+            return parse_download_link(response.content)
+        except MalformedBodyError as exc:
+            raise _unexpected_response(DOWNLOAD_LINK_PATH, str(exc), context=context) from None
+
     async def _get(self, api_path: str, params: dict[str, str | int], *, context: str | None) -> httpx.Response:
         retrying = AsyncRetrying(
             stop=stop_after_attempt(self._limits.retries + 1),
@@ -177,7 +211,7 @@ class DiskClient:
             try:
                 response = await self._http.get(api_path, params=params)
             except httpx.TransportError as exc:
-                reason = _transport_failure(exc, timeout=self._limits.timeout)
+                reason = describe_transport_error(exc, timeout=self._limits.timeout)
                 raise _TransientFailure(
                     f'Could not reach the Yandex Disk API at {self._base_url}: {reason}', retry_after=None
                 ) from None
@@ -218,8 +252,8 @@ def _status_failure(response: httpx.Response) -> str:
     return f'Yandex Disk API returned HTTP {response.status_code}: {_error_description(response)}'
 
 
-def _transport_failure(exc: httpx.TransportError, *, timeout: float) -> str:
-    """Describe a transport error without echoing the request, whose headers carry the token.
+def describe_transport_error(exc: httpx.TransportError, *, timeout: float) -> str:
+    """Describe a transport error without echoing the request, whose URL or headers may carry a secret.
 
     Only errors raised by the connection, the server or the URL scheme keep their text; anything else
     (such as httpx refusing to build the request) is reported by its type alone. Timeouts get their own

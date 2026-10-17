@@ -1,17 +1,24 @@
 """Tests for the config file layer: real TOML files feeding the registry options of `scan` and `auth`."""
 
 import itertools
+import sqlite3
 import urllib.parse
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 
 import pytest
+from fake_disk_server import Delay, Truncate
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.paths import config_dir
+from yandex_disk_rescue.paths import config_dir, manifest_path
 
 runner = CliRunner()
 
 TOKEN = 'y0_AgAAAAB-config-sentinel-token'
-OPTIONS = 'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, client_id'
+OPTIONS = (
+    'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, download_retries, '
+    'download_passes, scan_max_age, client_id'
+)
 
 
 @pytest.fixture
@@ -95,6 +102,40 @@ def test_auth_login_reads_the_client_id_from_the_config_file(fake_disk_api, tmp_
 
 
 @pytest.mark.parametrize(
+    ('fault', 'reason'),
+    [(Delay(2), 'the download stalled: no data for 1 s\n'), (Truncate(after_bytes=500), 'the download failed: ')],
+    ids=['stall', 'cut-short'],
+)
+def test_download_reads_its_transfer_options_from_the_config_file(disk, tmp_path, fault, reason):
+    _write_default_config('download_timeout = 1\ndownload_retries = 0\ndownload_passes = 1\n')
+    disk.add_file('disk:/A/file.txt', b'x' * 1000)
+    disk.inject('GET', '/download', fault, where={'path': 'disk:/A/file.txt'})
+
+    result = runner.invoke(app, ['download', 'disk:/A', str(tmp_path / 'dest')])
+
+    assert result.exit_code == 1
+    [failure] = [line for line in result.stdout.splitlines() if line.startswith('  disk:/A/file.txt: ')]
+    assert f'{failure}\n'.startswith(f'  disk:/A/file.txt: {reason}')
+    assert '(after' not in failure
+    assert 'Passes: 1 of 1\n' in result.stdout
+    assert len([r for r in disk.requests if r.path == '/download']) == 1
+
+
+@pytest.mark.parametrize(('age', 'scans'), [(timedelta(minutes=4), False), (timedelta(minutes=6), True)])
+def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, age, scans):
+    _write_default_config('scan_max_age = 5\n')
+    assert runner.invoke(app, ['scan']).exit_code == 0
+    with closing(sqlite3.connect(manifest_path())) as connection, connection:
+        completed_at = (datetime.now(UTC) - age).isoformat(timespec='microseconds')
+        connection.execute('UPDATE scans SET completed_at = ?', (completed_at,))
+
+    result = runner.invoke(app, ['download', str(tmp_path / 'dest')])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.startswith('Scanned disk:/' if scans else 'Using the scan of disk:/ completed ')
+
+
+@pytest.mark.parametrize(
     ('text', 'reason'),
     [
         (f'token = "{TOKEN}"\n', f'token: unknown option; the options are {OPTIONS}.'),
@@ -103,12 +144,16 @@ def test_auth_login_reads_the_client_id_from_the_config_file(fake_disk_api, tmp_
         ('api_retries = true\n', 'api_retries: must be an integer.'),
         ('api_url = 8080\n', 'api_url: must be a string.'),
         ('api_url = "ftp://example.com"\n', 'api_url: must be an http:// or https:// URL.'),
+        ('download_timeout = 0\n', 'download_timeout: must be an integer from 1 to 600.'),
+        ('download_retries = 21\n', 'download_retries: must be an integer from 0 to 20.'),
+        ('download_passes = -1\n', 'download_passes: must be an integer from 0 to 1000.'),
+        ('scan_max_age = 10081\n', 'scan_max_age: must be an integer from 0 to 10080.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
         (b'client_id = "\xff"\n', 'is not UTF-8 text.'),
     ],
 )
-@pytest.mark.parametrize('command', [['scan'], ['auth', 'status'], ['auth', 'logout']])
+@pytest.mark.parametrize('command', [['scan'], ['download', 'dest'], ['auth', 'status'], ['auth', 'logout']])
 def test_an_invalid_config_file_is_a_usage_error_naming_the_path_and_the_key(fake_disk_api, command, text, reason):
     path = _write_default_config(text)
 

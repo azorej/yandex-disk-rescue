@@ -73,6 +73,22 @@ def parse_resource(content: bytes) -> Resource:
     return _resource(_json_object(content), '')
 
 
+def parse_download_link(content: bytes) -> str:
+    """Parse a `GET /v1/disk/resources/download` body into the href to fetch with a plain GET.
+
+    The reasons never quote the href, which is a signed link.
+    """
+    body = _json_object(content)
+    href = _non_empty_string(body, 'href', 'href')
+    if not href.startswith(('https://', 'http://')):
+        raise MalformedBodyError('href is not an http(s) URL')
+    if body.get('method') != 'GET':
+        raise MalformedBodyError("method is missing or not 'GET'")
+    if body.get('templated') is not False:
+        raise MalformedBodyError('templated is missing or not false')
+    return href
+
+
 def _resource(item: object, prefix: str) -> Resource:
     """Parse one resource object; `prefix` locates it in the body for error messages (`''` for the body itself)."""
     if not isinstance(item, dict):

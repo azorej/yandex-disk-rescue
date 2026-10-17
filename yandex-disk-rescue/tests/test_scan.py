@@ -9,9 +9,9 @@ from datetime import UTC
 import pytest
 from fake_disk_server import Delay, FakeResponse
 from typer.testing import CliRunner
+from yandex_disk_rescue import scanning
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.paths import state_dir
 from yandex_disk_rescue.units import format_size
@@ -106,6 +106,22 @@ def test_a_rescan_lists_exactly_what_was_added_changed_and_removed(disk):
         f'Manifest: {_manifest_path()}\n'
     )
     assert _rows() == _tree_rows(disk)
+
+
+def test_entries_whose_names_are_not_valid_unicode_are_reported_and_not_recorded(disk):
+    disk.add_file('disk:/Docs/bad\udc80.txt', b'x')
+    disk.add_file('disk:/Bad\udc81/inside.txt', b'y')
+
+    result = _scan()
+
+    assert result.exit_code == 0, result.output
+    assert (
+        'Not recorded, the name is not valid Unicode: 2\n  disk:/Bad\\udc81\n  disk:/Docs/bad\\udc80.txt\n'
+    ) in result.stdout
+    assert result.stdout.startswith(f'Scanned disk:/: 6 files, 4 folders, {format_size(6013)}\n')
+    left_out = {'disk:/Docs/bad\udc80.txt', 'disk:/Bad\udc81', 'disk:/Bad\udc81/inside.txt'}
+    assert _rows() == [r for r in _tree_rows(disk) if r.path not in left_out]
+    assert 'disk:/Bad\udc81' not in [r.params.get('path') for r in disk.requests]
 
 
 def test_a_folder_scan_records_the_folder_itself_and_leaves_the_rest_alone(disk):
@@ -306,7 +322,7 @@ def _last_listing(fake, params: dict[str, str]):
 def test_a_folder_vanishing_on_a_later_page_discards_the_rows_of_sub_folders_listed_before(
     disk, monkeypatch, stage_batch, first_scan
 ):
-    monkeypatch.setattr(scan_command, '_STAGE_BATCH', stage_batch)
+    monkeypatch.setattr(scanning, '_STAGE_BATCH', stage_batch)
     _add_vanishing_tree(disk)
     if not first_scan:
         assert _scan().exit_code == 0

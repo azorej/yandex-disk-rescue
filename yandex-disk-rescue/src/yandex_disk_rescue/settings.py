@@ -93,6 +93,32 @@ API_RETRIES = Setting(
     'api_retries', 5, 'Retries of a Disk API request after a transport error or a throttling status.', _in_range(0, 20)
 )
 API_URL = Setting('api_url', 'https://cloud-api.yandex.net', 'Base URL of the Disk REST API.', _http_url, hidden=True)
+DOWNLOAD_TIMEOUT = Setting(
+    'download_timeout',
+    15,
+    'Stall timeout: a download fails as stalled when no data arrives from the download host for this long, in seconds.',
+    _in_range(1, 600),
+)
+DOWNLOAD_RETRIES = Setting(
+    'download_retries',
+    5,
+    'Retries of a download, at once and from where it stopped, after it failed having received new data.',
+    _in_range(0, 20),
+)
+DOWNLOAD_PASSES = Setting(
+    'download_passes',
+    7,
+    'Passes over the files to download: each pass after the first resumes the files whose download failed '
+    'transiently (a stall, a connection error, a 5xx); 0 passes until every file is done.',
+    _in_range(0, 1000),
+)
+SCAN_MAX_AGE = Setting(
+    'scan_max_age',
+    60,
+    'Reuse the last completed scan covering the remote folder when it is younger than this, in minutes; 0 always '
+    'scans.',
+    _in_range(0, 10080),
+)
 CLIENT_ID = Setting(
     'client_id',
     '9e2a0382c430429c9d57913b61d7d48f',
@@ -102,7 +128,18 @@ CLIENT_ID = Setting(
 
 SETTINGS: dict[str, Setting[Any]] = {
     setting.name: setting
-    for setting in (API_INTERVAL_MS, API_CONCURRENCY, API_TIMEOUT, API_RETRIES, API_URL, CLIENT_ID)
+    for setting in (
+        API_INTERVAL_MS,
+        API_CONCURRENCY,
+        API_TIMEOUT,
+        API_RETRIES,
+        API_URL,
+        DOWNLOAD_TIMEOUT,
+        DOWNLOAD_RETRIES,
+        DOWNLOAD_PASSES,
+        SCAN_MAX_AGE,
+        CLIENT_ID,
+    )
 }
 
 ApiIntervalMs = Annotated[int, API_INTERVAL_MS.typer_option()]
@@ -110,6 +147,10 @@ ApiConcurrency = Annotated[int, API_CONCURRENCY.typer_option()]
 ApiTimeout = Annotated[int, API_TIMEOUT.typer_option()]
 ApiRetries = Annotated[int, API_RETRIES.typer_option()]
 ApiUrl = Annotated[str, API_URL.typer_option()]
+DownloadTimeout = Annotated[int, DOWNLOAD_TIMEOUT.typer_option()]
+DownloadRetries = Annotated[int, DOWNLOAD_RETRIES.typer_option()]
+DownloadPasses = Annotated[int, DOWNLOAD_PASSES.typer_option()]
+ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 
 
