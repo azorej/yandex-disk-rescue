@@ -21,6 +21,22 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_API_TIMEOUT` | Timeout of one Disk API request, 1 to 300 s (default 30). Same as `--api-timeout`. |
 | `YANDEX_DISK_RESCUE_API_RETRIES` | Retries after a transport error or a throttling status, 0 to 20 (default 5). Same as `--api-retries`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file (default `~/.config`). |
+| `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
+
+## Manifest
+
+The manifest is a SQLite database at `$XDG_STATE_HOME/yandex-disk-rescue/manifest.sqlite3` (a 0600 file in a 0700
+directory). For each account (keyed by the Disk user uid) it stores every file and folder of each scanned remote
+folder: path, kind, size, MD5, SHA-256 and modification time.
+
+- It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
+  in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
+  unchanged, and the next scan discards its staged rows. Rescanning a folder replaces only that folder's subtree.
+- One run at a time: opening the manifest takes an exclusive lock on `manifest.sqlite3.lock`, and a second run fails
+  with `Another yandex-disk-rescue run is using ...`.
+- The database runs in WAL mode with `synchronous=FULL`, so it must live on a local filesystem.
+- The schema version is `PRAGMA user_version`. Schema changes append a migration to `manifest.py`; opening the
+  manifest applies pending ones, and a manifest from a newer version of the tool is refused.
 
 ## Layout
 
@@ -30,7 +46,8 @@ yandex-disk-rescue/
 │   ├── __init__.py   # Package version (read from installed metadata)
 │   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the `auth` commands
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
-│   ├── paths.py      # XDG config directory
+│   ├── paths.py      # XDG config and state directories
+│   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
 │   └── api/          # DiskClient — every Disk API request: the account check, paged folder listing,
@@ -44,5 +61,6 @@ yandex-disk-rescue/
     ├── test_api_client.py
     ├── test_auth.py
     ├── test_cli.py
+    ├── test_manifest.py
     └── test_rate_limiter.py
 ```

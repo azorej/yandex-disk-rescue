@@ -10,7 +10,7 @@ from typer.testing import CliRunner
 from yandex_disk_rescue import auth
 from yandex_disk_rescue.api import ApiLimits, DiskClient
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.paths import config_dir
+from yandex_disk_rescue.paths import config_dir, state_dir
 
 runner = CliRunner()
 
@@ -73,15 +73,19 @@ def test_save_token_rejects_empty_or_whitespace_values_without_echoing_them(valu
         assert value.strip() not in str(excinfo.value)
 
 
-@pytest.mark.parametrize('xdg_config_home', [None, '', 'relative/config'])
-def test_config_dir_falls_back_under_home(monkeypatch, tmp_path, xdg_config_home):
+@pytest.mark.parametrize(
+    ('directory', 'env_var', 'default_under_home'),
+    [(config_dir, 'XDG_CONFIG_HOME', '.config'), (state_dir, 'XDG_STATE_HOME', '.local/state')],
+)
+@pytest.mark.parametrize('xdg_value', [None, '', 'relative/dir'])
+def test_xdg_dirs_fall_back_under_home(monkeypatch, tmp_path, directory, env_var, default_under_home, xdg_value):
     monkeypatch.setenv('HOME', str(tmp_path))
-    if xdg_config_home is None:
-        monkeypatch.delenv('XDG_CONFIG_HOME')
+    if xdg_value is None:
+        monkeypatch.delenv(env_var)
     else:
-        monkeypatch.setenv('XDG_CONFIG_HOME', xdg_config_home)
+        monkeypatch.setenv(env_var, xdg_value)
 
-    assert config_dir() == tmp_path / '.config' / 'yandex-disk-rescue'
+    assert directory() == tmp_path / default_under_home / 'yandex-disk-rescue'
 
 
 def test_env_var_wins_over_the_file(monkeypatch):
