@@ -86,9 +86,9 @@ class FileFailed(Exception):
 
 
 class FileDeferred(FileFailed):
-    """The file's transfer failed transiently (a stall, a connection error, 408, 429 or 5xx, the retries spent); its
-    partial file and record are kept so a later pass resumes it. `retry_after` is the wait the download host asked
-    for, if any."""
+    """The file's transfer failed transiently (a stall, a connection error, 408, 429 or 5xx, the retries spent, a
+    refreshed link rejected again); its partial file and record are kept so a later pass resumes it. `retry_after` is
+    the wait the download host asked for, if any."""
 
     def __init__(self, reason: str, *, retry_after: float | None) -> None:
         super().__init__(reason)
@@ -958,8 +958,8 @@ class _Journal:
 
 
 class _Link:
-    """The download link the segments of one file share in one turn: requested on first use, and replaced once
-    when the download host rejects it."""
+    """The download link the segments of one file share in one turn: requested on first use, which comes once a
+    segment holds a connection, and replaced once when the download host rejects it."""
 
     def __init__(self, client: api.DiskClient, path: str) -> None:
         self._client = client
@@ -976,21 +976,23 @@ class _Link:
                 self._generation = 1
             return self._href, self._generation
 
-    async def rejected(self, generation: int, status: int) -> None:
-        """Replace the link of `generation`, which the host rejected with HTTP `status`, unless another segment has
-        replaced it already. Raises `FileFailed` when it was the replacement."""
+    async def rejected(self, generation: int) -> bool:
+        """Replace the link of `generation`, which the host rejected, unless another segment has replaced it already;
+        `False` when it was the replacement, which this turn does not replace."""
         async with self._lock:
             if generation != self._generation:
-                return
+                return True
             if generation > 1:
-                raise FileFailed(f'download link rejected again after a refresh (HTTP {status})')
+                return False
             self._href = await _download_link(self._client, self._path)
             self._generation += 1
+            return True
 
 
 class _FileFetch:
     """The fetch of one file's unfinished segments in one turn, each a ranged fetch of the rest of its segment, all
-    started at once; the content client's connection cap queues them."""
+    started at once; the content client's connection cap queues them, and each takes the file's link only once it
+    holds a connection."""
 
     def __init__(
         self,
@@ -1045,11 +1047,17 @@ class _FileFetch:
         """Fetch the rest of `stream`; the failure when it is deferred to a later pass.
 
         A failure after new data is resumed at once from where it stopped, up to `retries` times. An expired link is
-        replaced once for the whole file without spending a retry. Raises `FileFailed` for a failure that is not
-        transient, and `RangeNotHonouredError` when the host ignored the range of a fetch of less than the whole
-        file.
+        replaced once for the whole file without spending a retry; when the replacement is rejected too, the stream
+        is deferred, and the next pass gets a new link. Raises `FileFailed` for a failure that is not transient, and
+        `RangeNotHonouredError` when the host ignored the range of a fetch of less than the whole file.
         """
         size = self._identity.size
+        generation = 0
+
+        async def link() -> str:
+            nonlocal generation
+            href, generation = await self._link.current()
+            return href
 
         async def write(offset: int, chunk: bytes) -> None:
             await stream.write(self._partial, self._threads, offset, chunk)
@@ -1058,11 +1066,12 @@ class _FileFetch:
         attempt_number = 1
         while True:
             before = stream.written
-            href, generation = await self._link.current()
             try:
-                await self._attempt(href, stream, write)
+                await self._attempt(link, stream, write)
             except api.LinkExpiredError as exc:
-                await self._link.rejected(generation, exc.status)
+                if not await self._link.rejected(generation):
+                    reason = f'download link rejected again after a refresh (HTTP {exc.status})'
+                    return FileDeferred(reason, retry_after=None)
             except api.RangeNotHonouredError as exc:
                 if before == 0 and stream.end == size:
                     raise FileFailed(exc.reason) from None
@@ -1079,11 +1088,13 @@ class _FileFetch:
             else:
                 return None
 
-    async def _attempt(self, href: str, stream: _Stream, write: Callable[[int, bytes], Awaitable[None]]) -> None:
-        """One fetch of the rest of `stream`; an attempt that ends with a transfer error or a cancellation takes a
-        checkpoint first."""
+    async def _attempt(
+        self, link: Callable[[], Awaitable[str]], stream: _Stream, write: Callable[[int, bytes], Awaitable[None]]
+    ) -> None:
+        """One fetch of the rest of `stream` from the link `link()` returns; an attempt that ends with a transfer error
+        or a cancellation takes a checkpoint first."""
         try:
-            await self._content.fetch(href, start=stream.written, end=stream.end, size=self._identity.size, write=write)
+            await self._content.fetch(link, start=stream.written, end=stream.end, size=self._identity.size, write=write)
         except api.TransferError, asyncio.CancelledError:
             await self._journal.take()
             raise

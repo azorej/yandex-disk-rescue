@@ -103,9 +103,10 @@ yandex-disk-rescue/
 │   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
 │   │                 #   from its checkpoint journal once the cloud file is confirmed unchanged and each
 │   │                 #   segment's confirmed bytes re-hashed; the segment plan of a new download; one link per
-│   │                 #   file shared by its segments, preallocation of a segmented file, parallel ranged
-│   │                 #   fetches of its segments while hashing with checkpoints, immediate retries after new
-│   │                 #   data and one link refresh, the fallback to one stream when the host ignores a range;
+│   │                 #   file shared by its segments and taken once one holds a connection, preallocation of
+│   │                 #   a segmented file, parallel ranged fetches of its segments while hashing with
+│   │                 #   checkpoints, immediate retries after new data and one link refresh per pass, the
+│   │                 #   fallback to one stream when the host ignores a range;
 │   │                 #   verify, by reading a segmented file back; move aside what is in the way, place,
 │   │                 #   record), the rejected-name conversion of a folder or file name the destination
 │   │                 #   refuses, later passes over transiently failed files, the summary lines; disk work
@@ -140,7 +141,8 @@ yandex-disk-rescue/
 │       ├── errors.py # The RescueError subclasses of failed API requests
 │       └── transfer.py # ContentClient — fetches byte ranges from the download host into an async write
 │                       #   callback, awaited before the next chunk is read, at most `connections` fetches in
-│                       #   flight (waiting for one never counts as a stall), with no token, following redirects,
+│                       #   flight (waiting for one never counts as a stall), each asking for its link only once
+│                       #   it has a connection, with no token, following redirects,
 │                       #   with a stall (silence) timeout; its errors (expired link, transient, range not
 │                       #   honoured, refused, too many bytes) never quote the link
 └── tests/

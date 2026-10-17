@@ -275,11 +275,13 @@ stream, never appended to the bytes kept.
   checksum mismatch, a refused download, a file changed in the cloud and a
   local write error fail the file at once, stopping its other segments; no
   later pass retries it.
-- **Expired links.** The segments of a file share one download link per pass.
-  A link the host rejects (`401`, `403` or `410`) is replaced by a new one
-  once per pass for the whole file, and the download continues from the bytes
-  received; when the new link is rejected too, the file fails with
-  `download link rejected again after a refresh (HTTP <n>)`.
+- **Expired links.** The segments of a file share one download link per pass,
+  requested only once a segment has a free connection, so no link ages while
+  it waits for one. A link the host rejects (`401`, `403` or `410`) is
+  replaced by a new one once per pass for the whole file, and the download
+  continues from the bytes received; when the new link is rejected too, the
+  file waits for the next pass, which starts with a new link; after the last
+  pass its reason is `download link rejected again after a refresh (HTTP <n>)`.
 
 **Summary.**
 

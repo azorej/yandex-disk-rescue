@@ -62,9 +62,9 @@ class ContentClient:
     headers or the next piece of the body), takes longer. A slow but steady transfer never trips it, and time spent
     in the `write` callback does not count.
 
-    At most `connections` fetches are in flight, each from its first request (redirects included) until its body
-    ends or fails; a fetch over the cap waits for a free one, and that wait does not count toward the stall timeout
-    either. The connection pool itself never makes a request wait.
+    At most `connections` fetches are in flight, each from obtaining its link and its first request (redirects
+    included) until its body ends or fails; a fetch over the cap waits for a free one, and that wait does not count
+    toward the stall timeout either. The connection pool itself never makes a request wait.
     """
 
     def __init__(self, *, timeout: float, connections: int) -> None:
@@ -91,21 +91,43 @@ class ContentClient:
         await self._http.aclose()
 
     async def fetch(
-        self, href: str, *, start: int, end: int, size: int, write: Callable[[int, bytes], Awaitable[None]]
+        self,
+        link: Callable[[], Awaitable[str]],
+        *,
+        start: int,
+        end: int,
+        size: int,
+        write: Callable[[int, bytes], Awaitable[None]],
     ) -> None:
-        """Fetch bytes `[start, end)` of a file of `size` bytes, awaiting `write(offset, chunk)` in offset order.
+        """Fetch bytes `[start, end)` of a file of `size` bytes from the URL `link()` returns, awaiting
+        `write(offset, chunk)` in offset order.
 
-        Each `write` is awaited before the next chunk is read. The whole file (`start == 0`, `end == size`) is
-        requested without `Range`, and 200 or the matching 206 is accepted; any other range sends
-        `Range: bytes=<start>-<end-1>` and requires that 206. Exceptions from `write` propagate unchanged.
+        `link()` is awaited once a connection is free, so no link is held while the fetch waits for one. Each `write`
+        is awaited before the next chunk is read. The whole file (`start == 0`, `end == size`) is requested without
+        `Range`, and 200 or the matching 206 is accepted; any other range sends `Range: bytes=<start>-<end-1>` and
+        requires that 206. Exceptions from `link` and `write` propagate unchanged.
         """
         whole = start == 0 and end == size
         if not whole and not 0 <= start < end <= size:
             raise ValueError(f'invalid range [{start}, {end}) of a {size}-byte file')
         headers = {} if whole else {'Range': f'bytes={start}-{end - 1}'}
+        async with self._slots:
+            href = await link()
+            await self._get(href, headers, start=start, end=end, size=size, write=write)
+
+    async def _get(
+        self,
+        href: str,
+        headers: dict[str, str],
+        *,
+        start: int,
+        end: int,
+        size: int,
+        write: Callable[[int, bytes], Awaitable[None]],
+    ) -> None:
         try:
-            async with self._slots, self._http.stream('GET', href, headers=headers) as response:
-                _check_response(response, start=start, end=end, size=size, ranged=not whole)
+            async with self._http.stream('GET', href, headers=headers) as response:
+                _check_response(response, start=start, end=end, size=size, ranged='Range' in headers)
                 await _write_body(response, start=start, end=end, write=write)
         except httpx.TimeoutException:
             raise TransientTransferError(f'the download stalled: no data for {self._timeout:g} s') from None
