@@ -226,6 +226,18 @@ async def _mirror(
         typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     if destination.separate_partials:
         typer.echo(f'Partial files in {destination.partial_folder}')
+    if (move := run.partial_move) is not None:
+        if move.missing:
+            typer.echo(
+                f'The partial folder of the last run, {move.source}, is missing; its downloads in progress start '
+                'again from their first byte.'
+            )
+        elif move.downloads:
+            downloads = 'download' if move.downloads == 1 else 'downloads'
+            typer.echo(
+                f'Moving the confirmed bytes ({format_size(move.size)}) of {move.downloads} {downloads} in progress '
+                f'from {move.source} to {move.target}'
+            )
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
         policy = TransferPolicy(
             retries=transfers.retries,

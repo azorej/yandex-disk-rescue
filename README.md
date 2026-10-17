@@ -242,11 +242,23 @@ resume — happens on that disk, not on DEST:
   container layer that a rebuild discards. When the folder is lost, the
   downloads in progress start again from their first byte. Do not share one
   `PATH` between machines.
-- Turning the option on or off, or changing `PATH`, starts the downloads in
-  progress again from their first byte in the new folder; the partial files
-  in the old one are left where they are. Remounting DEST at another path
-  makes it a new mirror with a new `<key>`; the old `PATH/<key>/` can then be
-  deleted.
+- The manifest records which folder the partial files of each DEST are in.
+  When a run's folder differs from it — the option turned on or off, or
+  `PATH` changed — the run first moves the downloads in progress there,
+  printing `Moving the confirmed bytes (<size>) of N downloads in progress
+  from <old> to <new>`. Only the bytes the journals confirm are copied, one
+  file at a time; the rest (bytes past the last checkpoint, a segmented
+  file's zero-fill) is never read and is fetched again. Each copy is flushed
+  to the disk before its old file is deleted, and the old folder is deleted
+  at the end (for DEST's own `partial/`, only the files in it). A run stopped
+  during the move goes on with it on the next run, losing no confirmed byte.
+  A confirmed range missing from an old file cut short (by hand, or by a
+  power cut on a disk that lost the end of a write) is fetched again. When
+  the recorded folder is gone, the run prints `The partial folder of the last
+  run, <old>, is missing; its downloads in progress start again from their
+  first byte.`, and they do.
+- Remounting DEST at another path makes it a new mirror with a new `<key>`;
+  the old `PATH/<key>/` can then be deleted.
 
 **When it scans.** `download` reuses the last completed scan of the account
 covering REMOTE_PATH — a scan of REMOTE_PATH itself or of a folder above it,
@@ -452,10 +464,14 @@ DEST and never writes to its target. DEST itself may be a link.
 
 **Nothing is deleted.** The tool never deletes or truncates anything outside
 `DEST/.yandex-disk-rescue/partial/` and, with `--partial-dir PATH`, DEST's
-folder `PATH/<key>/`. At the start of every run it deletes the staged copies
+folder `PATH/<key>/`, or the `<key>/` folder below the `PATH` an earlier run
+used. At the start of every run it deletes the staged copies
 (`<id>.copy` files) in `DEST/.yandex-disk-rescue/partial/`, and in the partial
 folder of the run every file that is not the partial file of a download in
-progress (folders and links there are left alone). A partial file that cannot
+progress (folders and links there are left alone). After moving the
+downloads in progress out of an earlier run's partial folder, it deletes the
+files left in it, then the folder itself when it is empty (DEST's own
+`partial/` stays). A partial file that cannot
 be deleted once its file's outcome is recorded (a folder made there under its
 name, say) is listed under `Partial files not deleted` with the reason; the
 file still counts as verified or quarantined. Moved-aside and quarantined copies

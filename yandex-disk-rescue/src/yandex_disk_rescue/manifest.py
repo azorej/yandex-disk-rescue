@@ -13,7 +13,8 @@ of a partial download (`download_segments`), the reason the last turn of an entr
 of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
 wrong at the entry's final path (`verify_findings`), all keyed by `entries.id`. A rescan never rewrites them: a
 record keeps the remote identity it was made for, and only an entry's removal from the manifest deletes its rows.
-A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got.
+A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got, and the
+folder its partial files were last in (`mirrors.partial_folder`).
 
 The database runs in WAL mode with `synchronous=FULL`: a commit is atomic and durable across a crash or power cut,
 and each `ScanSession.add` costs one WAL append and fsync instead of the rollback journal's several. WAL needs a
@@ -219,6 +220,11 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
             checked_through TEXT
         )
         """,
+    ),
+    (
+        # The folder holding the partial files of the mirror's downloads in progress, as `destination` is stored; NULL
+        # for the destination's own `.yandex-disk-rescue/partial/`.
+        'ALTER TABLE mirrors ADD COLUMN partial_folder BLOB',
     ),
 )
 
@@ -615,6 +621,27 @@ class Mirror:
         self.account_uid = account_uid
         self.remote_root = remote_root
         self.destination = destination
+
+    @property
+    def partial_folder(self) -> Path | None:
+        """The folder the partial files of this mirror's downloads in progress were last recorded in; `None` for the
+        destination's own."""
+        with self._manifest._errors('read'):
+            (folder,) = self._manifest._connection.execute(
+                'SELECT partial_folder FROM mirrors WHERE id = ?', (self.id,)
+            ).fetchone()
+        return None if folder is None else Path(os.fsdecode(folder))
+
+    def record_partial_folder(self, folder: Path | None) -> None:
+        """Record `folder` (absolute), or `None` for the destination's own, as the folder of this mirror's partial
+        files."""
+        if folder is not None and not folder.is_absolute():
+            raise ValueError(f'partial folder {folder} is not an absolute path')
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'UPDATE mirrors SET partial_folder = ? WHERE id = ?',
+                (None if folder is None else os.fsencode(folder), self.id),
+            )
 
     def entries(self) -> list[MirrorEntry]:
         """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names,

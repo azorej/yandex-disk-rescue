@@ -51,7 +51,10 @@ folder: a scan of the folder itself or of an ancestor), and the entries each sca
 not valid Unicode (`unencodable_entries`, the path stored as a BLOB; `Mirror.unencodable` lists those below a
 mirror's root), so a run reusing a scan still reports them.
 
-For each destination directory ("mirror") it records the local name of every entry and each file's download state.
+For each destination directory ("mirror") it records the local name of every entry, each file's download state,
+and the folder the partial files of its downloads in progress are in (`mirrors.partial_folder`, the path in OS bytes;
+`Mirror.partial_folder` reads it, `None` for the destination's own `.yandex-disk-rescue/partial/`, and
+`Mirror.record_partial_folder` sets it; a mirror from schema version 8 or older gets `None` on the upgrade).
 A destination mirrors exactly one remote folder of one account; `Manifest.mirror` refuses a destination already
 recorded for another folder or account (`MirrorMismatchError`, exit code 2). `Manifest.mirror_at` looks a recorded
 mirror up by its destination without creating one.
@@ -131,7 +134,8 @@ yandex-disk-rescue/
 │   │                 #   failed folders) and the folders
 │   │                 #   above it (skip, hold quarantined files, fetch again files with a verify finding without
 │   │                 #   reading their copy, folders, things in the way, hard-link aliases) with
-│   │                 #   up to `download_connections` files in progress at once
+│   │                 #   up to `download_connections` files in progress at once, after moving the confirmed
+│   │                 #   bytes of the downloads in progress when the partial folder changed since the last run,
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
 │   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
@@ -164,7 +168,8 @@ yandex-disk-rescue/
 │   │                 #   work directory, the RENAME_NOREPLACE probe, partial files in DEST's `partial/` or in
 │   │                 #   DEST's own folder below `--partial-dir` (`<key>/`, created on open), the staged copy
 │   │                 #   `partial/<id>.copy` a separate partial file is copied to (each left by a stopped run
-│   │                 #   deleted at the start of the next), reading existing files,
+│   │                 #   deleted at the start of the next), the partial folder an earlier run used (reading,
+│   │                 #   deleting its partial files and its leftovers), reading existing files,
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
 │   │                 #   link; which errors stop the run;
@@ -178,7 +183,8 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories, the manifest path
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure and quarantine records, verify findings and the verify pass per destination)
+│   │                 #   failure and quarantine records, verify findings, the verify pass and the folder of the
+│   │                 #   partial files per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry

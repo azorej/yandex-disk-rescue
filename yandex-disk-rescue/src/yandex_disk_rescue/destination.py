@@ -4,6 +4,7 @@ in, and every file operation inside them; and the read-only view of a destinatio
 Partial files live in the destination's own `.yandex-disk-rescue/partial/`, or, with a partial folder given, in the
 destination's own folder below it. In the first layout a finished partial file is itself placed or quarantined; in
 the second it is first copied to a staged copy in the destination's `partial/`, which is then placed or quarantined.
+The partial folder an earlier run used, either layout, opens to read and delete the partial files left there.
 
 All operations go through open folder descriptors and `localfs`, so none follows a symbolic link inside the
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
@@ -252,6 +253,7 @@ class Destination(_Tree):
         self._separate = separate
         self._started = started
         self._run_folders: dict[str, tuple[int, PurePosixPath]] = {}
+        self._previous_fds: list[int] = []
 
     @classmethod
     def open(cls, path: Path, *, partial_dir: Path | None) -> Destination:
@@ -303,7 +305,17 @@ class Destination(_Tree):
     def close(self) -> None:
         run_fds = [fd for fd, _ in self._run_folders.values()]
         separate_fds = [] if self._separate is None else [self._separate[0]]
-        _close_all([self._partial_fd, self._lock_fd, self._work_fd, self._root_fd, *run_fds, *separate_fds])
+        _close_all(
+            [
+                self._partial_fd,
+                self._lock_fd,
+                self._work_fd,
+                self._root_fd,
+                *run_fds,
+                *separate_fds,
+                *self._previous_fds,
+            ]
+        )
 
     def __enter__(self) -> Self:
         return self
@@ -360,6 +372,32 @@ class Destination(_Tree):
                     pass
                 except OSError as exc:
                     raise OSError(exc.errno, exc.strerror, str(path)) from None
+
+    def sync_partial_folder(self) -> None:
+        """Make the files created in and deleted from the partial folder durable."""
+        with _work_errors(self.partial_folder):
+            os.fsync(self._files_fd)
+
+    def previous_partials(self, folder: Path) -> PreviousPartials | None:
+        """The separate partial folder `folder` an earlier run used (a `partial_folder` of a destination opened with a
+        partial folder), opened to read and delete the partial files there; `None` when it is missing. Nothing is
+        created, and the folder stays open until the destination is closed. Any other error raises `DestinationError`
+        naming `folder`."""
+        try:
+            fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError as exc:
+            if exc.errno in _MISSING_ERRNOS:
+                return None
+            raise DestinationError.of(folder, exc) from None
+        self._previous_fds.append(fd)
+        return PreviousPartials(fd, folder, own=False)
+
+    def own_partials(self) -> PreviousPartials:
+        """The destination's own `.yandex-disk-rescue/partial/` as `previous_partials` opens a folder, for the partial
+        files an earlier run kept there."""
+        fd = os.dup(self._partial_fd)
+        self._previous_fds.append(fd)
+        return PreviousPartials(fd, self._own_partials, own=True)
 
     def remove_staged_copies(self) -> None:
         """Delete every regular file named `<digits>.copy` in the destination's `.yandex-disk-rescue/partial/`: the
@@ -548,6 +586,87 @@ class PartialFile:
         with _work_errors(self._path):
             localfs.set_times(self._fd, atime_ns=mtime_ns, mtime_ns=mtime_ns)
             os.fsync(self._fd)
+
+
+class PreviousPartials:
+    """The partial folder at `path` an earlier run used, opened by `Destination.previous_partials` or
+    `Destination.own_partials`: the partial file of an entry, read-only, deleting it, and deleting what is left there.
+
+    Every error raises `DestinationError` naming the file or the folder, except reading an opened partial file, which
+    fails as `PartialFile` does.
+    """
+
+    def __init__(self, fd: int, path: Path, *, own: bool) -> None:
+        self.path = path
+        self._fd = fd
+        self._own = own
+
+    def size(self, entry_id: int) -> int | None:
+        """The size of the partial file of `entry_id`; `None` when there is no regular file of that name."""
+        name = str(entry_id)
+        try:
+            found = localfs.lstat(name, dir_fd=self._fd)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise DestinationError.of(self.path / name, exc) from None
+        return found.st_size if stat.S_ISREG(found.st_mode) else None
+
+    @contextmanager
+    def partial(self, entry_id: int) -> Iterator[PartialFile]:
+        """Open the partial file of `entry_id` for reading."""
+        path = self.path / str(entry_id)
+        try:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self._fd)
+        except OSError as exc:
+            raise DestinationError.of(path, exc) from None
+        try:
+            yield PartialFile(fd, path)
+        finally:
+            os.close(fd)
+
+    def remove(self, entry_id: int) -> None:
+        """Delete the partial file of `entry_id` and make that durable; a missing one is no error."""
+        name = str(entry_id)
+        try:
+            try:
+                os.unlink(name, dir_fd=self._fd)
+            except FileNotFoundError:
+                pass
+            os.fsync(self._fd)
+        except OSError as exc:
+            raise DestinationError.of(self.path / name, exc) from None
+
+    def remove_leftovers(self) -> None:
+        """Delete every regular file in the folder, and then the folder itself, which is left in place when something
+        else keeps it from being empty. In the destination's own folder the folder stays, and so do the staged copies,
+        which `Destination.remove_staged_copies` handles."""
+        try:
+            with os.scandir(self._fd) as found:
+                files = [e.name for e in found if e.is_file(follow_symlinks=False)]
+            for name in files:
+                if not (self._own and _COPY_NAME.fullmatch(name)):
+                    os.unlink(name, dir_fd=self._fd)
+            os.fsync(self._fd)
+            if not self._own:
+                _remove_empty_folder(self.path)
+        except OSError as exc:
+            raise DestinationError.of(self.path, exc) from None
+
+
+def _remove_empty_folder(path: Path) -> None:
+    """Delete the folder `path` and make that durable, unless it is not empty."""
+    parent_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        try:
+            os.rmdir(path.name, dir_fd=parent_fd)
+        except OSError as exc:
+            if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                return
+            raise
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 @contextmanager

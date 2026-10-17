@@ -31,6 +31,13 @@ to the recorded digest; other bytes are fetched again, never trusted. A segment 
 is resumed at once, within a retry budget, from the bytes this turn wrote; one that fails transiently otherwise
 waits for the next pass over the files still to download.
 
+The manifest records the folder the mirror's partial files are in. A run whose folder differs first moves each
+download in progress there, one at a time: only each segment's confirmed bytes are copied, a segment whose confirmed
+bytes the old file no longer holds is reset in the journal, and the copy is made durable before the old file is
+deleted. Then what is left in the old folder is deleted and the new folder recorded; a run stopped on the way leaves
+the old folder recorded, so the next run moves the files still there. A recorded folder that is gone is reported, and
+its downloads start again.
+
 A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
 conversion, which is then recorded as its local name.
 
@@ -60,7 +67,14 @@ from types import TracebackType
 from typing import Self
 
 from yandex_disk_rescue import api
-from yandex_disk_rescue.destination import FATAL_ERRNOS, NAME_ERRNOS, Destination, DestinationError, PartialFile
+from yandex_disk_rescue.destination import (
+    FATAL_ERRNOS,
+    NAME_ERRNOS,
+    Destination,
+    DestinationError,
+    PartialFile,
+    PreviousPartials,
+)
 from yandex_disk_rescue.disk_threads import DiskThreads
 from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
@@ -131,6 +145,19 @@ class PartialLeft:
 
     path: Path
     reason: str
+
+
+@dataclass(frozen=True)
+class PartialMove:
+    """The partial files of downloads in progress moving from `source`, the folder the last run recorded, to `target`,
+    this run's: `downloads` of them, with `size` confirmed bytes to copy. With `missing`, `source` no longer exists and
+    nothing is moved."""
+
+    source: Path
+    target: Path
+    downloads: int
+    size: int
+    missing: bool
 
 
 @dataclass(frozen=True)
@@ -378,8 +405,9 @@ class _FileTurns:
 
 class MirrorRun:
     """One run over a mirror: names are assigned, the staged copies and stray partial files a stopped run left
-    deleted, and the files this run will attempt counted on construction; `run` then walks the run's entries in path
-    order.
+    deleted, the files this run will attempt counted, and the move of the partial files from the folder the mirror
+    records planned (`partial_move`, `None` when it is this run's folder) on construction; `run` then makes that move
+    and walks the run's entries in path order.
 
     With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record, a
     `verify` finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
@@ -401,14 +429,17 @@ class MirrorRun:
         self._entries = _retry_walk(entries, self._names) if retry_failed else entries
         self._positions = {entry.entry_id: position for position, entry in enumerate(self._entries)}
         self._held = set() if retry_failed else {e.entry_id for e in self._entries if is_held(e)}
+        in_progress = [e for e in entries if e.download is not None and e.download.state == 'partial']
         destination.remove_staged_copies()
         with _fatal_errors(destination.path):
-            destination.keep_partials(
-                [e.entry_id for e in entries if e.download is not None and e.download.state == 'partial']
-            )
+            destination.keep_partials([e.entry_id for e in in_progress])
             self._current = {
                 e.entry_id for e in self._entries if e.entry_id not in self._held and _is_current(e, destination)
             }
+        self._partial_folder = destination.partial_folder if destination.separate_partials else None
+        self._source: PreviousPartials | None = None
+        self._moved: list[tuple[int, tuple[Segment, ...], int]] = []
+        self.partial_move = self._plan_move(in_progress)
         pending = [
             e
             for e in self._entries
@@ -417,10 +448,62 @@ class MirrorRun:
         self.pending_files = len(pending)
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
+    def _plan_move(self, in_progress: list[MirrorEntry]) -> PartialMove | None:
+        """The move of the downloads in `in_progress` from the partial folder the mirror records to this run's; `None`
+        when it is the same folder. Opens the recorded folder, when it exists, for `run`."""
+        recorded, destination = self._mirror.partial_folder, self._destination
+        if recorded == self._partial_folder:
+            return None
+        if recorded is None:
+            source = destination.own_partials()
+        elif (found := destination.previous_partials(recorded)) is None:
+            return PartialMove(recorded, destination.partial_folder, 0, 0, missing=True)
+        else:
+            source = found
+        for entry in in_progress:
+            if entry.download is not None and (held := source.size(entry.entry_id)) is not None:
+                self._moved.append((entry.entry_id, entry.download.segments, held))
+        self._source = source
+        size = sum(s.confirmed - s.start for _, segments, held in self._moved for s in _movable(segments, held))
+        return PartialMove(source.path, destination.partial_folder, len(self._moved), size, missing=False)
+
+    async def _move_partials(self, threads: DiskThreads) -> None:
+        """Carry out `partial_move`: each download's partial file in turn, then the deletion of what is left in the
+        recorded folder, then the record of this run's folder. A run stopped on the way keeps the recorded folder, so
+        the next run moves the partial files still there, writing their copies in this run's folder again."""
+        if self.partial_move is None:
+            return
+        if self._source is not None:
+            for entry_id, segments, held in self._moved:
+                with _fatal_errors(self._destination.partial_folder):
+                    await self._move_partial(entry_id, segments, held, self._source, threads)
+            await threads.run(self._source.remove_leftovers)
+        self._mirror.record_partial_folder(self._partial_folder)
+
+    async def _move_partial(
+        self, entry_id: int, segments: tuple[Segment, ...], held: int, source: PreviousPartials, threads: DiskThreads
+    ) -> None:
+        """Copy the bytes the journal confirms of the `held`-byte partial file of `entry_id` in `source` to the same
+        offsets of its partial file here, emptied first; a segment whose confirmed bytes are not all held is reset to
+        its start in the journal instead. The copy is made durable before the source is deleted."""
+        movable = _movable(segments, held)
+        kept = [s if s in movable else Segment(s.start, s.end, s.start, None) for s in segments]
+        if kept != list(segments):
+            self._mirror.checkpoint(entry_id, kept)
+        with source.partial(entry_id) as old, self._destination.partial(entry_id) as new:
+            await threads.run(new.truncate, 0)
+            for segment in movable:
+                await _feed(new.write, old.chunks(segment.start, segment.confirmed), threads, segment.start)
+            await threads.run(new.sync)
+        await threads.run(self._destination.sync_partial_folder)
+        await threads.run(source.remove, entry_id)
+
     async def run(
         self, client: api.DiskClient, content: api.ContentClient, policy: TransferPolicy, *, passes: int
     ) -> MirrorReport:
-        """Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
+        """Move the partial files as `partial_move` says, before any fetch.
+
+        Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
         most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
         the download host asked for. Each file is fetched as `policy` says.
 
@@ -437,6 +520,7 @@ class MirrorRun:
         once every file's turn has ended."""
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         with DiskThreads(content.connections + _SPARE_THREADS) as threads:
+            await self._move_partials(threads)
             tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), report, policy)
             deferred = await self._first_pass(tools)
             if deferred:
@@ -736,7 +820,7 @@ async def _adopt(
         opened = file.stat()
         if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
             return None
-        await _hash(digest, file.chunks(), threads, 0)
+        await _feed(digest.update, file.chunks(), threads, 0)
         if digest.mismatch(identity) is not None:
             return None
         async with placement:
@@ -785,15 +869,17 @@ class _RangeDigest:
         return self._sha256.copy().hexdigest()
 
 
-async def _hash(digest: Digest | _RangeDigest, chunks: Iterator[bytes], threads: DiskThreads, start: int) -> int:
-    """Add every chunk of `chunks`, the bytes from offset `start` on, to `digest` in order, each read and hashed in a
-    thread call of its own; the offset after the last chunk."""
+async def _feed(
+    consume: Callable[[int, bytes], None], chunks: Iterator[bytes], threads: DiskThreads, start: int
+) -> int:
+    """Pass every chunk of `chunks`, the bytes from offset `start` on, to `consume(offset, chunk)` in order, each read
+    and consumed in a thread call of its own; the offset after the last chunk."""
 
     def step(offset: int) -> int | None:
         chunk = next(chunks, None)
         if chunk is None:
             return None
-        digest.update(offset, chunk)
+        consume(offset, chunk)
         return offset + len(chunk)
 
     offset = start
@@ -893,7 +979,7 @@ async def _copy_to_destination(
     digest = Digest()
     async with copying:
         with destination.copy_target(entry_id) as target:
-            await _hash(digest, _copied(partial.chunks(0, identity.size), target), threads, 0)
+            await _feed(digest.update, _copied(partial.chunks(0, identity.size), target), threads, 0)
             await threads.run(target.finish, _mtime_ns(identity.modified))
     return digest
 
@@ -959,6 +1045,11 @@ async def _resume(
     return streams
 
 
+def _movable(segments: Sequence[Segment], held: int) -> list[Segment]:
+    """The segments of a journal that confirm bytes, all of them within the first `held` bytes."""
+    return [s for s in segments if s.start < s.confirmed <= held]
+
+
 def _whole_file(size: int) -> tuple[Segment, ...]:
     """The journal of a download of a `size`-byte file as one stream from byte 0: one segment, none for an empty
     file."""
@@ -989,7 +1080,7 @@ async def _file_digest(journal: _Journal, partial: PartialFile, threads: DiskThr
             return digest
     await journal.take()
     digest = Digest()
-    await _hash(digest, partial.chunks(0, size), threads, 0)
+    await _feed(digest.update, partial.chunks(0, size), threads, 0)
     return digest
 
 
@@ -1025,7 +1116,7 @@ class _Stream:
 
     async def rehash(self, partial: PartialFile, end: int, threads: DiskThreads) -> None:
         """Hash the bytes `[start, end)` the partial file holds, the bytes kept from an earlier turn."""
-        self.written = await _hash(self.hasher, partial.chunks(self.start, end), threads, self.start)
+        self.written = await _feed(self.hasher.update, partial.chunks(self.start, end), threads, self.start)
         self.sha256 = self.hasher.sha256()
 
     async def write(self, partial: PartialFile, threads: DiskThreads, offset: int, chunk: bytes) -> None:

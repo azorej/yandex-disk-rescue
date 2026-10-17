@@ -1896,6 +1896,234 @@ def test_with_a_partial_folder_a_run_killed_while_its_copy_is_fsynced_finishes_o
     _rerun_finishes_without_fetching(segmented, dest, partial_root, monkeypatch, adopted=False)
 
 
+# The bytes each of the four segments of `SEGMENTED` confirms when `_leave_two_partials` cuts them short.
+_SEGMENT_CUTS = (100_000, 250_000, 400_000, 0)
+# The partial folder of the run leaving the partial files, then of the rerun: DEST's own (`None`), `partial_root`
+# itself, or a folder of that name in it.
+_PARTIAL_FOLDER_CHANGES = pytest.mark.parametrize(
+    ('before', 'after'), [(None, '.'), ('.', None), ('a', 'b')], ids=['on', 'off', 'moved']
+)
+
+
+def _partial_root(partial_root, name: str | None):
+    if name is None:
+        return None
+    root = partial_root / name
+    root.mkdir(exist_ok=True)
+    return root
+
+
+def _partial_folder(dest, partial_root):
+    """The folder of the partial files of `dest`: its own, or its folder below `partial_root`."""
+    return dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
+
+
+def _entry_id(path: str) -> int:
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        return connection.execute('SELECT id FROM entries WHERE path = ?', (path,)).fetchone()[0]
+
+
+def _leave_two_partials(fake, dest, partial_root):
+    """Run a mirror of the Disk cut short with no retry and no later pass, which keeps the partial files of `BIG`, 300
+    000 bytes confirmed, and of `SEGMENTED`, each segment confirming its `_SEGMENT_CUTS`, in DEST or below
+    `partial_root`; then write unconfirmed bytes past every confirmed offset. Their partial files, `BIG`'s first."""
+    fake.add_file(BIG_PATH, BIG, modified=MODIFIED)
+    fake.add_file(SEGMENTED_PATH, SEGMENTED, modified=MODIFIED)
+    fake.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+    for segment, cut in zip(SEGMENT_RANGES, _SEGMENT_CUTS, strict=True):
+        where = {'path': SEGMENTED_PATH}
+        fake.inject('GET', '/download', Truncate(after_bytes=cut), where=where, where_headers={'range': segment})
+    args = ('--download-retries', '0', '--download-passes', '1', *SEGMENTED_ARGS, *_partial_args(partial_root))
+    result = run_download(*args, str(dest))
+
+    assert result.exit_code == 1, result.output
+    folder = _partial_folder(dest, partial_root)
+    big, segmented = folder / str(_entry_id(BIG_PATH)), folder / str(_entry_id(SEGMENTED_PATH))
+    assert sorted(_partials(dest, partial_root)) == sorted([big, segmented])
+    assert _journals() == {
+        int(big.name): [(0, len(BIG), 300_000, hashlib.sha256(BIG[:300_000]).hexdigest())],
+        int(segmented.name): _segmented_journal(_SEGMENT_CUTS),
+    }
+    with big.open('ab') as file:
+        file.write(b'\xee' * 50_000)
+    with segmented.open('r+b') as file:
+        for n, cut in enumerate(_SEGMENT_CUTS):
+            file.seek(n * MiB + cut)
+            file.write(b'\xee' * 1000)
+    return big, segmented
+
+
+def _journals() -> dict[int, list[tuple[int, int, int, str | None]]]:
+    """The segments of each download journal in the manifest by entry id, read as `_journal` reads them."""
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        rows = connection.execute(
+            'SELECT entry_id, start, end, confirmed, digest FROM download_segments ORDER BY entry_id, start'
+        ).fetchall()
+    return {entry_id: [tuple(row[1:]) for row in group] for entry_id, group in itertools.groupby(rows, lambda r: r[0])}
+
+
+def _segmented_journal(cuts) -> list[tuple[int, int, int, str | None]]:
+    """The journal of `SEGMENTED` whose segment `n` confirms its first `cuts[n]` bytes."""
+    journal = []
+    for n, cut in enumerate(cuts):
+        start = n * MiB
+        journal.append((start, start + MiB, start + cut, hashlib.sha256(SEGMENTED[start : start + cut]).hexdigest()))
+    return [(start, end, confirmed, digest if confirmed > start else None) for start, end, confirmed, digest in journal]
+
+
+def _segment_tails(cuts) -> list[str]:
+    """The `Range` of each fetch of the rest of `SEGMENTED`'s segments after the first `cuts[n]` bytes of segment `n`,
+    sorted."""
+    return sorted(f'bytes={n * MiB + cut}-{(n + 1) * MiB - 1}' for n, cut in enumerate(cuts))
+
+
+def _durability_log(monkeypatch) -> list[tuple[str, str]]:
+    """Log `('fsync', path)` for every `os.fsync` and `('unlink', path)` for every `os.unlink` relative to a folder
+    descriptor, in call order, the paths read from `/proc/self/fd`."""
+    log: list[tuple[str, str]] = []
+    fsync, unlink = os.fsync, os.unlink
+
+    def logged_fsync(fd):
+        log.append(('fsync', os.readlink(f'/proc/self/fd/{fd}')))
+        return fsync(fd)
+
+    def logged_unlink(path, *, dir_fd=None):
+        if dir_fd is not None:
+            log.append(('unlink', f'{os.readlink(f"/proc/self/fd/{dir_fd}")}/{path}'))
+        return unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, 'fsync', logged_fsync)
+    monkeypatch.setattr(os, 'unlink', logged_unlink)
+    return log
+
+
+def _moving(size: int, downloads: str, source, target) -> str:
+    return f'Moving the confirmed bytes ({format_size(size)}) of {downloads} in progress from {source} to {target}\n'
+
+
+@_PARTIAL_FOLDER_CHANGES
+def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download_in_progress(
+    disk, dest, partial_root, monkeypatch, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    sources = _leave_two_partials(disk, dest, old_root)
+    confirmed = {entry_id: [(s, c) for s, _, c, _ in segments] for entry_id, segments in _journals().items()}
+    log = _io_log(monkeypatch, ('pread', 'read'))
+    durability = _durability_log(monkeypatch)
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(new_root), *SEGMENTED_ARGS, str(dest))
+    calls = list(log)
+
+    assert result.exit_code == 0, result.output
+    old, new = _partial_folder(dest, old_root), _partial_folder(dest, new_root)
+    assert _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', old, new) in result.stdout
+    for source in sources:
+        reads = [(offset, length) for _, path, offset, length in calls if path == str(source)]
+        assert reads
+        for offset, length in reads:
+            assert any(start <= offset and offset + length <= end for start, end in confirmed[int(source.name)])
+        steps = [('fsync', str(new / source.name)), ('fsync', str(new)), ('unlink', str(source)), ('fsync', str(old))]
+        at = durability.index(steps[0])
+        for step in steps[1:]:
+            at = durability.index(step, at + 1)
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(_SEGMENT_CUTS)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    if old_root is None:
+        assert _partials(dest) == []
+    else:
+        assert not old.exists()
+        assert old_root.exists()
+    assert _partials(dest, new_root) == []
+    again = run_download(*_partial_args(new_root), str(dest))
+    assert again.exit_code == 0, again.output
+    assert 'Moving' not in again.stdout
+
+
+@_PARTIAL_FOLDER_CHANGES
+def test_a_move_of_partial_files_stopped_after_the_first_file_goes_on_in_the_rerun_losing_no_confirmed_byte(
+    disk, dest, partial_root, monkeypatch, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    big, segmented = _leave_two_partials(disk, dest, old_root)
+    new = _partial_folder(dest, new_root)
+    pwrite = os.pwrite
+
+    def stopped_on_the_second_file(fd, data, offset):
+        if os.readlink(f'/proc/self/fd/{fd}') == str(new / segmented.name):
+            raise KeyboardInterrupt
+        return pwrite(fd, data, offset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'pwrite', stopped_on_the_second_file)
+        stopped = run_download(*_partial_args(new_root), str(dest))
+
+    assert stopped.exit_code == 130
+    assert _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', big.parent, new) in stopped.stdout
+    assert not big.exists()
+    assert (new / big.name).read_bytes() == BIG[:300_000]
+    assert segmented.exists()
+    earlier = len(disk.requests)
+
+    rerun = run_download(*_partial_args(new_root), str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _moving(sum(_SEGMENT_CUTS), '1 download', big.parent, new) in rerun.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(_SEGMENT_CUTS)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert _partials(dest, new_root) == []
+
+
+@pytest.mark.parametrize(('before', 'after'), [('.', None), ('a', 'b')], ids=['off', 'moved'])
+def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_byte_0(
+    disk, dest, partial_root, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    big, _ = _leave_two_partials(disk, dest, old_root)
+    shutil.rmtree(big.parent)
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(new_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f'The partial folder of the last run, {big.parent}, is missing; its downloads in progress start again from '
+        'their first byte.\n'
+    ) in result.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [None]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == sorted(SEGMENT_RANGES)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    again = run_download(*_partial_args(new_root), str(dest))
+    assert again.exit_code == 0, again.output
+    assert 'is missing' not in again.stdout
+
+
+@_PARTIAL_FOLDER_CHANGES
+def test_a_moved_partial_file_cut_short_below_a_confirmed_offset_fetches_that_segment_again(
+    disk, dest, partial_root, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    big, segmented = _leave_two_partials(disk, dest, old_root)
+    os.truncate(segmented, 2 * MiB + 1000)
+    kept = (_SEGMENT_CUTS[0], _SEGMENT_CUTS[1], 0, 0)
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(new_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    new = _partial_folder(dest, new_root)
+    assert _moving(300_000 + sum(kept), '2 downloads', big.parent, new) in result.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(kept)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+
+
 @pytest.mark.parametrize(
     ('way', 'partials'),
     [('downloaded', 'separate'), ('quarantined', 'separate'), ('adopted', 'in-dest'), ('adopted', 'separate')],
