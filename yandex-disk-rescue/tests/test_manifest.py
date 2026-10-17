@@ -22,6 +22,7 @@ from yandex_disk_rescue.manifest import (
     MirrorMismatchError,
     RemoteIdentity,
     ScanTime,
+    UnencodableEntry,
 )
 from yandex_disk_rescue.paths import state_dir
 
@@ -50,7 +51,7 @@ def _scan(path: Path, resources: list[Resource], root: str = 'disk:/', uid: str 
     with Manifest.open(path) as manifest:
         session = manifest.begin_scan(uid, root)
         session.add(resources)
-        return session.commit()
+        return session.commit(unencodable=())
 
 
 def _entries(path: Path, root: str = 'disk:/', uid: str = UID) -> list[Resource]:
@@ -167,7 +168,7 @@ def test_a_discarded_subtree_is_left_out_of_the_commit(tmp_path):
         assert [r.path for r in session.staged()] == ['disk:/A', 'disk:/A/x', 'disk:/A0', 'disk:/AB']
         session.discard('disk:/A')
         assert [r.path for r in session.staged()] == ['disk:/A0', 'disk:/AB']
-        diff = session.commit()
+        diff = session.commit(unencodable=())
 
     assert (diff.added, diff.removed) == (['disk:/A0'], ['disk:/A', 'disk:/A/B', 'disk:/A/B/y', 'disk:/A/x'])
     assert [r.path for r in _entries(db)] == ['disk:/A0', 'disk:/AB']
@@ -330,7 +331,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 2
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 3
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -652,3 +653,36 @@ def test_the_last_scan_covering_a_folder_is_the_newest_committed_scan_of_it_or_a
     assert again is not None
     assert again.root == 'disk:/'
     assert again.completed_at > folder.completed_at
+
+
+def test_entries_left_out_for_their_names_are_kept_per_subtree_until_a_scan_covering_them_commits(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    bad_file = _file('disk:/A/bad\udc80.txt')
+    bad_dir = _dir('disk:/B\udc81')
+    with Manifest.open(db) as manifest:
+        session = manifest.begin_scan(UID, 'disk:/')
+        session.add(TREE)
+        session.commit(unencodable=[bad_file, bad_dir])
+        session = manifest.begin_scan('2', 'disk:/')
+        session.add([_dir('disk:/A')])
+        session.commit(unencodable=[_file('disk:/A/other\udc82')])
+        with pytest.raises(ValueError, match='is not below the scan root'):
+            manifest.begin_scan(UID, 'disk:/A').commit(unencodable=[bad_dir])
+
+    with Manifest.open(db) as manifest:
+        whole = manifest.mirror(UID, 'disk:/', tmp_path / 'whole')
+        assert whole.unencodable() == [
+            UnencodableEntry('disk:/A/bad\udc80.txt', 'file'),
+            UnencodableEntry('disk:/B\udc81', 'dir'),
+        ]
+        assert manifest.mirror(UID, 'disk:/A', tmp_path / 'a').unencodable() == [
+            UnencodableEntry('disk:/A/bad\udc80.txt', 'file')
+        ]
+        session = manifest.begin_scan(UID, 'disk:/A')
+        session.add([_dir('disk:/A')])
+        session.commit(unencodable=())
+
+        assert whole.unencodable() == [UnencodableEntry('disk:/B\udc81', 'dir')]
+        assert manifest.mirror('2', 'disk:/', tmp_path / 'other').unencodable() == [
+            UnencodableEntry('disk:/A/other\udc82', 'file')
+        ]

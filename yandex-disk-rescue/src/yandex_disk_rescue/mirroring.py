@@ -22,7 +22,14 @@ from pathlib import Path, PurePosixPath
 from yandex_disk_rescue import api
 from yandex_disk_rescue.destination import FATAL_ERRNOS, Destination, DestinationError
 from yandex_disk_rescue.local_names import map_local_names
-from yandex_disk_rescue.manifest import LocalFingerprint, Mirror, MirrorEntry, RemoteIdentity, VerifiedBy
+from yandex_disk_rescue.manifest import (
+    LocalFingerprint,
+    Mirror,
+    MirrorEntry,
+    RemoteIdentity,
+    UnencodableEntry,
+    VerifiedBy,
+)
 from yandex_disk_rescue.scanning import display_path, listed
 from yandex_disk_rescue.units import format_size
 
@@ -109,14 +116,13 @@ class MirrorRun:
     """One run over a mirror: names are assigned, stray partial files deleted and the files still to download
     counted on construction; `run` then walks the entries in path order.
 
-    `unencodable` are the entries the scan left out because their names are not valid Unicode; each one is a
-    failure of the run.
+    Each entry the manifest records as left out of its scan, because its name is not valid Unicode, is a failure of
+    the run.
     """
 
-    def __init__(self, mirror: Mirror, destination: Destination, *, unencodable: tuple[api.Resource, ...]) -> None:
+    def __init__(self, mirror: Mirror, destination: Destination) -> None:
         self._mirror = mirror
         self._destination = destination
-        self._unencodable = unencodable
         self._entries = _assign_local_names(mirror)
         with _fatal_errors(destination.path):
             destination.keep_partials(
@@ -144,7 +150,7 @@ class MirrorRun:
             else:
                 await self._download(entry, client, content, report)
         report.replaced_folder = self._destination.replaced_folder
-        report.failed += [Failure(display_path(r.path), _unencodable_reason(r)) for r in self._unencodable]
+        report.failed += [Failure(display_path(e.path), _unencodable_reason(e)) for e in self._mirror.unencodable()]
         report.failed.sort(key=lambda failure: failure.path)
         return report
 
@@ -431,8 +437,8 @@ def _recorded_method(entry: MirrorEntry) -> VerifiedBy:
     return entry.download.verified_by
 
 
-def _unencodable_reason(resource: api.Resource) -> str:
-    if resource.kind == 'dir':
+def _unencodable_reason(entry: UnencodableEntry) -> str:
+    if entry.kind == 'dir':
         return 'the folder name is not valid Unicode, so the Disk API cannot list it or download anything in it'
     return 'the name is not valid Unicode, so the Disk API cannot download it'
 

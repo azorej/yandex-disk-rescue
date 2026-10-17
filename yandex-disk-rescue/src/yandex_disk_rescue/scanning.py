@@ -84,8 +84,8 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
     A folder root is itself a manifest row, as the API names it (so a scan of `disk:/A` keeps the `disk:/A` row a
     scan of `disk:/` wrote); the root `disk:/` has no row. Neither is counted in the totals, which cover exactly the
     rows the commit records. An entry whose path is not valid Unicode (the API can send a lone UTF-16 surrogate in a
-    JSON escape) cannot be stored or requested again: it is left out of the session, a folder is not listed, and
-    the result names it. Folders are listed with `client.limits.concurrency` concurrent listings; the first
+    JSON escape) cannot be stored as an entry or requested again: it is left out of the session, a folder is not
+    listed, and the result and the commit name it. Folders are listed with `client.limits.concurrency` concurrent listings; the first
     failed listing stops the walk, is raised, and leaves the manifest unchanged.
     """
     session = manifest.begin_scan(account.uid, root.path)
@@ -97,7 +97,7 @@ async def scan_tree(client: api.DiskClient, manifest: Manifest, account: api.Acc
     for resource in session.staged():
         if resource.path != root.path:
             totals.count(resource)
-    diff = session.commit()
+    diff = session.commit(unencodable=walk.unencodable)
     return ScanResult(root=root.path, totals=totals, vanished=walk.vanished, unencodable=walk.unencodable, diff=diff)
 
 

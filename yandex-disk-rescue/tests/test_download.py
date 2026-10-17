@@ -6,6 +6,8 @@ import fcntl
 import hashlib
 import os
 import re
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
@@ -68,6 +70,17 @@ def _transfers(fake, since: int = 0) -> list[str]:
 def _linked(fake) -> list[str]:
     """The remote paths download links were requested for."""
     return [r.params['path'] for r in fake.requests if r.path == '/v1/disk/resources/download']
+
+
+def _listings(fake, since: int = 0) -> list[str]:
+    """The folders listed after the first `since` requests (a listing is paged; a resource lookup is not)."""
+    return [r.params['path'] for r in fake.requests[since:] if r.path == '/v1/disk/resources' and 'offset' in r.params]
+
+
+def _set_scan_times(moment: datetime) -> None:
+    """Set the completion time of every scan recorded in the real manifest file, outside any run."""
+    with closing(sqlite3.connect(manifest_path())) as connection, connection:
+        connection.execute('UPDATE scans SET completed_at = ?', (moment.isoformat(timespec='microseconds'),))
 
 
 def _replaced_runs(dest) -> list:
@@ -306,7 +319,7 @@ def test_a_file_changed_in_the_cloud_replaces_the_old_copy_only_once_verified(di
     if fault:
         disk.corrupt(path, offset=0)
 
-    result = _download(str(dest))
+    result = _download('--scan-max-age', '0', str(dest))
 
     if fault:
         assert result.exit_code == 1
@@ -424,7 +437,7 @@ def test_a_hard_link_to_another_verified_file_is_never_replaced(disk, dest):
     inode = (dest / 'a.bin').stat().st_ino
 
     for _ in range(2):
-        result = _download('disk:/Pair', str(dest))
+        result = _download('--scan-max-age', '0', 'disk:/Pair', str(dest))
 
         assert result.exit_code == 1
         assert (
@@ -468,17 +481,144 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
     disk.add_file('disk:/Docs/bad\udc80.txt', b'unreachable')
     disk.add_file('disk:/Bad\udc81/inside.txt', b'unreachable too')
 
-    result = _download(str(dest))
-
-    assert result.exit_code == 1
-    assert (
+    failed = (
         'Failed: 2\n'
         '  disk:/Bad\\udc81: the folder name is not valid Unicode, so the Disk API cannot list it or download '
         'anything in it\n'
         '  disk:/Docs/bad\\udc80.txt: the name is not valid Unicode, so the Disk API cannot download it\n'
-    ) in result.stdout
+    )
+
+    result = _download(str(dest))
+
+    assert result.exit_code == 1
+    assert failed in result.stdout
     assert '6 downloaded' in result.stdout
     assert all(_local(dest, path).read_bytes() == content for path, content in FILES.items())
+
+    for reuse in (['--no-scan'], []):
+        earlier = len(disk.requests)
+        rerun = _download(*reuse, str(dest))
+
+        assert rerun.exit_code == 1
+        assert 'Using the scan of disk:/ completed ' in rerun.stdout
+        assert failed in rerun.stdout
+        assert _listings(disk, earlier) == []
+
+    disk.remove('disk:/Docs/bad\udc80.txt')
+    disk.remove('disk:/Bad\udc81')
+    rescan = _download('--scan-max-age', '0', str(dest))
+
+    assert rescan.exit_code == 0, rescan.output
+    assert 'not valid Unicode' not in rescan.stdout
+
+
+_REUSED = re.compile(r'Using the scan of (disk:/\S*) completed \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \((.+)\)')
+
+
+def _reused_scan(result) -> tuple[str, str]:
+    """The root and the parenthesized note of the `Using the scan of` line, which is the run's first line."""
+    match = _REUSED.fullmatch(result.stdout.splitlines()[0])
+    assert match is not None, result.stdout
+    return match.group(1), match.group(2)
+
+
+def test_a_rerun_inside_the_scan_window_lists_nothing_and_a_window_of_zero_scans_again(disk, dest):
+    assert _download(str(dest)).exit_code == 0
+    earlier = len(disk.requests)
+
+    rerun = _download(str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _reused_scan(rerun) == ('disk:/', '0 min ago')
+    assert 'Scanned' not in rerun.stdout
+    assert _listings(disk, earlier) == []
+    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 failed\n' in rerun.stdout
+
+    earlier = len(disk.requests)
+    always = _download('--scan-max-age', '0', str(dest))
+
+    assert always.exit_code == 0, always.output
+    assert always.stdout.startswith('Scanned disk:/: 6 files, 4 folders')
+    assert 'Using the scan of' not in always.stdout
+    assert 'disk:/' in _listings(disk, earlier)
+
+
+def test_a_scan_of_an_ancestor_inside_the_window_is_reused(disk, dest):
+    assert runner.invoke(app, ['scan']).exit_code == 0
+    earlier = len(disk.requests)
+
+    result = _download('disk:/Photos', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _reused_scan(result) == ('disk:/', '0 min ago')
+    assert _listings(disk, earlier) == []
+    assert (dest / '2024' / 'a.jpg').read_bytes() == FILES['disk:/Photos/2024/a.jpg']
+
+
+@pytest.mark.parametrize('age', [timedelta(hours=2), timedelta(hours=-1)], ids=['old', 'future'])
+def test_a_scan_outside_the_window_is_done_again(disk, dest, age):
+    assert _download(str(dest)).exit_code == 0
+    _set_scan_times(datetime.now(UTC) - age)
+    earlier = len(disk.requests)
+
+    result = _download(str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.startswith('Scanned disk:/: 6 files, 4 folders')
+    assert 'Using the scan of' not in result.stdout
+    assert 'disk:/' in _listings(disk, earlier)
+
+
+def test_no_scan_needs_a_scan_covering_the_folder_and_then_never_lists(disk, dest):
+    assert runner.invoke(app, ['scan', 'disk:/Docs']).exit_code == 0
+    earlier = len(disk.requests)
+
+    refused = _download('--no-scan', 'disk:/Photos', str(dest))
+
+    assert refused.exit_code == 2
+    assert refused.stderr == (
+        "Error: disk:/Photos has never been scanned; run 'yandex-disk-rescue scan disk:/Photos' or drop --no-scan.\n"
+    )
+    assert not dest.exists()
+    assert _transfers(disk, earlier) == []
+
+    _set_scan_times(datetime.now(UTC) - timedelta(days=30))
+    earlier = len(disk.requests)
+    result = _download('--no-scan', 'disk:/Docs', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _reused_scan(result) == ('disk:/Docs', '--no-scan')
+    assert _listings(disk, earlier) == []
+    assert (dest / 'readme.txt').read_bytes() == FILES['disk:/Docs/readme.txt']
+
+
+def test_a_scan_max_age_out_of_range_is_a_usage_error(disk, dest):
+    result = _download('--scan-max-age', '10081', str(dest))
+
+    assert result.exit_code == 2
+    assert 'must be an integer from 0 to 10080' in result.stderr
+    assert disk.requests == []
+
+
+@pytest.mark.parametrize(
+    ('edited', 'reason'),
+    [
+        (b'READ ME', f'MD5 mismatch (expected {hashlib.md5(b"read me").hexdigest()}, got '),
+        (b'read me, edited after the scan', 'the download host sent more than the 7 bytes requested'),
+    ],
+    ids=['same-size', 'longer'],
+)
+def test_a_file_changed_after_the_reused_scan_fails_instead_of_being_kept(disk, dest, edited, reason):
+    path = 'disk:/Docs/readme.txt'
+    assert runner.invoke(app, ['scan']).exit_code == 0
+    disk.add_file(path, edited, modified=MODIFIED)
+
+    result = _download(str(dest))
+
+    assert result.exit_code == 1
+    assert _reused_scan(result)[0] == 'disk:/'
+    assert f'Failed: 1\n  {path}: {reason}' in result.stdout
+    assert not _local(dest, path).exists()
 
 
 @pytest.mark.parametrize('args', [[], ['a', 'b', 'c']], ids=['none', 'three'])

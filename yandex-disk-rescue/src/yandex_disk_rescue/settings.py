@@ -99,6 +99,13 @@ DOWNLOAD_TIMEOUT = Setting(
     'Timeout of connecting to the download host and of each read from it, in seconds.',
     _in_range(1, 600),
 )
+SCAN_MAX_AGE = Setting(
+    'scan_max_age',
+    60,
+    'Reuse the last completed scan covering the remote folder when it is younger than this, in minutes; 0 always '
+    'scans.',
+    _in_range(0, 10080),
+)
 CLIENT_ID = Setting(
     'client_id',
     '9e2a0382c430429c9d57913b61d7d48f',
@@ -108,7 +115,16 @@ CLIENT_ID = Setting(
 
 SETTINGS: dict[str, Setting[Any]] = {
     setting.name: setting
-    for setting in (API_INTERVAL_MS, API_CONCURRENCY, API_TIMEOUT, API_RETRIES, API_URL, DOWNLOAD_TIMEOUT, CLIENT_ID)
+    for setting in (
+        API_INTERVAL_MS,
+        API_CONCURRENCY,
+        API_TIMEOUT,
+        API_RETRIES,
+        API_URL,
+        DOWNLOAD_TIMEOUT,
+        SCAN_MAX_AGE,
+        CLIENT_ID,
+    )
 }
 
 ApiIntervalMs = Annotated[int, API_INTERVAL_MS.typer_option()]
@@ -117,6 +133,7 @@ ApiTimeout = Annotated[int, API_TIMEOUT.typer_option()]
 ApiRetries = Annotated[int, API_RETRIES.typer_option()]
 ApiUrl = Annotated[str, API_URL.typer_option()]
 DownloadTimeout = Annotated[int, DOWNLOAD_TIMEOUT.typer_option()]
+ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 
 

@@ -8,6 +8,7 @@ uv run yandex-disk-rescue --version
 uv run yandex-disk-rescue auth status
 uv run yandex-disk-rescue scan disk:/Photos
 uv run yandex-disk-rescue download disk:/Photos /tmp/photos
+uv run yandex-disk-rescue download --no-scan disk:/Photos /tmp/photos
 ```
 
 Tests: `mise run test -- yandex-disk-rescue/tests`.
@@ -25,6 +26,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_API_TIMEOUT` | Timeout of one Disk API request, 1 to 300 s (default 30). Same as `--api-timeout`. |
 | `YANDEX_DISK_RESCUE_API_RETRIES` | Retries after a transport error or a throttling status, 0 to 20 (default 5). Same as `--api-retries`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | Timeout of connecting to the download host and of each read from it, 1 to 600 s (default 60). Same as `--download-timeout`. |
+| `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
 
@@ -35,7 +37,9 @@ directory). For each account (keyed by the Disk user uid) it stores every file a
 folder: path, kind, size, MD5, SHA-256 and modification time. A scanned folder other than `disk:/` is a row too,
 as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `disk:/` wrote; `disk:/` has no row.
 It also records when the last scan of each folder completed (`Manifest.last_scan` finds the newest one covering a
-folder: a scan of the folder itself or of an ancestor).
+folder: a scan of the folder itself or of an ancestor), and the entries each scan left out because their paths are
+not valid Unicode (`unencodable_entries`, the path stored as a BLOB; `Mirror.unencodable` lists those below a
+mirror's root), so a run reusing a scan still reports them.
 
 For each destination directory ("mirror") it records the local name of every entry and each file's download state.
 A destination mirrors exactly one remote folder of one account; `Manifest.mirror` refuses a destination already
@@ -75,7 +79,8 @@ yandex-disk-rescue/
 │   │                 #   the commands in `commands/`
 │   ├── commands/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
-│   │   └── download.py # The `download` command: arguments, scan, destination, mirror run, summary, exit code
+│   │   └── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
+│   │                 #   destination, mirror run, summary, exit code
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines

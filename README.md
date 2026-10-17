@@ -157,7 +157,9 @@ The manifest only ever holds completed scans: a scan that fails or is
 interrupted (Ctrl+C, a kill, a crash) leaves the previous scan in place, and
 the next run scans again from the start. Ctrl+C prints `Interrupted; the
 manifest holds the last completed scan.` and exits with 130. Scanning a
-folder replaces only that folder's part of the manifest. Only one run can use
+folder replaces only that folder's part of the manifest. The manifest also
+records when each scan completed, and the entries left out because their
+names are not valid Unicode. Only one run can use
 the manifest at a time; a second one fails with `Another yandex-disk-rescue
 run is using ...`.
 Paths outside `disk:/` (such as `trash:/`) are refused.
@@ -170,11 +172,33 @@ yandex-disk-rescue download disk:/Photos ~/Photos    # one folder
 ```
 
 `download [REMOTE_PATH] DEST` first scans REMOTE_PATH (default `disk:/`)
-exactly as [`scan`](#scanning-a-folder) does and prints the scan summary.
-It then mirrors that folder into DEST, one file at a time: the folder
-structure is kept, empty folders are created, and every file gets the
-modification time it has on the Disk. It takes the `--api-*` options and
-`--download-timeout` (see [Configuration](#configuration)).
+exactly as [`scan`](#scanning-a-folder) does and prints the scan summary,
+unless a recent scan covers it (below). It then mirrors that folder into
+DEST, one file at a time: the folder structure is kept, empty folders are
+created, and every file gets the modification time it has on the Disk. It
+takes the `--api-*` options, `--download-timeout` and `--scan-max-age` (see
+[Configuration](#configuration)), and `--no-scan`.
+
+**When it scans.** `download` reuses the last completed scan of the account
+covering REMOTE_PATH — a scan of REMOTE_PATH itself or of a folder above it,
+by `scan` or by an earlier `download` — when it completed less than
+`scan_max_age` minutes ago (default 60). Otherwise it scans: when there is no
+such scan, when `scan_max_age` is `0`, when the scan is older, and when its
+completion time lies in the future (the clock went back). `--no-scan` reuses
+the last covering scan whatever its age; with no such scan it is a usage
+error (exit `2`): `disk:/A has never been scanned; run 'yandex-disk-rescue
+scan disk:/A' or drop --no-scan.` A reused scan is named in place of the scan
+summary:
+
+```
+Using the scan of disk:/ completed 2026-10-17 14:05 UTC (23 min ago)
+Using the scan of disk:/ completed 2026-10-17 14:05 UTC (--no-scan)
+```
+
+A reused scan does not see changes on the Disk since it completed. A file
+changed since then fails its download (the bytes no longer match the
+recorded size and checksums) and is never kept as verified; rerun with
+`--scan-max-age 0` to scan first. `scan` always scans.
 
 **Verified.** A file reaches its final path only after its size and every
 checksum the Disk has for it (MD5 and SHA-256) match the downloaded bytes.
@@ -286,7 +310,7 @@ entry whose local name differs from its Disk name.
 |---|---|
 | `0` | Success; for `download`, every file of the folder is verified at its final path |
 | `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run; for `download` also one or more failed files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run |
-| `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, and a DEST already mirroring another remote folder or account |
+| `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers |
 | `130` | Interrupted with Ctrl+C |
 
 ## Rate limiting
@@ -331,11 +355,12 @@ first one that sets it wins:
 | `api_retries` | `--api-retries` | `YANDEX_DISK_RESCUE_API_RETRIES` | `5` | 0 to 20 |
 | `api_url` | `--api-url` (hidden) | `YANDEX_DISK_RESCUE_API_URL` | `https://cloud-api.yandex.net` | an `http://` or `https://` URL |
 | `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `60` | 1 to 600 (s); bounds connecting to the download host and each read |
+| `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
-(`auth login`, `auth status`, `scan`, `download`); `download_timeout`
-applies to `download` and `client_id` to `auth login`.
+(`auth login`, `auth status`, `scan`, `download`); `download_timeout` and
+`scan_max_age` apply to `download` and `client_id` to `auth login`.
 
 The config file is `$XDG_CONFIG_HOME/yandex-disk-rescue/config.toml`
 (`~/.config/yandex-disk-rescue/config.toml` when `XDG_CONFIG_HOME` is unset

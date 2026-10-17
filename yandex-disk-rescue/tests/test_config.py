@@ -1,18 +1,23 @@
 """Tests for the config file layer: real TOML files feeding the registry options of `scan` and `auth`."""
 
 import itertools
+import sqlite3
 import urllib.parse
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fake_disk_server import Delay
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.paths import config_dir
+from yandex_disk_rescue.paths import config_dir, manifest_path
 
 runner = CliRunner()
 
 TOKEN = 'y0_AgAAAAB-config-sentinel-token'
-OPTIONS = 'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, client_id'
+OPTIONS = (
+    'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, scan_max_age, client_id'
+)
 
 
 @pytest.fixture
@@ -105,6 +110,20 @@ def test_download_reads_the_download_timeout_from_the_config_file(disk, tmp_path
     assert '  disk:/A/file.txt: the download failed: the request timed out after 1 s (ReadTimeout)\n' in result.stdout
 
 
+@pytest.mark.parametrize(('age', 'scans'), [(timedelta(minutes=4), False), (timedelta(minutes=6), True)])
+def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, age, scans):
+    _write_default_config('scan_max_age = 5\n')
+    assert runner.invoke(app, ['scan']).exit_code == 0
+    with closing(sqlite3.connect(manifest_path())) as connection, connection:
+        completed_at = (datetime.now(UTC) - age).isoformat(timespec='microseconds')
+        connection.execute('UPDATE scans SET completed_at = ?', (completed_at,))
+
+    result = runner.invoke(app, ['download', str(tmp_path / 'dest')])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout.startswith('Scanned disk:/' if scans else 'Using the scan of disk:/ completed ')
+
+
 @pytest.mark.parametrize(
     ('text', 'reason'),
     [
@@ -115,6 +134,7 @@ def test_download_reads_the_download_timeout_from_the_config_file(disk, tmp_path
         ('api_url = 8080\n', 'api_url: must be a string.'),
         ('api_url = "ftp://example.com"\n', 'api_url: must be an http:// or https:// URL.'),
         ('download_timeout = 0\n', 'download_timeout: must be an integer from 1 to 600.'),
+        ('scan_max_age = 10081\n', 'scan_max_age: must be an integer from 0 to 10080.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
         (b'client_id = "\xff"\n', 'is not UTF-8 text.'),

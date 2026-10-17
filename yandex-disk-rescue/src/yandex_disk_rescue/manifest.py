@@ -3,7 +3,9 @@ mirrors made from it.
 
 A scan streams its rows into a staging table through a `ScanSession`; only `ScanSession.commit()` moves them into
 `entries`, in one transaction. A scan that stops in any other way (an exception, Ctrl+C, SIGKILL, a power cut)
-leaves `entries` as the previous completed scan wrote it. The commit also records when that scan completed.
+leaves `entries` as the previous completed scan wrote it. The commit also records when that scan completed, and
+the entries it left out because their names are not valid Unicode (`unencodable_entries`), so a run that reuses the
+scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
 the local name of every entry (`local_names`) and each file's download state (`downloads`), keyed by `entries.id`.
@@ -128,6 +130,18 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    (
+        # `path` is the UTF-8 encoding with lone surrogates encoded as themselves ('surrogatepass'): such a path is
+        # not valid Unicode, so it cannot be TEXT.
+        """
+        CREATE TABLE unencodable_entries (
+            account_uid TEXT NOT NULL,
+            path BLOB NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('file', 'dir')),
+            PRIMARY KEY (account_uid, path)
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -194,6 +208,14 @@ class MirrorEntry:
     resource: Resource
     local_path: PurePosixPath | None  # relative to the destination; `None` until a name is assigned
     download: DownloadRecord | None
+
+
+@dataclass(frozen=True)
+class UnencodableEntry:
+    """An entry a scan left out because its path is not valid Unicode (it holds a lone surrogate)."""
+
+    path: str
+    kind: Literal['file', 'dir']
 
 
 @dataclass(frozen=True)
@@ -383,9 +405,14 @@ class ScanSession:
             for row in cursor:
                 yield _resource(row)
 
-    def commit(self) -> ScanDiff:
-        """Replace the committed subtree of `root` with the staged rows in one transaction and return the diff."""
+    def commit(self, *, unencodable: Iterable[Resource]) -> ScanDiff:
+        """Replace the committed subtree of `root` with the staged rows in one transaction and return the diff.
+
+        `unencodable` are the entries below `root` the scan left out because their paths are not valid Unicode; they
+        replace the ones the subtree's previous scans recorded.
+        """
         self._check_open()
+        left_out = [(self._params['account'], *_unencodable_row(resource, self._root)) for resource in unencodable]
         connection = self._manifest._connection
         with self._manifest._transaction('update'):
             (had_entries,) = connection.execute(_HAD_ENTRIES_SQL, self._params).fetchone()
@@ -398,6 +425,10 @@ class ScanSession:
             connection.execute(_DELETE_REMOVED_SQL, self._params)
             connection.execute(_UPSERT_SQL, self._params)
             connection.execute(_RECORD_SCAN_SQL, {**self._params, 'completed_at': _timestamp(datetime.now(UTC))})
+            connection.execute(_DELETE_UNENCODABLE_SQL, {'account': self._params['account'], **_blob_below(self._root)})
+            connection.executemany(
+                'INSERT INTO unencodable_entries (account_uid, path, kind) VALUES (?, ?, ?)', left_out
+            )
             connection.execute('DELETE FROM staged_entries WHERE session_id = ?', (self._id,))
             connection.execute('DELETE FROM scan_sessions WHERE id = ?', (self._id,))
         self._committed = True
@@ -434,6 +465,13 @@ class Mirror:
         with self._manifest._errors('read'):
             rows = self._manifest._connection.execute(_MIRROR_ENTRIES_SQL, params).fetchall()
         return [_mirror_entry(row) for row in rows]
+
+    def unencodable(self) -> list[UnencodableEntry]:
+        """The entries below `remote_root` the last scans covering them left out for their names, ordered by path."""
+        params = {'account': self.account_uid, **_blob_below(self.remote_root)}
+        with self._manifest._errors('read'):
+            rows = self._manifest._connection.execute(_UNENCODABLE_SQL, params).fetchall()
+        return [UnencodableEntry(path=path.decode('utf-8', 'surrogatepass'), kind=kind) for path, kind in rows]
 
     def assign_names(self, names: Mapping[int, PurePosixPath]) -> None:
         """Set the local path of each entry id in `names`, replacing any it had; a path already taken by another
@@ -578,6 +616,14 @@ _RECORD_DOWNLOAD_SQL = """
         state = excluded.state, size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256,
         modified = excluded.modified, verified_by = excluded.verified_by, local_size = excluded.local_size,
         local_mtime_ns = excluded.local_mtime_ns, local_ino = excluded.local_ino
+"""
+_UNENCODABLE_SQL = """
+    SELECT path, kind FROM unencodable_entries
+    WHERE account_uid = :account AND path >= :low AND path < :high
+    ORDER BY path
+"""
+_DELETE_UNENCODABLE_SQL = """
+    DELETE FROM unencodable_entries WHERE account_uid = :account AND path >= :low AND path < :high
 """
 _RENAME_DESCENDANTS_SQL = """
     UPDATE local_names SET local_path = :new || substr(local_path, length(:old) + 1)
@@ -743,6 +789,11 @@ def _below(path: str) -> dict[str, str]:
     return {'low': prefix, 'high': prefix[:-1] + '0'}
 
 
+def _blob_below(path: str) -> dict[str, bytes]:
+    """`_below` as UTF-8 bounds for the BLOB paths of `unencodable_entries`; UTF-8 byte order is code point order."""
+    return {bound: text.encode('utf-8') for bound, text in _below(path).items()}
+
+
 def _ancestors(root: str) -> list[str]:
     """`root` and every folder above it, up to `disk:/`."""
     parts = root.removeprefix('disk:/').split('/') if root != 'disk:/' else []
@@ -769,6 +820,12 @@ def _row(resource: Resource, root: str) -> _Row:
         raise ValueError(f'{resource.path!r} has a modification time without a UTC offset')
     modified = resource.modified.astimezone(UTC).isoformat()
     return resource.path, resource.kind, resource.size, resource.md5, resource.sha256, modified
+
+
+def _unencodable_row(resource: Resource, root: str) -> tuple[bytes, Literal['file', 'dir']]:
+    if not resource.path.startswith(_prefix(root)):
+        raise ValueError(f'{resource.path!r} is not below the scan root {root!r}')
+    return resource.path.encode('utf-8', 'surrogatepass'), resource.kind
 
 
 def _local_path_text(path: PurePosixPath) -> str:
