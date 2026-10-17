@@ -225,6 +225,16 @@ resume — happens on that disk, not on DEST:
   the disk, and is then placed like any verified file, or quarantined in
   DEST's `quarantine/` (below) when the check fails. The partial file below
   `PATH` is deleted once that is recorded.
+- A run stopped anywhere on the way (Ctrl+C, a kill, a crash, a power cut)
+  never leaves a cut-short file at a final path, and fetches nothing of that
+  file again. Until the outcome is recorded, the partial file below `PATH`
+  and its journal stay as they are. Stopped before the copy is placed, it
+  leaves a staged copy, which the next run deletes at its start and then
+  copies the file again. Stopped once the copy is placed but before it is
+  recorded, it leaves the file at its final path, which the next run hashes,
+  adopts as matching the Disk, and then deletes the partial file. Stopped
+  after the record, it leaves only the partial file, which the next run
+  deletes at its start.
 - A file waiting for its copy keeps its place among the
   `download_connections` files in progress, so when DEST is slower than the
   network, fetching slows down instead of filling `PATH`.
@@ -442,9 +452,13 @@ DEST and never writes to its target. DEST itself may be a link.
 
 **Nothing is deleted.** The tool never deletes or truncates anything outside
 `DEST/.yandex-disk-rescue/partial/` and, with `--partial-dir PATH`, DEST's
-folder `PATH/<key>/`. In the partial folder of the run, at the start, it also
-deletes every file that is not the partial file of a download in progress
-(folders and links there are left alone). Moved-aside and quarantined copies
+folder `PATH/<key>/`. At the start of every run it deletes the staged copies
+(`<id>.copy` files) in `DEST/.yandex-disk-rescue/partial/`, and in the partial
+folder of the run every file that is not the partial file of a download in
+progress (folders and links there are left alone). A partial file that cannot
+be deleted once its file's outcome is recorded (a folder made there under its
+name, say) is listed under `Partial files not deleted` with the reason; the
+file still counts as verified or quarantined. Moved-aside and quarantined copies
 stay in `replaced/` and `quarantine/` until you remove them, after checking
 them. A quarantined copy whose file later verified, or whose record a new
 Disk version replaced, is no longer listed anywhere; browse the

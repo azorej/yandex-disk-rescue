@@ -6,18 +6,21 @@ are computed, the size and every checksum the cloud provides are checked, and on
 place without replacing anything. With the destination's partial files in a separate folder, a finished partial file
 is copied to a staged copy in the destination as one sequential stream, one copy of the whole run at a time, and the
 digest of the bytes copied is the check; the staged copy is what is placed or quarantined, and the partial file is
-deleted once that is recorded. A downloaded file that fails the check is moved, never deleted, to the run's
-quarantine folder and recorded; while the cloud file keeps that identity, only `--retry-failed` downloads it again. A
-verified file whose record and `lstat` fingerprint still match is skipped without being read, unless `verify` found
-the file at its path broken: such a file is downloaded again without its copy there being read, and that copy is
-moved aside once the new one is verified. Any other file already at a final path is hashed: one matching the cloud is
-adopted as it is, and anything else there is moved aside once the new version is verified. Paths with no cloud
-counterpart are never looked at.
+deleted once that is recorded. A run stopped before the placing leaves the partial file confirmed in full, so the next
+run copies it again without fetching; one stopped after the placing and before the record leaves a file the next run
+adopts. A partial file that cannot be deleted once its file's outcome is recorded is reported, and the outcome stands.
+A downloaded file that fails the check is moved, never deleted, to the run's quarantine folder and recorded; while
+the cloud file keeps that identity, only `--retry-failed` downloads it again. A verified file whose record and `lstat`
+fingerprint still match is skipped without being read, unless `verify` found the file at its path broken: such a file
+is downloaded again without its copy there being read, and that copy is moved aside once the new one is verified. Any
+other file already at a final path is hashed: one matching the cloud is adopted as it is, and anything else there is
+moved aside once the new version is verified. Paths with no cloud counterpart are never looked at.
 
 A file larger than the policy's segment threshold is downloaded as several segments, ranged fetches running in
 parallel into one partial file, which is preallocated to the file's size first and, with partial files in the
 destination, read back in full to be verified once every segment is in; any other file is one stream, there verified
-by the digest computed as it arrives. The segments are fixed when the download starts and kept by every later turn of it.
+by the digest computed as it arrives. The segments are fixed when the download starts and kept by every later turn of
+it.
 
 Every download keeps a checkpoint journal in the manifest: for each segment, the offset up to which its bytes were
 fsynced and the SHA-256 of those bytes. A checkpoint is taken every `checkpoint_bytes` a segment receives,
@@ -96,12 +99,14 @@ class FileFailed(Exception):
 
 class FileQuarantined(Exception):
     """The file's download failed verification for `reason`; it was moved to `copy` in the quarantine folder and
-    recorded. The run goes on."""
+    recorded. `partial_left` is its partial file that could not be deleted after that, with the reason. The run goes
+    on."""
 
-    def __init__(self, reason: str, copy: PurePosixPath) -> None:
+    def __init__(self, reason: str, copy: PurePosixPath, partial_left: PartialLeft | None) -> None:
         super().__init__(reason)
         self.reason = reason
         self.copy = copy
+        self.partial_left = partial_left
 
 
 class FileDeferred(FileFailed):
@@ -117,6 +122,14 @@ class FileDeferred(FileFailed):
 @dataclass(frozen=True)
 class Failure:
     path: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class PartialLeft:
+    """A partial file at `path` that could not be deleted once its file's outcome was recorded, for `reason`."""
+
+    path: Path
     reason: str
 
 
@@ -145,18 +158,21 @@ class MirrorReport:
     replaced_folder: PurePosixPath | None = None
     quarantined: list[QuarantinedFile] = field(default_factory=list)
     failed: list[Failure] = field(default_factory=list)
+    partials_left: list[PartialLeft] = field(default_factory=list)
     passes: tuple[int, int] | None = None  # (used, limit; 0 is no limit) once a transient failure deferred a file
 
 
 @dataclass(frozen=True)
 class FileOutcome:
     """How a file came to be verified at its final path `local`: `adopted` when the copy already there matched the
-    cloud, `moved_aside` when something else stood there and was moved to the replaced folder."""
+    cloud, `moved_aside` when something else stood there and was moved to the replaced folder; `partial_left` is its
+    partial file that could not be deleted once the file was recorded."""
 
     local: PurePosixPath
     verified_by: VerifiedBy
     adopted: bool
     moved_aside: bool
+    partial_left: PartialLeft | None
 
 
 class LocalNames:
@@ -361,8 +377,9 @@ class _FileTurns:
 
 
 class MirrorRun:
-    """One run over a mirror: names are assigned, stray partial files deleted and the files this run will attempt
-    counted on construction; `run` then walks the run's entries in path order.
+    """One run over a mirror: names are assigned, the staged copies and stray partial files a stopped run left
+    deleted, and the files this run will attempt counted on construction; `run` then walks the run's entries in path
+    order.
 
     With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record, a
     `verify` finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
@@ -384,6 +401,7 @@ class MirrorRun:
         self._entries = _retry_walk(entries, self._names) if retry_failed else entries
         self._positions = {entry.entry_id: position for position, entry in enumerate(self._entries)}
         self._held = set() if retry_failed else {e.entry_id for e in self._entries if is_held(e)}
+        destination.remove_staged_copies()
         with _fatal_errors(destination.path):
             destination.keep_partials(
                 [e.entry_id for e in entries if e.download is not None and e.download.state == 'partial']
@@ -537,6 +555,7 @@ class MirrorRun:
         report.moved_aside.sort(key=by_local.__getitem__)
         report.quarantined.sort(key=lambda quarantined: quarantined.path)
         report.failed.sort(key=lambda failure: failure.path)
+        report.partials_left.sort(key=lambda left: left.path)
         report.renamed.sort()
 
     async def _download(self, entry: MirrorEntry, tools: _RunTools) -> FileDeferred | None:
@@ -562,7 +581,11 @@ class MirrorRun:
             return None
         except FileQuarantined as quarantined:
             report.quarantined.append(QuarantinedFile(entry.resource.path, quarantined.reason, quarantined.copy))
+            if quarantined.partial_left is not None:
+                report.partials_left.append(quarantined.partial_left)
             return None
+        if outcome.partial_left is not None:
+            report.partials_left.append(outcome.partial_left)
         if outcome.adopted:
             report.skipped += 1
             report.adopted.append(entry.resource.path)
@@ -624,7 +647,8 @@ async def download_file(
             if entry.finding is None:
                 verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads, placement)
                 if verified_by is not None:
-                    return FileOutcome(local, verified_by, adopted=True, moved_aside=False)
+                    left = await _remove_recorded_partial(entry.entry_id, destination, threads)
+                    return FileOutcome(local, verified_by, adopted=True, moved_aside=False, partial_left=left)
         verified_by = await _fetch_verified(
             entry,
             identity,
@@ -649,9 +673,9 @@ async def download_file(
         async with placement:
             (placed, moved_aside), local = await _create(entry, local, place, names, destination)
             mirror.record_verified(entry.entry_id, identity, verified_by, placed)
-        if destination.separate_partials:
-            await threads.run(destination.remove_partial, entry.entry_id)
-    return FileOutcome(local, verified_by, adopted=False, moved_aside=moved_aside)
+        separate = destination.separate_partials
+        left = await _remove_recorded_partial(entry.entry_id, destination, threads) if separate else None
+    return FileOutcome(local, verified_by, adopted=False, moved_aside=moved_aside, partial_left=left)
 
 
 async def _create[T](
@@ -725,8 +749,6 @@ async def _adopt(
                 await threads.run(file.set_mtime, _mtime_ns(identity.modified))
             verified_by = _method(identity)
             mirror.record_verified(entry.entry_id, identity, verified_by, file.stat())
-            with _local_errors(destination, local, 'write'):
-                destination.remove_partial(entry.entry_id)
     return verified_by
 
 
@@ -853,9 +875,9 @@ async def _fetch_verified(
     async with placement:
         copy = await threads.run(destination.quarantine, entry.entry_id, _local_path(entry))
     mirror.record_quarantined(entry.entry_id, identity, copy, reason)
-    if destination.separate_partials:
-        await threads.run(destination.remove_partial, entry.entry_id)
-    raise FileQuarantined(reason, copy)
+    separate = destination.separate_partials
+    left = await _remove_recorded_partial(entry.entry_id, destination, threads) if separate else None
+    raise FileQuarantined(reason, copy, left)
 
 
 async def _copy_to_destination(
@@ -1273,6 +1295,10 @@ def mirror_summary(report: MirrorReport) -> list[str]:
         lines.append(f'Failed: {len(report.failed)}')
         shown = [f'{failure.path}: {failure.reason}' for failure in report.failed]
         lines += listed('', shown, len(shown), '')
+    if report.partials_left:
+        lines.append(f'Partial files not deleted: {len(report.partials_left)}')
+        shown = [f'{left.path}: {left.reason}' for left in report.partials_left]
+        lines += listed('', shown, len(shown), '')
     return lines
 
 
@@ -1355,6 +1381,17 @@ async def _download_link(client: api.DiskClient, path: str) -> str:
         raise FileFailed('removed from the Disk after the scan') from None
     except api.DownloadRefusedError as exc:
         raise FileFailed(exc.reason) from None
+
+
+async def _remove_recorded_partial(entry_id: int, destination: Destination, threads: DiskThreads) -> PartialLeft | None:
+    """Delete the partial file of a file whose outcome is recorded; the file left behind when an error that does not
+    stop the run kept it. The outcome stands either way: the next run deletes a stray partial file that is a regular
+    file."""
+    try:
+        await threads.run(destination.remove_partial, entry_id)
+    except OSError as exc:
+        return PartialLeft(Path(exc.filename), exc.strerror)
+    return None
 
 
 def _discard(entry: MirrorEntry, mirror: Mirror, destination: Destination) -> None:

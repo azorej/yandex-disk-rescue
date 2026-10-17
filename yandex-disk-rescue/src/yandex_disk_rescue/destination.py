@@ -16,6 +16,7 @@ import errno
 import fcntl
 import hashlib
 import os
+import re
 import stat
 from collections.abc import Collection, Iterator
 from contextlib import ExitStack, contextmanager
@@ -36,6 +37,7 @@ _STAMP_FORMAT = '%Y-%m-%dT%H-%M-%SZ'
 _READ_SIZE = 1 << 20
 _PROBE_NAMES = ('probe', 'probe.renamed')
 _COPY_SUFFIX = '.copy'
+_COPY_NAME = re.compile(r'[0-9]+\.copy')
 _KEY_DIGITS = 16
 # Errors that no other file of the run would escape: the run stops instead of failing every file in turn.
 FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS})
@@ -344,16 +346,32 @@ class Destination(_Tree):
 
     def remove_partial(self, entry_id: int) -> None:
         """Delete the partial file of `entry_id`, and with separate partials its staged copy too; a missing one is no
-        error."""
+        error. Any other error that is not `DestinationError` is an `OSError` whose `filename` is the full path of the
+        file it could not delete."""
         names = [(str(entry_id), self._files_fd, self.partial_folder)]
         if self._separate is not None:
             names.append((_copy_name(entry_id), self._partial_fd, self._own_partials))
         for name, dir_fd, folder in names:
-            with _work_errors(folder / name):
+            path = folder / name
+            with _work_errors(path):
                 try:
                     os.unlink(name, dir_fd=dir_fd)
                 except FileNotFoundError:
                     pass
+                except OSError as exc:
+                    raise OSError(exc.errno, exc.strerror, str(path)) from None
+
+    def remove_staged_copies(self) -> None:
+        """Delete every regular file named `<digits>.copy` in the destination's `.yandex-disk-rescue/partial/`: the
+        staged copies a stopped run left there, whichever folder partial files live in now. Any error raises
+        `DestinationError` naming the folder."""
+        try:
+            with os.scandir(self._partial_fd) as found:
+                stray = [e.name for e in found if _COPY_NAME.fullmatch(e.name) and e.is_file(follow_symlinks=False)]
+            for name in stray:
+                os.unlink(name, dir_fd=self._partial_fd)
+        except OSError as exc:
+            raise DestinationError.of(self._own_partials, exc) from None
 
     def keep_partials(self, entry_ids: Collection[int]) -> None:
         """Delete every regular file in the partial folder that is not the partial file of one of `entry_ids`; anything

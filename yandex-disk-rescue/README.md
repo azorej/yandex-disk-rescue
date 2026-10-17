@@ -147,7 +147,8 @@ yandex-disk-rescue/
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
 │   │                 #   failure records written as entries fail and dropped as they succeed, the summary
-│   │                 #   lines; disk work (hashing, writes, preallocation, fsync, placement) runs in the
+│   │                 #   lines (with the partial files that could not be deleted once their file was
+│   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
 │   │                 #   stay on the event loop
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
@@ -162,7 +163,8 @@ yandex-disk-rescue/
 │   ├── destination.py # The destination folder: argument checks (DEST and `--partial-dir`), the run lock and
 │   │                 #   work directory, the RENAME_NOREPLACE probe, partial files in DEST's `partial/` or in
 │   │                 #   DEST's own folder below `--partial-dir` (`<key>/`, created on open), the staged copy
-│   │                 #   `partial/<id>.copy` a separate partial file is copied to, reading existing files,
+│   │                 #   `partial/<id>.copy` a separate partial file is copied to (each left by a stopped run
+│   │                 #   deleted at the start of the next), reading existing files,
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
 │   │                 #   link; which errors stop the run;
