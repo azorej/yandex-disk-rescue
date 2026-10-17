@@ -537,14 +537,14 @@ Each file of the mirror, as of the last scan, is one of:
   be read (`could not read <path>: <reason>`).
 - **Quarantined:** its last download [failed the check](#downloading) and is
   kept in `quarantine/`; listed with the reason and the copy's path.
+- **Not downloaded:** no verified copy of the current Disk version: never
+  downloaded, failed (with the reason), unfinished, changed on the Disk since
+  it was downloaded, or a name that is not valid Unicode.
 
 A file with a finding (missing, modified or corrupt) is listed under its
 finding even when a later download of it was quarantined: the finding
 describes the copy at its path, and the line ends with `; repair
-quarantined: <quarantine reason>`.
-- **Not downloaded:** no verified copy of the current Disk version: never
-  downloaded, failed (with the reason), unfinished, changed on the Disk since
-  it was downloaded, or a name that is not valid Unicode.
+quarantined: <quarantine reason>; kept at <copy>`.
 
 Only files with a verified copy of their current Disk version are read; the
 others are listed from the manifest. A file found missing, modified or

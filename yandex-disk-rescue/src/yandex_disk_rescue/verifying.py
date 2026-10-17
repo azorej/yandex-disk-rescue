@@ -11,7 +11,7 @@ as it is made, an intact file drops its earlier finding, and `download` fetches 
 Any other file is reported without being read: under its finding when it has one (the copy `verify` found is still at
 its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. A file
 listed under its finding whose quarantine record is for its current identity has its repair quarantined, and its line
-says so with the quarantine reason. Paths with no manifest entry are never opened, listed or reported.
+says so with the quarantine reason and the copy's path. Paths with no manifest entry are never opened, listed or reported.
 
 A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C, a
 kill or an unreadable destination continues where its committed cursor stands, and its report covers the whole pass.
@@ -91,10 +91,11 @@ class VerifyReport:
         return sum(1 for problems in self._lists() if problems)
 
     def add(self, entry: MirrorEntry, finding: Finding) -> None:
-        """List `entry` under `finding`, with the reason its current quarantine record holds, if any."""
+        """List `entry` under `finding`, with the reason and copy of its current quarantine record, if any."""
         reason = finding.reason
         if is_held(entry):
-            reason = f'{reason}; repair quarantined: {held_copy(entry, None).reason}'
+            held = held_copy(entry, None)
+            reason = f'{reason}; repair quarantined: {held.reason}; kept at {held.copy}'
         {'missing': self.missing, 'modified': self.modified, 'corrupt': self.corrupt}[finding.kind].append(
             Problem(entry.resource.path, reason)
         )

@@ -269,7 +269,7 @@ code, which deletes the bytes (`work dir: ['lock', 'partial'] []`) and fetches t
     it only under `Quarantined`, and `verify` lists it only under `Quarantined`. The line shows the quarantine
     reason followed by `; last retry: <failure reason>`. This rule is about a failure record versus a quarantine
     record only. A `verify` finding (Stage 3) describes the copy at the final path and wins in `verify`'s lists:
-    such a file is listed under its finding as `<finding>; repair quarantined: <quarantine reason>`, while a plain
+    such a file is listed under its finding as `<finding>; repair quarantined: <quarantine reason>; kept at <copy>`, while a plain
     `download` still holds it and lists it under `Quarantined`.
 - **Behaviour to lock** (`tests/test_download.py`, `tests/test_manifest.py`):
   - **Rewrite `test_a_corrupted_download_fails_that_file_and_a_rerun_fetches_it[one-stream|segmented]`** as

@@ -298,12 +298,15 @@ def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_
     assert local_file(dest, CORRUPT).read_bytes() == local
     assert _findings() == [(CORRUPT, 'corrupt', finding)]
 
+    [run] = quarantine_runs(dest)
+    copy = PurePosixPath('.yandex-disk-rescue', 'quarantine', run.name, 'Photos', '2024', 'a.jpg')
+
     again = _verify(str(dest))
 
     assert again.exit_code == 1, again.output
     assert (
         _intact_lines(dest, 5, corrupt=1)
-        + f'Corrupt: 1\n  {CORRUPT}: {finding}; repair quarantined: {quarantine_reason}\n'
+        + f'Corrupt: 1\n  {CORRUPT}: {finding}; repair quarantined: {quarantine_reason}; kept at {copy}\n'
         + f'Manifest: {manifest_path()}\n'
     ) in again.stdout
     assert 'Quarantined:' not in again.stdout
