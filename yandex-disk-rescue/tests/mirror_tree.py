@@ -1,9 +1,13 @@
 """The Disk tree the `download` and `verify` tests mirror (the `disk` fixture in `conftest.py` serves it), and helpers
-to run `download` and look at its destination."""
+to run `download`, run a command in a child process, and look at its destination."""
 
 import hashlib
+import os
+import subprocess
+import time
 from datetime import UTC, datetime
 
+import pytest
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
 
@@ -25,6 +29,28 @@ SIZE_ONLY = 'disk:/Photos/old.bmp'
 
 def run_download(*args: str):
     return runner.invoke(app, ['download', *args])
+
+
+def start_command(command: str, *args: str) -> subprocess.Popen[str]:
+    """Start `yandex-disk-rescue <command> <args>` in a child process with this process's environment."""
+    return subprocess.Popen(
+        ['yandex-disk-rescue', command, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+
+
+def wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
+    """Wait up to 60 s for `condition()`, failing the test if `child` exits first."""
+    deadline = time.monotonic() + 60
+    while not condition():
+        if child.poll() is not None:
+            pytest.fail(f'{child.args[1]} exited with {child.returncode} before it {what}: {child.communicate()}')
+        if time.monotonic() > deadline:
+            pytest.fail(f'{child.args[1]} never {what}')
+        time.sleep(0.01)
 
 
 def local_file(dest, remote_path: str):

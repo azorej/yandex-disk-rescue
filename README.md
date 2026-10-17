@@ -8,8 +8,8 @@ account to local storage. It is a headless analogue of the Windows app
 > (`yandex-disk-rescue auth`), scanning the remote tree into a local
 > manifest (`yandex-disk-rescue scan`) and verified, parallel, resumable
 > mirroring with segmented downloads of large files
-> (`yandex-disk-rescue download`) and an offline integrity check of a mirror
-> (`yandex-disk-rescue verify`) work. Further features are being built;
+> (`yandex-disk-rescue download`) and an offline, resumable integrity check
+> of a mirror (`yandex-disk-rescue verify`) work. Further features are being built;
 > planned work is tracked in GitHub issues.
 
 ## Goals
@@ -258,7 +258,8 @@ downloaded again whatever its record says, and its copy in DEST is never read
 (it may be unreadable): once the new file is verified, that copy is moved
 aside to `replaced/` (below) and the finding is dropped. A repair that fails,
 is interrupted or is quarantined keeps the finding, so every later run treats
-the file the same way until it is verified.
+the file the same way until it is verified. `download --retry-failed`
+(below) repairs exactly those files without walking the rest of the mirror.
 
 **Interruptions, stalls and retries.** Every download keeps a checkpoint
 journal in the manifest: for each segment (a file fetched as one stream has
@@ -330,21 +331,22 @@ recorded too, but the file stays listed under `Quarantined` only, its line
 ending with `; last retry: <reason>`.
 
 `download --retry-failed [REMOTE_PATH] DEST` covers only the *retry set*: the
-files with a failure record, a quarantine record or a download that started
-and never finished (for example one stopped by Ctrl+C), and the folders with
-a failure record. Files never started are not in it; a plain `download` gets them. The
+files with a failure record, a quarantine record, a download that started
+and never finished (for example one stopped by Ctrl+C) or a
+[`verify`](#verifying-a-mirror) finding (missing, modified or corrupt), and
+the folders with a failure record. Files never started are not in it; a plain `download` gets them. The
 scan step runs as usual; the retry set is fixed once it is done. The run then
 visits only the retry set and the folders above its members, in path order,
 with the usual passes and rules, and never looks at any other path of DEST:
 those files are neither checked nor counted. It starts with
 
 ```
-Retrying 3 failed, quarantined or unfinished files (1.5 GiB) in /mnt/backup
+Retrying 3 failed, quarantined, unfinished or broken files (1.5 GiB) in /mnt/backup
 ```
 
 in place of `Downloading …`, and its summary and exit code are those of a
 normal run over the retry set. With nothing to retry it prints `Retrying 0
-failed, quarantined or unfinished files (0 B)`, downloads nothing and exits
+failed, quarantined, unfinished or broken files (0 B)`, downloads nothing and exits
 `0`. Entries
 whose names are not valid Unicode have no record; they fail every run,
 `--retry-failed` included.
@@ -378,8 +380,8 @@ failed or is quarantined, the run ends with exit code `1` and
 `Error: F failed; see the list above.`, `Error: Q quarantined; see the list
 above.` or `Error: F failed and Q quarantined; see the lists above.` A plain
 rerun retries every file that is not verified yet except the quarantined
-ones, and `download --retry-failed` only the failed, quarantined and
-unfinished ones.
+ones, and `download --retry-failed` only the failed, quarantined, unfinished
+and broken ones.
 
 **Files already in DEST.** DEST may already hold files, for example an
 earlier copy made by hand. A regular file at the path of a Disk file is read
@@ -542,7 +544,7 @@ Each file of the mirror, as of the last scan, is one of:
 Only files with a verified copy of their current Disk version are read; the
 others are listed from the manifest. A file found missing, modified or corrupt is recorded
 in the manifest at once, and the next `download` (a plain one, `--no-scan`
-included) downloads it again without reading the bad copy and moves that copy
+or `--retry-failed`) downloads it again without reading the bad copy and moves that copy
 aside to `replaced/`. A file `verify` finds intact again drops its finding.
 Paths of DEST with no Disk counterpart (local-only files, `.DS_Store`, …) are
 never opened, listed or reported, and folders are not checked.
@@ -577,9 +579,28 @@ downloaded, `verify` ends with exit code `1` and `Error: N problems found; see
 the lists above.`; on a complete, intact mirror it exits `0`. `verify` uses
 the destination's lock like `download`, so the two never run on one DEST at
 once. A DEST that is not an existing folder, or that no `download` recorded in
-the manifest, is a usage error (exit `2`). Ctrl+C prints `Interrupted; rerun
-verify to check the mirror again.` and exits with 130; the findings made so
-far stay recorded.
+the manifest, is a usage error (exit `2`); `verify` never creates a manifest.
+
+**Resuming.** A check is one *pass* over the mirror, kept in the manifest
+until every file is checked. Ctrl+C prints `Interrupted; rerun verify to
+continue where it stopped.` and exits with 130; the findings made so far stay
+recorded. The next `verify DEST` continues the pass instead of starting over:
+it reads only the files after the last one checked, and starts with
+
+```
+Continuing the verification started 2026-10-17 09:30 UTC: 412 files (380.5 MiB) left
+```
+
+The pass records how far it got at least every 5 s and when it stops, so a
+kill or a power cut costs the files checked in the last 5 s and the one being
+read; a destination that became unreadable stops the pass the same way. Its
+summary always covers the whole pass: a file checked in an earlier part
+counts by what was recorded then (intact unless it was found missing,
+modified or corrupt), so the report equals that of an uninterrupted
+`verify`. A `download` between two parts is harmless: a file it repaired
+counts as intact, and the files after the cursor are read as usual.
+`verify --restart DEST` drops the pass in progress and starts a new one over
+every file.
 
 ## Exit codes
 

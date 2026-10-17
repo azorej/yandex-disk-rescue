@@ -1,6 +1,6 @@
 """`download`: scan a remote folder (unless a recent scan covers it), mirror it into a local folder with every file
-verified, or retry only the files whose last attempt failed, was quarantined or never finished, and summarize the
-run."""
+verified, or retry only the files whose last attempt failed, was quarantined or never finished and those `verify`
+found broken, and summarize the run."""
 
 import asyncio
 from dataclasses import dataclass
@@ -58,8 +58,9 @@ def download(
         bool,
         typer.Option(
             '--retry-failed',
-            help='Download only the files whose last attempt in DEST failed, was quarantined or never finished, and '
-            'the folders that failed; leave everything else alone.',
+            help='Download only the files whose last attempt in DEST failed, was quarantined or never finished, the '
+            'files verify found missing, modified or corrupt, and the folders that failed; leave everything else '
+            'alone.',
         ),
     ] = False,
     scan_max_age: settings.ScanMaxAge = settings.SCAN_MAX_AGE.default,
@@ -79,7 +80,7 @@ def download(
     api_url: settings.ApiUrl = settings.API_URL.default,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
-    skipped on a rerun, or with --retry-failed only the failed, quarantined and unfinished ones."""
+    skipped on a rerun, or with --retry-failed only the failed, quarantined, unfinished and broken ones."""
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
@@ -214,7 +215,8 @@ async def _mirror(
     size = format_size(run.pending_size)
     if retry_failed:
         typer.echo(
-            f'Retrying {run.pending_files} failed, quarantined or unfinished {files} ({size}) in {destination.path}'
+            f'Retrying {run.pending_files} failed, quarantined, unfinished or broken {files} ({size}) in '
+            f'{destination.path}'
         )
     else:
         typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')

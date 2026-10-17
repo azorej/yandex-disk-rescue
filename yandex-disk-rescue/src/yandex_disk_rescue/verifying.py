@@ -12,12 +12,16 @@ Any other file is reported without being read: under its finding when it has one
 its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. Paths
 with no manifest entry are never opened, listed or reported.
 
+A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C, a
+kill or an unreadable destination continues where its committed cursor stands, and its report covers the whole pass.
+
 A read error stops the check instead of being recorded when the destination itself has become unreadable, as a
 disconnected disk makes every file unreadable.
 """
 
 import errno
 import stat
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
@@ -31,6 +35,7 @@ from yandex_disk_rescue.manifest import (
     Mirror,
     MirrorEntry,
     RemoteIdentity,
+    VerifyPass,
 )
 from yandex_disk_rescue.mirroring import (
     Digest,
@@ -41,6 +46,10 @@ from yandex_disk_rescue.mirroring import (
     unencodable_reason,
 )
 from yandex_disk_rescue.scanning import display_path, listed
+
+# The longest a pass keeps its cursor uncommitted while files are checked: a killed pass reads again at most the files
+# checked in this time, and the one in flight.
+CURSOR_SECONDS = 5.0
 
 # A read failing with one of these means the device is gone, whatever the destination's path still answers.
 _DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
@@ -90,38 +99,70 @@ class VerifyReport:
 
 
 class VerifyRun:
-    """One check of a mirror: the files to read are counted on construction (`files`, `size`); `run` checks them."""
+    """One part of a `verify` pass over a mirror: the files still to read are counted on construction (`files`,
+    `size`); `run` checks them.
 
-    def __init__(self, mirror: Mirror, destination: ReadOnlyDestination) -> None:
+    The pass checks the files in path order and moves its cursor (`VerifyPass.checked_through`) past each file once
+    its check is recorded, committing it at least every `CURSOR_SECONDS` and whenever the run stops, so a later part
+    reads only the files after the cursor. A file at or before the cursor counts by what the manifest holds: intact
+    while it is verified for its current identity and has no finding.
+    """
+
+    def __init__(self, mirror: Mirror, destination: ReadOnlyDestination, verify_pass: VerifyPass) -> None:
         self._mirror = mirror
         self._destination = destination
         self._entries = [e for e in mirror.entries() if e.resource.kind == 'file']
-        checked = [e for e in self._entries if _verified_now(e)]
-        self._checked = {e.entry_id for e in checked}
-        self.files = len(checked)
-        self.size = sum(e.resource.size or 0 for e in checked)
+        through = verify_pass.checked_through
+        verified = [e for e in self._entries if _verified_now(e)]
+        pending = [e for e in verified if through is None or e.resource.path > through]
+        self._pending = {e.entry_id for e in pending}
+        self._verified = {e.entry_id for e in verified}
+        self._through = through
+        self._committed = through
+        self._committed_at = time.monotonic()
+        self.files = len(pending)
+        self.size = sum(e.resource.size or 0 for e in pending)
 
     def run(self) -> VerifyReport:
-        """Check every file in path order, recording each finding as it is made.
+        """Check every file still to read in path order, recording each finding as it is made, and end the pass.
 
         Raises `DestinationUnreadableError` when a read fails and the destination itself cannot be read, or the error
-        says the device is gone; nothing is recorded for that file.
+        says the device is gone; nothing is recorded for that file, and the cursor stays before it.
         """
         report = VerifyReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
-        for entry in self._entries:
-            if entry.entry_id in self._checked:
-                self._check(entry, report)
-            elif entry.finding is not None:
-                report.add(entry.resource.path, entry.finding)
-            elif is_held(entry):
-                report.quarantined.append(held_copy(entry, entry.failure))
-            else:
-                report.not_downloaded.append(Problem(entry.resource.path, _not_downloaded_reason(entry)))
+        try:
+            for entry in self._entries:
+                self._report(entry, report)
+        except KeyboardInterrupt, DestinationUnreadableError:
+            self._commit_cursor()
+            raise
+        self._mirror.end_verify_pass()
         report.not_downloaded += [
             Problem(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()
         ]
         report.not_downloaded.sort(key=lambda problem: problem.path)
         return report
+
+    def _report(self, entry: MirrorEntry, report: VerifyReport) -> None:
+        if entry.entry_id in self._pending:
+            self._check(entry, report)
+            self._through = entry.resource.path
+            if time.monotonic() - self._committed_at >= CURSOR_SECONDS:
+                self._commit_cursor()
+        elif entry.finding is not None:
+            report.add(entry.resource.path, entry.finding)
+        elif entry.entry_id in self._verified:
+            _count_intact(entry, report)
+        elif is_held(entry):
+            report.quarantined.append(held_copy(entry, entry.failure))
+        else:
+            report.not_downloaded.append(Problem(entry.resource.path, _not_downloaded_reason(entry)))
+
+    def _commit_cursor(self) -> None:
+        if self._through is not None and self._through != self._committed:
+            self._mirror.checked_through(self._through)
+            self._committed = self._through
+        self._committed_at = time.monotonic()
 
     def _check(self, entry: MirrorEntry, report: VerifyReport) -> None:
         finding = _finding(entry, self._destination)
@@ -129,9 +170,7 @@ class VerifyRun:
             self._mirror.record_finding(entry.entry_id, finding)
             report.add(entry.resource.path, finding)
             return
-        report.intact += 1
-        if _record(entry).verified_by == 'size':
-            report.size_only.append(entry.resource.path)
+        _count_intact(entry, report)
         if entry.finding is not None:
             self._mirror.clear_finding(entry.entry_id)
 
@@ -186,6 +225,12 @@ def _finding(entry: MirrorEntry, destination: ReadOnlyDestination) -> Finding | 
     if mismatch is None:
         return None
     return Finding('modified' if touched else 'corrupt', mismatch)
+
+
+def _count_intact(entry: MirrorEntry, report: VerifyReport) -> None:
+    report.intact += 1
+    if _record(entry).verified_by == 'size':
+        report.size_only.append(entry.resource.path)
 
 
 def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity) -> str | None:

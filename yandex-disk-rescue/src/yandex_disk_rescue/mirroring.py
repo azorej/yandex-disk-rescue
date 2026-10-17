@@ -360,10 +360,11 @@ class MirrorRun:
     """One run over a mirror: names are assigned, stray partial files deleted and the files this run will attempt
     counted on construction; `run` then walks the run's entries in path order.
 
-    With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record or a
-    `partial` download record, and the folders with a failure record. Its walk visits them and the folders above them,
-    and no other path of the mirror is looked at. Otherwise the run covers every entry, and holds every file whose
-    quarantine record is for its current identity: such a file is reported as quarantined without being looked at.
+    With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record, a
+    `verify` finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
+    the folders above them, and no other path of the mirror is looked at. Otherwise the run covers every entry, and
+    holds every file whose quarantine record is for its current identity: such a file is reported as quarantined
+    without being looked at.
 
     Every entry that fails gets a failure record with the reason when the failure happens; an entry verified, adopted
     or made in place loses it. A failed entry is reported as failed, or as quarantined when its quarantine record is
@@ -1246,6 +1247,7 @@ def _retry_walk(entries: list[MirrorEntry], names: LocalNames) -> list[MirrorEnt
         for e in entries
         if e.failure is not None
         or e.quarantine is not None
+        or e.finding is not None
         or (e.resource.kind == 'file' and e.download is not None and e.download.state == 'partial')
     ]
     walked = {names[e.entry_id] for e in members}

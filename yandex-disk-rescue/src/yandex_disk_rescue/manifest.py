@@ -13,6 +13,7 @@ of a partial download (`download_segments`), the reason the last turn of an entr
 of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
 wrong at the entry's final path (`verify_findings`), all keyed by `entries.id`. A rescan never rewrites them: a
 record keeps the remote identity it was made for, and only an entry's removal from the manifest deletes its rows.
+A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got.
 
 The database runs in WAL mode with `synchronous=FULL`: a commit is atomic and durable across a crash or power cut,
 and each `ScanSession.add` costs one WAL append and fsync instead of the rollback journal's several. WAL needs a
@@ -208,6 +209,17 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    (
+        # The `verify` pass in progress on a mirror; `checked_through` is the Disk path of the last file whose check is
+        # committed, NULL before the first.
+        """
+        CREATE TABLE verify_passes (
+            mirror_id INTEGER PRIMARY KEY REFERENCES mirrors (id) ON DELETE CASCADE,
+            started_at TEXT NOT NULL,
+            checked_through TEXT
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -218,6 +230,10 @@ type _Row = tuple[str, Literal['file', 'dir'], int | None, str | None, str | Non
 
 class ManifestError(RescueError):
     """The manifest cannot be opened or updated; the message names the file and what to do."""
+
+
+class ManifestMissingError(ManifestError):
+    """No manifest exists at the path `Manifest.open_existing` was given."""
 
 
 class MirrorMismatchError(RescueError):
@@ -304,6 +320,15 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class VerifyPass:
+    """A `verify` pass in progress on a mirror: the files up to `checked_through` (a Disk path; `None` before the
+    first) are checked, every file after it is still to check."""
+
+    started_at: datetime
+    checked_through: str | None
+
+
+@dataclass(frozen=True)
 class MirrorEntry:
     entry_id: int
     resource: Resource
@@ -355,12 +380,31 @@ class Manifest:
         """
         try:
             path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            lock_fd = os.open(_lock_path(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
         except OSError as exc:
             raise ManifestError(f'Could not create the manifest at {path}: {exc.strerror}.') from None
+        return cls._open(path, create=True)
+
+    @classmethod
+    def open_existing(cls, path: Path) -> Manifest:
+        """Open the manifest at `path` as `open` does, but create nothing: raises `ManifestMissingError` when no file
+        is there."""
+        try:
+            os.stat(path)
+        except FileNotFoundError:
+            raise ManifestMissingError(f'No manifest exists at {path}.') from None
+        except OSError as exc:
+            raise ManifestError(f'Could not open the manifest at {path}: {exc.strerror}.') from None
+        return cls._open(path, create=False)
+
+    @classmethod
+    def _open(cls, path: Path, *, create: bool) -> Manifest:
+        try:
+            lock_fd = os.open(_lock_path(path), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        except OSError as exc:
+            raise ManifestError(f'Could not open the run lock of the manifest at {path}: {exc.strerror}.') from None
         try:
             _acquire_run_lock(lock_fd, path)
-            connection = _connect(path)
+            connection = _connect(path, create=create)
         except BaseException:
             os.close(lock_fd)
             raise
@@ -741,6 +785,39 @@ class Mirror:
                 'DELETE FROM verify_findings WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
 
+    def verify_pass(self) -> VerifyPass | None:
+        """The `verify` pass in progress on this mirror, if any."""
+        with self._manifest._errors('read'):
+            row = self._manifest._connection.execute(
+                'SELECT started_at, checked_through FROM verify_passes WHERE mirror_id = ?', (self.id,)
+            ).fetchone()
+        return None if row is None else VerifyPass(datetime.fromisoformat(row[0]), row[1])
+
+    def start_verify_pass(self) -> VerifyPass:
+        """Start a `verify` pass with nothing checked, replacing any pass in progress."""
+        started = VerifyPass(datetime.now(UTC), None)
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'INSERT OR REPLACE INTO verify_passes (mirror_id, started_at, checked_through) VALUES (?, ?, NULL)',
+                (self.id, _timestamp(started.started_at)),
+            )
+        return started
+
+    def checked_through(self, path: str) -> None:
+        """Record that the pass in progress has checked every file up to the Disk path `path`; raises `ValueError`
+        when no pass is in progress."""
+        with self._manifest._transaction('update'):
+            updated = self._manifest._connection.execute(
+                'UPDATE verify_passes SET checked_through = ? WHERE mirror_id = ?', (path, self.id)
+            ).rowcount
+            if not updated:
+                raise ValueError(f'mirror {self.id} has no verify pass in progress')
+
+    def end_verify_pass(self) -> None:
+        """Delete the pass in progress, if any."""
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute('DELETE FROM verify_passes WHERE mirror_id = ?', (self.id,))
+
     def _segments(self, entry_id: int) -> tuple[Segment, ...]:
         rows = self._manifest._connection.execute(
             'SELECT start, end, confirmed, digest FROM download_segments WHERE mirror_id = ? AND entry_id = ? '
@@ -953,11 +1030,14 @@ def _acquire_run_lock(lock_fd: int, path: Path) -> None:
         ) from None
 
 
-def _connect(path: Path) -> sqlite3.Connection:
+def _connect(path: Path, *, create: bool) -> sqlite3.Connection:
     try:
-        # Created here so the database (and the WAL files SQLite gives the same mode) are private from the start.
-        os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600))
-        connection = sqlite3.connect(path, autocommit=True)
+        if create:
+            # Created here so the database (and the WAL files SQLite gives the same mode) are private from the start.
+            os.close(os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600))
+            connection = sqlite3.connect(path, autocommit=True)
+        else:
+            connection = sqlite3.connect(f'{path.absolute().as_uri()}?mode=rw', uri=True, autocommit=True)
     except (OSError, sqlite3.Error) as exc:
         raise ManifestError(f'Could not open the manifest at {path}: {_reason(exc)}.') from None
     try:

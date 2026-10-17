@@ -1,7 +1,8 @@
 """`verify`: check every file of the mirror at a destination against the manifest, with no token and no network,
-reading the destination only, and summarize what is broken or missing."""
+reading the destination only, continuing an interrupted pass, and summarize what is broken or missing."""
 
 import os
+from datetime import UTC
 from pathlib import Path
 from typing import Annotated
 
@@ -10,7 +11,7 @@ import typer
 from yandex_disk_rescue import paths
 from yandex_disk_rescue.destination import ReadOnlyDestination
 from yandex_disk_rescue.errors import RescueError
-from yandex_disk_rescue.manifest import Manifest
+from yandex_disk_rescue.manifest import Manifest, ManifestMissingError, VerifyPass
 from yandex_disk_rescue.units import format_size
 from yandex_disk_rescue.verifying import VerifyReport, VerifyRun, verify_summary
 
@@ -36,27 +37,42 @@ def verify(
         str,
         typer.Argument(metavar='DEST', help='Destination folder of an earlier download.', show_default=False),
     ],
+    restart: Annotated[
+        bool,
+        typer.Option('--restart', help='Start a new pass over every file instead of continuing an interrupted one.'),
+    ] = False,
 ) -> None:
     """Re-hash every verified file of the mirror at DEST against the manifest, with no network and nothing written to
-    DEST, and report missing, modified, corrupt, quarantined and not downloaded files."""
+    DEST, and report missing, modified, corrupt, quarantined and not downloaded files. An interrupted pass continues
+    where it stopped."""
     manifest_path = paths.manifest_path()
     try:
-        with (
-            ReadOnlyDestination.open(Path(os.path.abspath(dest))) as destination,
-            Manifest.open(manifest_path) as manifest,
-        ):
-            mirror = manifest.mirror_at(destination.path)
-            if mirror is None:
-                raise NotAMirrorError(destination.path, manifest_path)
-            run = VerifyRun(mirror, destination)
-            files = 'file' if run.files == 1 else 'files'
-            typer.echo(f'Verifying {run.files} {files} ({format_size(run.size)}) in {destination.path}')
-            report = run.run()
+        with ReadOnlyDestination.open(Path(os.path.abspath(dest))) as destination:
+            try:
+                manifest = Manifest.open_existing(manifest_path)
+            except ManifestMissingError:
+                raise NotAMirrorError(destination.path, manifest_path) from None
+            with manifest:
+                mirror = manifest.mirror_at(destination.path)
+                if mirror is None:
+                    raise NotAMirrorError(destination.path, manifest_path)
+                current = None if restart else mirror.verify_pass()
+                run = VerifyRun(mirror, destination, current or mirror.start_verify_pass())
+                typer.echo(_start_line(run, current, destination.path))
+                report = run.run()
     except KeyboardInterrupt:
-        typer.echo('Interrupted; rerun verify to check the mirror again.', err=True)
+        typer.echo('Interrupted; rerun verify to continue where it stopped.', err=True)
         raise
     for line in verify_summary(report):
         typer.echo(line)
     typer.echo(f'Manifest: {manifest_path}')
     if report.problems:
         raise ProblemsFoundError(report)
+
+
+def _start_line(run: VerifyRun, continued: VerifyPass | None, destination: Path) -> str:
+    files = f'{run.files} {"file" if run.files == 1 else "files"} ({format_size(run.size)})'
+    if continued is None:
+        return f'Verifying {files} in {destination}'
+    started = continued.started_at.astimezone(UTC).strftime('%Y-%m-%d %H:%M')
+    return f'Continuing the verification started {started} UTC: {files} left'

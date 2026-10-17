@@ -12,7 +12,6 @@ import re
 import shutil
 import signal
 import sqlite3
-import subprocess
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -34,6 +33,8 @@ from mirror_tree import (
     replaced_runs,
     run_download,
     runner,
+    start_command,
+    wait_until,
 )
 from yandex_disk_rescue import api, localfs, mirroring
 from yandex_disk_rescue.api import Resource
@@ -268,7 +269,8 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
 
     assert retry.exit_code == 0, retry.output
     assert (
-        f'Retrying 1 failed, quarantined or unfinished file ({format_size(len(content))}) in {dest}\n' in retry.stdout
+        f'Retrying 1 failed, quarantined, unfinished or broken file ({format_size(len(content))}) in {dest}\n'
+        in retry.stdout
     )
     assert f'1 downloaded ({format_size(len(content))}), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert local_file(dest, path).read_bytes() == content
@@ -1390,7 +1392,7 @@ def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_other
     retry = run_download('--retry-failed', '--scan-max-age', '0', str(dest))
 
     assert retry.exit_code == 0, retry.output
-    assert f'Retrying 1 failed, quarantined or unfinished file (7 B) in {dest}\n' in retry.stdout
+    assert f'Retrying 1 failed, quarantined, unfinished or broken file (7 B) in {dest}\n' in retry.stdout
     assert f'Mirrored disk:/ to {dest}: 1 downloaded (7 B), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert [r.params['path'] for r in disk.requests[earlier:] if r.path in _CONTENT_PATHS] == [failed, failed]
     assert local_file(dest, failed).read_bytes() == FILES[failed]
@@ -1402,7 +1404,7 @@ def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_other
     again = run_download('--retry-failed', str(dest))
 
     assert again.exit_code == 0, again.output
-    assert f'Retrying 0 failed, quarantined or unfinished files (0 B) in {dest}\n' in again.stdout
+    assert f'Retrying 0 failed, quarantined, unfinished or broken files (0 B) in {dest}\n' in again.stdout
     assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 0 skipped, 0 quarantined, 0 failed\n' in again.stdout
     assert _transfers(disk, earlier) == []
 
@@ -1421,7 +1423,7 @@ def test_retry_failed_makes_a_failed_folder_and_the_files_under_it(disk, dest, m
     retry = run_download('--retry-failed', str(dest))
 
     assert retry.exit_code == 0, retry.output
-    assert f'Retrying 1 failed, quarantined or unfinished file (6 B) in {dest}\n' in retry.stdout
+    assert f'Retrying 1 failed, quarantined, unfinished or broken file (6 B) in {dest}\n' in retry.stdout
     assert f'Mirrored disk:/ to {dest}: 1 downloaded (6 B), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert (dest / 'Q?' / 'x.txt').read_bytes() == b'inside'
     assert _failure_records() == []
@@ -1430,7 +1432,7 @@ def test_retry_failed_makes_a_failed_folder_and_the_files_under_it(disk, dest, m
     again = run_download('--retry-failed', str(dest))
 
     assert again.exit_code == 0, again.output
-    assert f'Retrying 0 failed, quarantined or unfinished files (0 B) in {dest}\n' in again.stdout
+    assert f'Retrying 0 failed, quarantined, unfinished or broken files (0 B) in {dest}\n' in again.stdout
     assert _transfers(disk, earlier) == []
 
 
@@ -1703,31 +1705,11 @@ def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_
     assert len(_partials(dest)) == len(slow) + 1
 
 
-def _start_download(*args: str) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        ['yandex-disk-rescue', 'download', *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=os.environ.copy(),
-    )
-
-
-def _wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
-    deadline = time.monotonic() + 60
-    while not condition():
-        if child.poll() is not None:
-            pytest.fail(f'download exited with {child.returncode} before it {what}: {child.communicate()}')
-        if time.monotonic() > deadline:
-            pytest.fail(f'download never {what}')
-        time.sleep(0.01)
-
-
 def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_there(big, dest):
     big.chunk_delay = 0.2
-    child = _start_download('disk:/Big', str(dest))
+    child = start_command('download', 'disk:/Big', str(dest))
     try:
-        _wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
+        wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
         child.send_signal(signal.SIGINT)
         _, stderr = child.communicate(timeout=60)
     finally:
@@ -1745,7 +1727,10 @@ def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_th
     result = run_download('--retry-failed', 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
-    assert f'Retrying 1 failed, quarantined or unfinished file ({format_size(len(BIG))}) in {dest}\n' in result.stdout
+    assert (
+        f'Retrying 1 failed, quarantined, unfinished or broken file ({format_size(len(BIG))}) in {dest}\n'
+        in result.stdout
+    )
     assert _fetches(big, BIG_PATH, earlier) == [_tail(held)]
     assert _transfers(big, earlier) == ['/v1/disk/resources/download', '/download']
     assert (dest / 'big.bin').read_bytes() == BIG
@@ -1755,9 +1740,9 @@ def test_a_download_killed_mid_file_fetches_at_most_one_checkpoint_interval_agai
     path, content = 'disk:/Kill/k.bin', random.Random(5).randbytes(4 * 1024 * 1024)
     disk.add_file(path, content, modified=MODIFIED)
     disk.chunk_delay = 0.25
-    child = _start_download('--download-checkpoint-mib', '1', 'disk:/Kill', str(dest))
+    child = start_command('download', '--download-checkpoint-mib', '1', 'disk:/Kill', str(dest))
     try:
-        _wait_until(lambda: _confirmed() >= 1024 * 1024, child, 'confirmed 1 MiB')
+        wait_until(lambda: _confirmed() >= 1024 * 1024, child, 'confirmed 1 MiB')
         child.kill()
         child.communicate(timeout=60)
     finally:
@@ -1787,9 +1772,9 @@ def test_a_download_killed_mid_file_fetches_at_most_one_checkpoint_interval_agai
 def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_file(big, dest, monkeypatch):
     monkeypatch.setenv('YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT', '1')
     big.inject('GET', '/download', Truncate(after_bytes=300_000), Delay(30), where={'path': BIG_PATH})
-    child = _start_download('disk:/Big', str(dest))
+    child = start_command('download', 'disk:/Big', str(dest))
     try:
-        _wait_until(lambda: len(_fetches(big, BIG_PATH)) == 2, child, 'resumed the file')
+        wait_until(lambda: len(_fetches(big, BIG_PATH)) == 2, child, 'resumed the file')
         resumed = [r.started for r in big.requests if r.path == '/download'][-1]
         time.sleep(max(0.0, resumed + 2.5 - time.monotonic()))
         child.send_signal(signal.SIGINT)
@@ -1847,16 +1832,16 @@ def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error
     (site / 'sitecustomize.py').write_text(_FSYNC_GATE)
     monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
     monkeypatch.setenv('FSYNC_GATE', str(gate))
-    child = _start_download('disk:/Stop', str(dest))
+    child = start_command('download', 'disk:/Stop', str(dest))
     try:
-        _wait_until(
+        wait_until(
             lambda: sum(p.stat().st_size >= 64 * 1024 for p in _partials(dest)) == len(slow),
             child,
             'wrote a chunk of every slow file',
         )
         # z.txt fails as it is finished, which stops the run; each slow file's checkpoint then hangs in its fsync.
         (gate / 'go').touch()
-        _wait_until(lambda: len(list(gate.glob('blocked-*'))) == len(slow), child, 'checkpointed the cancelled files')
+        wait_until(lambda: len(list(gate.glob('blocked-*'))) == len(slow), child, 'checkpointed the cancelled files')
         child.send_signal(signal.SIGINT)
         time.sleep(0.5)
         (gate / 'release').touch()
@@ -1915,11 +1900,18 @@ def test_a_segmented_download_killed_midway_fetches_at_most_one_checkpoint_inter
     disk.add_file(path, content, modified=MODIFIED)
     disk.chunk_delay = 0.25
     ranges = [f'bytes={n * 4 * MiB}-{(n + 1) * 4 * MiB - 1}' for n in range(4)]
-    child = _start_download(
-        *SEGMENTED_ARGS, '--download-segments', '4', '--download-checkpoint-mib', '1', 'disk:/Kill', str(dest)
+    child = start_command(
+        'download',
+        *SEGMENTED_ARGS,
+        '--download-segments',
+        '4',
+        '--download-checkpoint-mib',
+        '1',
+        'disk:/Kill',
+        str(dest),
     )
     try:
-        _wait_until(lambda: _segments_confirmed(MiB), child, 'confirmed 1 MiB of every segment')
+        wait_until(lambda: _segments_confirmed(MiB), child, 'confirmed 1 MiB of every segment')
         child.kill()
         child.communicate(timeout=60)
     finally:
@@ -1961,9 +1953,9 @@ def _interrupt_segmented(fake, dest) -> list[tuple[int, int, int, str | None]]:
     """Start a segmented download of `SEGMENTED_PATH`, stop it with Ctrl+C once every segment has received some data,
     and return its journal."""
     fake.chunk_delay = 0.2
-    child = _start_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+    child = start_command('download', *SEGMENTED_ARGS, 'disk:/Seg', str(dest))
     try:
-        _wait_until(lambda: _each_segment_sent(fake, 256 * 1024), child, 'sent 256 KiB of every segment')
+        wait_until(lambda: _each_segment_sent(fake, 256 * 1024), child, 'sent 256 KiB of every segment')
         child.send_signal(signal.SIGINT)
         _, stderr = child.communicate(timeout=60)
     finally:

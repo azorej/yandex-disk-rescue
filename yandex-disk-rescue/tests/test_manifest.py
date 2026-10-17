@@ -19,6 +19,7 @@ from yandex_disk_rescue.manifest import (
     LocalFingerprint,
     Manifest,
     ManifestError,
+    ManifestMissingError,
     Mirror,
     MirrorMismatchError,
     Quarantine,
@@ -26,6 +27,7 @@ from yandex_disk_rescue.manifest import (
     ScanTime,
     Segment,
     UnencodableEntry,
+    VerifyPass,
 )
 from yandex_disk_rescue.paths import state_dir
 
@@ -209,6 +211,32 @@ def test_open_creates_a_private_directory_and_database_at_the_current_schema_ver
         assert connection.execute('PRAGMA journal_mode').fetchone()[0] == 'wal'
 
 
+def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_and_upgrades(tmp_path):
+    db = tmp_path / 'state' / 'manifest.sqlite3'
+
+    with pytest.raises(ManifestMissingError, match=f'No manifest exists at {db}'):
+        Manifest.open_existing(db)
+    assert not db.parent.exists()
+    db.parent.mkdir()
+    with pytest.raises(ManifestMissingError):
+        Manifest.open_existing(db)
+    assert list(db.parent.iterdir()) == []
+
+    _scan(db, TREE)
+    with sqlite3.connect(db) as connection:
+        connection.execute('DROP TABLE verify_passes')
+        connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 1}')
+    with Manifest.open_existing(db) as manifest:
+        assert [r.path for r in manifest.entries(UID, 'disk:/')] == sorted(r.path for r in TREE)
+        with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
+            Manifest.open(db)
+        with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
+            Manifest.open_existing(db)
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
+        assert connection.execute('SELECT count(*) FROM verify_passes').fetchone()[0] == 0
+
+
 def test_a_newer_schema_version_is_refused(tmp_path):
     db = tmp_path / 'manifest.sqlite3'
     Manifest.open(db).close()
@@ -339,7 +367,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 7
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -363,7 +391,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 7
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -392,7 +420,7 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 7
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
@@ -1025,3 +1053,38 @@ def test_a_finding_survives_download_record_changes_and_goes_with_verifying_clea
         assert connection.execute('SELECT entry_id, finding FROM verify_findings').fetchall() == [
             (ids[edit.path], 'modified')
         ]
+
+
+def test_a_verify_pass_round_trips_is_replaced_by_a_new_one_and_goes_with_its_mirror(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    _scan(db, TREE)
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/', tmp_path / 'dest')
+        other = manifest.mirror(UID, 'disk:/', tmp_path / 'other')
+        assert mirror.verify_pass() is None
+        with pytest.raises(ValueError, match='has no verify pass in progress'):
+            mirror.checked_through('disk:/A/keep.txt')
+
+        before = datetime.now(UTC)
+        started = mirror.start_verify_pass()
+        mirror.checked_through('disk:/A/edit.txt')
+        mirror.checked_through('disk:/A/keep.txt')
+        assert mirror.verify_pass() == VerifyPass(started.started_at, 'disk:/A/keep.txt')
+        assert before <= started.started_at <= datetime.now(UTC)
+        assert started.checked_through is None
+        assert other.verify_pass() is None
+
+        restarted = mirror.start_verify_pass()
+        assert mirror.verify_pass() == restarted == VerifyPass(restarted.started_at, None)
+        assert restarted.started_at >= started.started_at
+        other.start_verify_pass()
+        mirror.end_verify_pass()
+        mirror.end_verify_pass()
+        assert mirror.verify_pass() is None
+        assert other.verify_pass() is not None
+
+    with closing(sqlite3.connect(db)) as connection:
+        connection.execute('PRAGMA foreign_keys = ON')
+        connection.execute('DELETE FROM mirrors')
+        connection.commit()
+        assert connection.execute('SELECT count(*) FROM verify_passes').fetchone()[0] == 0

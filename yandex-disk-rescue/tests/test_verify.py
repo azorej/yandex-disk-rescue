@@ -5,9 +5,12 @@ import errno
 import fcntl
 import hashlib
 import os
+import random
+import signal
 import sqlite3
 import stat
 from contextlib import closing
+from datetime import datetime
 from pathlib import PurePosixPath
 
 import pytest
@@ -22,8 +25,10 @@ from mirror_tree import (
     replaced_runs,
     run_download,
     runner,
+    start_command,
+    wait_until,
 )
-from yandex_disk_rescue import localfs
+from yandex_disk_rescue import localfs, verifying
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import ReadOnlyDestination
 from yandex_disk_rescue.manifest import Mirror
@@ -34,6 +39,7 @@ CORRUPT = 'disk:/Photos/2024/a.jpg'
 EDITED = 'disk:/Photos/2024/b.jpg'
 README = 'disk:/Docs/readme.txt'
 TOTAL = format_size(sum(map(len, FILES.values())))
+_RETRYING = 'Retrying 3 failed, quarantined, unfinished or broken files'
 _CONTENT_PATHS = ('/v1/disk/resources/download', '/download', '/storage')
 
 
@@ -56,17 +62,60 @@ def _flip_keeping_mtime(local, offset: int) -> bytes:
     return bytes(content)
 
 
-def _findings() -> list[tuple[str, str, str]]:
-    """The (remote path, finding, reason) of every finding in the manifest, read with a connection of its own."""
+def _query(sql: str) -> list[tuple]:
+    """The rows of `sql` over the manifest, read with a read-only connection of its own."""
     with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
-        return connection.execute(
-            'SELECT e.path, v.finding, v.reason FROM verify_findings v JOIN entries e ON e.id = v.entry_id '
-            'ORDER BY e.path'
-        ).fetchall()
+        return connection.execute(sql).fetchall()
+
+
+def _findings() -> list[tuple[str, str, str]]:
+    """The (remote path, finding, reason) of every finding in the manifest."""
+    return _query(
+        'SELECT e.path, v.finding, v.reason FROM verify_findings v JOIN entries e ON e.id = v.entry_id ORDER BY e.path'
+    )
+
+
+def _verify_pass() -> tuple[datetime, str | None] | None:
+    """The start and the cursor of the verify pass in progress, if any."""
+    rows = _query('SELECT started_at, checked_through FROM verify_passes')
+    return None if not rows else (datetime.fromisoformat(rows[0][0]), rows[0][1])
+
+
+def _started(moment: datetime) -> str:
+    return f'Continuing the verification started {moment:%Y-%m-%d %H:%M} UTC:'
 
 
 def _content_requests(fake, since: int = 0) -> list[str]:
     return [r.params['path'] for r in fake.requests[since:] if r.path in _CONTENT_PATHS]
+
+
+def _count_reads(monkeypatch) -> list[int]:
+    """Record the inode of every file read, once per file, in the order first read."""
+    read = localfs.read
+    reads: list[int] = []
+
+    def counting(fd, size, offset):
+        inode = os.fstat(fd).st_ino
+        if inode not in reads:
+            reads.append(inode)
+        return read(fd, size, offset)
+
+    monkeypatch.setattr(localfs, 'read', counting)
+    return reads
+
+
+def _interrupt_reads(monkeypatch, at: int) -> None:
+    """Raise `KeyboardInterrupt`, as Ctrl+C does, at the first read of the `at`-th file read."""
+    read = localfs.read
+    seen: set[int] = set()
+
+    def interrupting(fd, size, offset):
+        seen.add(os.fstat(fd).st_ino)
+        if len(seen) == at:
+            raise KeyboardInterrupt
+        return read(fd, size, offset)
+
+    monkeypatch.setattr(localfs, 'read', interrupting)
 
 
 def _fail_reads(monkeypatch, inode: int) -> list[int]:
@@ -191,11 +240,16 @@ def test_a_destination_gone_mid_check_stops_it_with_nothing_recorded(disk, dest,
         f'Error: Could not read {dest}: {os.strerror(code)}; verify stopped. Rerun it once the disk is back.\n'
     )
     assert _findings() == []
+    started, through = _verify_pass()
+    assert through == CYRILLIC
 
     rerun = _verify(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
+    left = format_size(sum(len(content) for path, content in FILES.items() if path > CYRILLIC))
+    assert rerun.stdout.startswith(f'{_started(started)} 4 files ({left}) left\n')
     assert _intact_lines(dest, 6) in rerun.stdout
+    assert _verify_pass() is None
 
 
 def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk, dest, monkeypatch):
@@ -207,14 +261,7 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
     disk.add_file('disk:/New/n.txt', b'new', modified=MODIFIED)
     disk.add_file(EDITED, b'edited on the Disk', modified=MODIFIED)
     assert runner.invoke(app, ['scan']).exit_code == 0
-    read = localfs.read
-    reads: list[int] = []
-
-    def counting(fd, size, offset):
-        reads.append(os.fstat(fd).st_ino)
-        return read(fd, size, offset)
-
-    monkeypatch.setattr(localfs, 'read', counting)
+    reads = _count_reads(monkeypatch)
 
     result = _verify(str(dest))
 
@@ -281,7 +328,13 @@ def test_verify_writes_nothing_in_the_destination_and_never_reports_local_only_c
         assert name not in result.stdout
 
 
-def test_download_fetches_again_exactly_what_verify_found_and_moves_the_bad_copies_aside(disk, dest):
+@pytest.mark.parametrize(
+    ('option', 'start', 'skipped'),
+    [('--no-scan', 'Downloading 3 files ({size}) to', 3), ('--retry-failed', _RETRYING + ' ({size}) in', 0)],
+)
+def test_download_fetches_again_exactly_what_verify_found_and_moves_the_bad_copies_aside(
+    disk, dest, option, start, skipped
+):
     assert run_download(str(dest)).exit_code == 0
     corrupt = _flip_keeping_mtime(local_file(dest, CORRUPT), 10)
     edited = b'B' * len(FILES[EDITED])
@@ -290,12 +343,12 @@ def test_download_fetches_again_exactly_what_verify_found_and_moves_the_bad_copi
     assert _verify(str(dest)).exit_code == 1
     earlier = len(disk.requests)
 
-    repair = run_download('--no-scan', str(dest))
+    repair = run_download(option, str(dest))
 
     assert repair.exit_code == 0, repair.output
     size = format_size(sum(len(FILES[path]) for path in (CORRUPT, EDITED, README)))
-    assert f'Downloading 3 files ({size}) to {dest}\n' in repair.stdout
-    assert f'3 downloaded ({size}), 3 skipped, 0 quarantined, 0 failed\n' in repair.stdout
+    assert f'{start.format(size=size)} {dest}\n' in repair.stdout
+    assert f'3 downloaded ({size}), {skipped} skipped, 0 quarantined, 0 failed\n' in repair.stdout
     assert sorted(set(_content_requests(disk, earlier))) == sorted([CORRUPT, EDITED, README])
     for path in (CORRUPT, EDITED, README):
         assert local_file(dest, path).read_bytes() == FILES[path]
@@ -353,7 +406,9 @@ def test_download_never_reads_a_copy_verify_found_unreadable_and_a_failed_repair
     assert _findings() == []
 
 
-def test_a_destination_that_is_not_a_recorded_mirror_folder_is_a_usage_error(disk, dest, tmp_path):
+def test_a_destination_that_is_not_a_recorded_mirror_folder_is_a_usage_error_and_creates_no_manifest(
+    disk, dest, tmp_path
+):
     missing = _verify(str(tmp_path / 'missing'))
 
     assert missing.exit_code == 2
@@ -367,12 +422,15 @@ def test_a_destination_that_is_not_a_recorded_mirror_folder_is_a_usage_error(dis
     assert a_file.stderr == f'Error: Destination {tmp_path / "file"} is not an existing folder.\n'
 
     dest.mkdir()
+    no_manifest = _verify(str(dest))
+    created = manifest_path().parent.exists()
+    assert runner.invoke(app, ['scan']).exit_code == 0
     unrecorded = _verify(str(dest))
 
-    assert unrecorded.exit_code == 2
-    assert unrecorded.stderr == (
-        f'Error: {dest} is not a mirror recorded in the manifest {manifest_path()}; nothing to verify.\n'
-    )
+    not_a_mirror = f'Error: {dest} is not a mirror recorded in the manifest {manifest_path()}; nothing to verify.\n'
+    assert (no_manifest.exit_code, no_manifest.stderr) == (2, not_a_mirror)
+    assert not created
+    assert (unrecorded.exit_code, unrecorded.stderr) == (2, not_a_mirror)
     assert list(dest.iterdir()) == []
 
 
@@ -412,3 +470,162 @@ def test_verify_holds_the_destination_lock_and_waits_for_no_other_run(disk, dest
     assert (
         busy.stderr == f'Error: Another yandex-disk-rescue run is using {dest}; wait for it to finish and try again.\n'
     )
+
+
+MANY = [f'disk:/Many/f{n:02}.bin' for n in range(40)]
+EARLY, LATE = MANY[1], MANY[38]
+MANY_SIZE = format_size(1024 * len(MANY))
+
+
+@pytest.fixture
+def many(disk, dest):
+    """A mirror of `disk:/Many` in `dest`: the 1 KiB files `MANY`, with a byte of `EARLY` and of `LATE` flipped since
+    they were verified."""
+    rng = random.Random(40)
+    for path in MANY:
+        disk.add_file(path, rng.randbytes(1024), modified=MODIFIED)
+    assert run_download('disk:/Many', str(dest)).exit_code == 0
+    for path in (EARLY, LATE):
+        _flip_keeping_mtime(_many_file(dest, path), 0)
+    return disk
+
+
+def _many_file(dest, path: str):
+    return dest / path.removeprefix('disk:/Many/')
+
+
+def _after(through: str) -> list[str]:
+    return [path for path in MANY if path > through]
+
+
+# Installed as `sitecustomize` in a verify subprocess: every `pread` sleeps 50 ms first, and leaves a marker named
+# after the inode it reads in the folder `READ_GATE`.
+_SLOW_READS = """
+import os, pathlib, time
+
+_gate, _pread = pathlib.Path(os.environ['READ_GATE']), os.pread
+
+
+def pread(fd, size, offset):
+    (_gate / str(os.fstat(fd).st_ino)).touch()
+    time.sleep(0.05)
+    return _pread(fd, size, offset)
+
+
+os.pread = pread
+"""
+
+
+def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_uninterrupted_verify_does(
+    many, dest, tmp_path, monkeypatch
+):
+    site, gate = tmp_path / 'site', tmp_path / 'gate'
+    site.mkdir()
+    gate.mkdir()
+    (site / 'sitecustomize.py').write_text(_SLOW_READS)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
+    monkeypatch.setenv('READ_GATE', str(gate))
+    child = start_command('verify', str(dest))
+    try:
+        wait_until(lambda: len(list(gate.iterdir())) >= 10, child, 'read 10 files')
+        child.send_signal(signal.SIGINT)
+        stdout, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+    monkeypatch.delenv('PYTHONPATH')
+
+    assert child.returncode == 130, stderr
+    assert stdout == f'Verifying 40 files ({MANY_SIZE}) in {dest}\n'
+    assert stderr == 'Interrupted; rerun verify to continue where it stopped.\n'
+    started, through = _verify_pass()
+    assert EARLY <= through < LATE
+    assert [path for path, *_ in _findings()] == [EARLY]
+
+    resumed = _verify(str(dest))
+
+    left = _after(through)
+    assert resumed.stdout.startswith(f'{_started(started)} {len(left)} files ({format_size(1024 * len(left))}) left\n')
+    assert _verify_pass() is None
+
+    uninterrupted = _verify(str(dest))
+
+    assert uninterrupted.stdout.startswith(f'Verifying 40 files ({MANY_SIZE}) in {dest}\n')
+    assert (
+        (resumed.exit_code, resumed.stderr)
+        == (uninterrupted.exit_code, uninterrupted.stderr)
+        == (
+            1,
+            'Error: 2 problems found; see the list above.\n',
+        )
+    )
+    assert resumed.stdout.splitlines()[1:] == uninterrupted.stdout.splitlines()[1:]
+    assert f'Verified {dest} (disk:/Many): 38 intact, 0 missing, 0 modified, 2 corrupt,' in resumed.stdout
+    assert [path for path, *_ in _findings()] == [EARLY, LATE]
+
+
+def test_the_cursor_is_committed_every_cursor_seconds_and_never_past_the_file_in_flight(many, dest, monkeypatch):
+    monkeypatch.setattr(verifying, 'CURSOR_SECONDS', 0)
+    read = localfs.read
+    cursors: dict[int, str | None] = {}
+
+    def watching(fd, size, offset):
+        cursors.setdefault(os.fstat(fd).st_ino, _verify_pass()[1])
+        return read(fd, size, offset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(localfs, 'read', watching)
+        result = _verify(str(dest))
+
+    assert result.exit_code == 1
+    inodes = [_many_file(dest, path).stat().st_ino for path in MANY]
+    assert [cursors[inode] for inode in inodes] == [None, *MANY[:-1]]
+    assert _verify_pass() is None
+
+
+def test_restart_starts_a_new_pass_and_a_completed_pass_is_not_continued(many, dest, monkeypatch):
+    with monkeypatch.context() as patch:
+        _interrupt_reads(patch, at=6)
+        assert _verify(str(dest)).exit_code == 130
+    assert _verify_pass()[1] == MANY[4]
+
+    with monkeypatch.context() as patch:
+        reads = _count_reads(patch)
+        restarted = _verify('--restart', str(dest))
+
+    assert restarted.exit_code == 1
+    assert restarted.stdout.startswith(f'Verifying 40 files ({MANY_SIZE}) in {dest}\n')
+    assert len(reads) == 40
+    assert _verify_pass() is None
+
+    with monkeypatch.context() as patch:
+        reads = _count_reads(patch)
+        again = _verify(str(dest))
+
+    assert again.stdout.startswith(f'Verifying 40 files ({MANY_SIZE}) in {dest}\n')
+    assert len(reads) == 40
+    assert again.stdout.splitlines()[1:] == restarted.stdout.splitlines()[1:]
+
+
+def test_a_download_between_two_parts_of_a_pass_counts_what_it_repaired_and_the_rest_is_still_hashed(
+    many, dest, monkeypatch
+):
+    with monkeypatch.context() as patch:
+        _interrupt_reads(patch, at=6)
+        assert _verify(str(dest)).exit_code == 130
+    started, through = _verify_pass()
+    assert [path for path, *_ in _findings()] == [EARLY]
+
+    repair = run_download('--retry-failed', 'disk:/Many', str(dest))
+
+    assert repair.exit_code == 0, repair.output
+    assert '1 downloaded (1.0 KiB), 0 skipped, 0 quarantined, 0 failed\n' in repair.stdout
+    with monkeypatch.context() as patch:
+        reads = _count_reads(patch)
+        resumed = _verify(str(dest))
+
+    assert resumed.exit_code == 1
+    assert resumed.stdout.startswith(f'{_started(started)} 35 files (35.0 KiB) left\n')
+    assert reads == [_many_file(dest, path).stat().st_ino for path in _after(through)]
+    assert f'Verified {dest} (disk:/Many): 39 intact, 0 missing, 0 modified, 1 corrupt,' in resumed.stdout
+    assert [path for path, *_ in _findings()] == [LATE]
