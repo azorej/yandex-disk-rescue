@@ -143,6 +143,103 @@ async def test_resource_reports_a_malformed_body_with_the_path(fake_disk_api):
     )
 
 
+async def test_download_link_returns_the_href_of_a_file(fake_disk_api):
+    fake_disk_api.token = TOKEN
+    fake_disk_api.add_file('disk:/Photos/a.jpg', b'abc')
+
+    async with _client(fake_disk_api) as client:
+        first = await client.download_link('/Photos/a.jpg')
+        second = await client.download_link('disk:/Photos/a.jpg')
+
+    assert first == f'{fake_disk_api.base_url}/download?path=disk%3A%2FPhotos%2Fa.jpg&link=1'
+    assert second.endswith('&link=2')
+    link_requests = [r for r in fake_disk_api.requests if r.path == '/v1/disk/resources/download']
+    assert [r.params for r in link_requests] == [{'path': 'disk:/Photos/a.jpg', 'fields': 'href,method,templated'}] * 2
+
+
+@pytest.mark.parametrize(
+    ('status', 'error', 'message'),
+    [
+        (404, api.RemotePathNotFoundError, "Remote path 'disk:/a.bin' does not exist."),
+        (
+            403,
+            api.DownloadRefusedError,
+            'Could not download disk:/a.bin: Yandex Disk API returned HTTP 403: Injected HTTP 403',
+        ),
+        (
+            409,
+            api.DownloadRefusedError,
+            'Could not download disk:/a.bin: Yandex Disk API returned HTTP 409: Injected HTTP 409',
+        ),
+        (401, api.TokenRejectedError, 'Yandex rejected the token'),
+    ],
+)
+async def test_download_link_maps_client_errors_without_retrying(fake_disk_api, status, error, message):
+    fake_disk_api.add_file('disk:/a.bin', b'abc')
+    fake_disk_api.inject('GET', '/v1/disk/resources/download', status)
+
+    async with _client(fake_disk_api) as client:
+        with pytest.raises(error) as excinfo:
+            await client.download_link('disk:/a.bin')
+
+    assert str(excinfo.value).startswith(message)
+    assert excinfo.value.exit_code == 1
+    assert len(fake_disk_api.requests) == 1
+
+
+async def test_download_link_of_a_missing_path_or_a_folder_is_refused(fake_disk_api):
+    fake_disk_api.add_dir('disk:/Photos')
+
+    async with _client(fake_disk_api) as client:
+        with pytest.raises(api.RemotePathNotFoundError, match=r"^Remote path 'disk:/gone\.bin' does not exist\.$"):
+            await client.download_link('disk:/gone.bin')
+        with pytest.raises(api.DownloadRefusedError) as excinfo:
+            await client.download_link('disk:/Photos')
+
+    assert str(excinfo.value) == (
+        'Could not download disk:/Photos: Yandex Disk API returned HTTP 400: Resource is a folder.'
+    )
+
+
+async def test_download_link_retries_throttling(fake_disk_api):
+    fake_disk_api.add_file('disk:/a.bin', b'abc')
+    fake_disk_api.inject('GET', '/v1/disk/resources/download', 503, 429)
+
+    async with _client(fake_disk_api) as client:
+        assert (await client.download_link('disk:/a.bin')).endswith('&link=1')
+    assert len(fake_disk_api.requests) == 3
+
+
+_SIGNED = 'https://downloader.example/disk/s3cr3t-signature?tknv=s3cr3t-query'
+
+
+@pytest.mark.parametrize(
+    ('body', 'reason'),
+    [
+        ({'href': _SIGNED, 'method': 'GET', 'templated': True}, 'templated is missing or not false'),
+        ({'href': _SIGNED, 'method': 'GET'}, 'templated is missing or not false'),
+        ({'href': _SIGNED, 'method': 'POST', 'templated': False}, "method is missing or not 'GET'"),
+        ({'method': 'GET', 'templated': False}, 'href is missing or not a non-empty string'),
+        (
+            {'href': 'ftp://downloader.example/s3cr3t-signature', 'method': 'GET', 'templated': False},
+            'href is not an http(s) URL',
+        ),
+    ],
+)
+async def test_download_link_rejects_an_unexpected_body_without_quoting_the_href(fake_disk_api, body, reason):
+    fake_disk_api.route_json('GET', '/v1/disk/resources/download', 200, body)
+
+    async with _client(fake_disk_api) as client:
+        with pytest.raises(api.DiskApiError) as excinfo:
+            await client.download_link('disk:/a.bin')
+
+    assert str(excinfo.value) == (
+        'Could not download disk:/a.bin: Yandex Disk API returned an unexpected response to '
+        f'GET /v1/disk/resources/download: {reason}.'
+    )
+    assert 's3cr3t' not in str(excinfo.value)
+
+
 async def test_list_folder_reports_a_status_error_with_the_path(fake_disk_api):
     fake_disk_api.add_dir('disk:/A')
     fake_disk_api.add_dir('disk:/B')

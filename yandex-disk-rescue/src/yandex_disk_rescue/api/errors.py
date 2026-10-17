@@ -11,6 +11,10 @@ class DiskApiError(RescueError):
     """Any other failed request: an error status, a transport error or an unexpected response body."""
 
 
+class DownloadRefusedError(RescueError):
+    """The API refused a download link for one file (a non-throttling 4xx other than 401 or 404)."""
+
+
 class RemotePathNotFoundError(RescueError):
     pass
 

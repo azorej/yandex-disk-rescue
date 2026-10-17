@@ -1,23 +1,29 @@
-"""A fake Yandex Disk REST API on a real socket: an in-memory tree, a routes table and a fault script.
+"""A fake Yandex Disk REST API and download host on a real socket: an in-memory tree, a routes table, faults.
 
-A request is answered by the first of: an `inject`ed fault, the `token` check, a `routes` entry, a
-built-in handler (`GET /v1/disk/`, `GET /v1/disk/resources`), then a Yandex-style 404.
+A request is answered by the first of: the download host's refusal of an `Authorization` header (`/download`
+and `/storage` only), an `inject`ed fault, the `token` check (every other path), a `routes` entry, a built-in
+handler (`GET /v1/disk/`, `GET /v1/disk/resources`, `GET /v1/disk/resources/download`, `GET /download`,
+`GET /storage`), then a Yandex-style 404. Bodies are sent in 64 KiB chunks, `chunk_delay` seconds apart.
 """
 
 import enum
 import hashlib
 import json
+import re
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Literal
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 DEFAULT_MODIFIED = datetime(2024, 5, 17, 12, 30, 45, tzinfo=timezone(timedelta(hours=3)))
 _DEFAULT_LIMIT = 20
+_CHUNK = 64 * 1024
+_CONTENT_PATHS = ('/download', '/storage')
+_RANGE = re.compile(r'bytes=(\d+)-(\d*)')
 
 
 class _Checksum(enum.Enum):
@@ -29,6 +35,7 @@ class FakeResponse:
     status: int
     body: bytes = b''
     headers: dict[str, str] = field(default_factory=dict)
+    truncate_after: int | None = None
 
     @classmethod
     def json(cls, status: int, payload: object, headers: dict[str, str] | None = None) -> FakeResponse:
@@ -48,6 +55,13 @@ class Delay:
 
     seconds: float
     then: FakeResponse | None = None
+
+
+@dataclass(frozen=True)
+class Truncate:
+    """A fault that sends the normal answer's headers (the full `Content-Length`), then closes after `after_bytes`."""
+
+    after_bytes: int
 
 
 @dataclass(frozen=True)
@@ -75,7 +89,7 @@ class FakeNode:
 @dataclass
 class _Fault:
     where: dict[str, str]
-    responses: deque[FakeResponse | Delay]
+    responses: deque[FakeResponse | Delay | Truncate]
 
 
 def _default_account() -> dict[str, object]:
@@ -101,6 +115,12 @@ class FakeDiskApi:
 
     Recorded header names are lower-cased. `routes` maps `(method, path)` (path without the query string)
     to the response served for it and overrides the built-in handlers. `token=None` accepts any token.
+
+    A download link is `<base_url>/download?path=<disk:/ path>&link=<n>`, numbered from 1 in issue order.
+    The download host serves the file's current content, honouring one `bytes=a-b` or `bytes=a-` range.
+    Its faults: `corrupt`, `expire_links`, `ignore_range` (200 with the full body for any range),
+    `redirect_downloads` (`/download` answers 302 to `/storage` with the same query, which serves the bytes,
+    as the real host redirects to a storage host), `chunk_delay`, and the `Truncate` fault for `inject`.
     """
 
     base_url: str
@@ -110,9 +130,15 @@ class FakeDiskApi:
     page_cap: int | None = None
     token: str | None = None
     peak_in_flight: int = 0
+    ignore_range: bool = False
+    redirect_downloads: bool = False
+    chunk_delay: float = 0.0
     tree: dict[str, FakeNode] = field(default_factory=lambda: {'/': FakeNode('dir', DEFAULT_MODIFIED)})
     _faults: dict[tuple[str, str], list[_Fault]] = field(default_factory=dict)
     _in_flight: int = 0
+    _links_issued: int = 0
+    _expired_links: dict[int, int] = field(default_factory=dict)
+    _corruptions: dict[str, set[int]] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def route(
@@ -162,8 +188,22 @@ class FakeDiskApi:
         for other in [k for k in self.tree if k == key or k.startswith(key + '/')]:
             del self.tree[other]
 
+    def corrupt(self, path: str, offset: int) -> None:
+        """Flip every bit of the served byte at `offset` of a file; its metadata keeps the true checksums."""
+        self._corruptions.setdefault(_tree_key(path), set()).add(offset)
+
+    def expire_links(self, status: int = 410) -> None:
+        """Make every download link issued so far answer `status`; links issued later work."""
+        with self._lock:
+            for link in range(1, self._links_issued + 1):
+                self._expired_links.setdefault(link, status)
+
     def inject(
-        self, method: str, route: str, *responses: FakeResponse | Delay | int, where: dict[str, str] | None = None
+        self,
+        method: str,
+        route: str,
+        *responses: FakeResponse | Delay | Truncate | int,
+        where: dict[str, str] | None = None,
     ) -> None:
         """Answer the next matching requests with `responses` in order, then serve the route normally again.
 
@@ -172,7 +212,7 @@ class FakeDiskApi:
         queue = deque(FakeResponse.error(r) if isinstance(r, int) else r for r in responses)
         self._faults.setdefault((method, route), []).append(_Fault(where or {}, queue))
 
-    def _next_fault(self, method: str, path: str, params: dict[str, str]) -> FakeResponse | Delay | None:
+    def _next_fault(self, method: str, path: str, params: dict[str, str]) -> FakeResponse | Delay | Truncate | None:
         with self._lock:
             for fault in self._faults.get((method, path), []):
                 if fault.responses and all(params.get(k) == v for k, v in fault.where.items()):
@@ -190,25 +230,85 @@ class FakeDiskApi:
             self._in_flight -= 1
 
     def respond(self, request: RecordedRequest) -> FakeResponse:
-        params = request.params
-        fault = self._next_fault(request.method, request.path, params)
+        if request.path in _CONTENT_PATHS and 'authorization' in request.headers:
+            return FakeResponse.json(
+                400, {'error': 'AuthorizationNotExpected', 'description': 'The download host takes no token.'}
+            )
+        fault = self._next_fault(request.method, request.path, request.params)
         if isinstance(fault, FakeResponse):
             return fault
         if isinstance(fault, Delay):
             time.sleep(fault.seconds)
             if fault.then is not None:
                 return fault.then
-        if self.token is not None and request.headers.get('authorization') != f'OAuth {self.token}':
+        normal = self._normal(request)
+        if isinstance(fault, Truncate):
+            return replace(normal, truncate_after=fault.after_bytes)
+        return normal
+
+    def _normal(self, request: RecordedRequest) -> FakeResponse:
+        params = request.params
+        if (
+            request.path not in _CONTENT_PATHS
+            and self.token is not None
+            and request.headers.get('authorization') != f'OAuth {self.token}'
+        ):
             return FakeResponse.json(401, {'error': 'UnauthorizedError', 'description': 'Unauthorized'})
         if routed := self.routes.get((request.method, request.path)):
             return routed
-        if (request.method, request.path) == ('GET', '/v1/disk/'):
-            return FakeResponse.json(200, self.account)
-        if (request.method, request.path) == ('GET', '/v1/disk/resources'):
-            return self._resources(params)
+        match (request.method, request.path):
+            case ('GET', '/v1/disk/'):
+                return FakeResponse.json(200, self.account)
+            case ('GET', '/v1/disk/resources'):
+                return self._resources(params)
+            case ('GET', '/v1/disk/resources/download'):
+                return self._download_link(params)
+            case ('GET', '/download') if self.redirect_downloads:
+                return FakeResponse(302, headers={'Location': f'{self.base_url}/storage?{request.query}'})
+            case ('GET', '/download' | '/storage'):
+                return self._content(params, request.headers.get('range'))
         return FakeResponse.json(
             404, {'error': 'NotFound', 'description': f'No fake route for {request.method} {request.path}'}
         )
+
+    def _download_link(self, params: dict[str, str]) -> FakeResponse:
+        key = _tree_key(params.get('path', ''))
+        node = self.tree.get(key)
+        if node is None:
+            return FakeResponse.json(404, {'error': 'DiskNotFoundError', 'description': 'Resource not found.'})
+        if node.kind == 'dir':
+            return FakeResponse.json(400, {'error': 'FieldValidationError', 'description': 'Resource is a folder.'})
+        with self._lock:
+            self._links_issued += 1
+            link = self._links_issued
+        query = urlencode({'path': 'disk:' + key, 'link': link})
+        return FakeResponse.json(
+            200, {'href': f'{self.base_url}/download?{query}', 'method': 'GET', 'templated': False}
+        )
+
+    def _content(self, params: dict[str, str], range_header: str | None) -> FakeResponse:
+        with self._lock:
+            expired = self._expired_links.get(int(params.get('link', '0')))
+        if expired is not None:
+            return FakeResponse.json(expired, {'error': 'LinkExpired', 'description': 'The link has expired.'})
+        key = _tree_key(params.get('path', ''))
+        node = self.tree.get(key)
+        if node is None or node.kind != 'file':
+            return FakeResponse.json(404, {'error': 'NotFound', 'description': 'No such file.'})
+        content = bytearray(node.content)
+        for offset in self._corruptions.get(key, set()):
+            if offset < len(content):
+                content[offset] ^= 0xFF
+        headers = {'Content-Type': 'application/octet-stream', 'Accept-Ranges': 'bytes'}
+        if range_header is None or self.ignore_range:
+            return FakeResponse(200, bytes(content), headers)
+        match = _RANGE.fullmatch(range_header)
+        first = int(match[1]) if match else len(content)
+        last = min(int(match[2]), len(content) - 1) if match and match[2] else len(content) - 1
+        if first > last:
+            return FakeResponse(416, headers={'Content-Range': f'bytes */{len(content)}'})
+        headers['Content-Range'] = f'bytes {first}-{last}/{len(content)}'
+        return FakeResponse(206, bytes(content[first : last + 1]), headers)
 
     def _resources(self, params: dict[str, str]) -> FakeResponse:
         if 'path' not in params:
@@ -268,9 +368,21 @@ def _handler_for(api: FakeDiskApi) -> type[BaseHTTPRequestHandler]:
                     self.send_header(name, value)
                 self.send_header('Content-Length', str(len(response.body)))
                 self.end_headers()
-                self.wfile.write(response.body)
+                self._send_body(response)
             finally:
                 api._leave()
+
+        def _send_body(self, response: FakeResponse) -> None:
+            body = response.body[: response.truncate_after]
+            try:
+                for start in range(0, len(body), _CHUNK):
+                    if start:
+                        time.sleep(api.chunk_delay)
+                    self.wfile.write(body[start : start + _CHUNK])
+            except BrokenPipeError, ConnectionResetError:
+                self.close_connection = True
+            if response.truncate_after is not None:
+                self.close_connection = True
 
         do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = _serve
 

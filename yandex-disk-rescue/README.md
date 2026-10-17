@@ -80,23 +80,38 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names and download records per destination)
+│   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
-│   └── api/          # DiskClient — every Disk API request: the account check, one resource, paged folder listing,
-│                     #   error mapping (401/403, other statuses, transport errors, malformed bodies), `disk:/` paths;
-│                     #   the shared AdaptiveLimiter (pacing, concurrency cap, Retry-After) and bounded retries
+│   └── api/
+│       ├── client.py # DiskClient — every Disk API request: the account check, one resource, paged folder listing,
+│       │             #   download links; error mapping (401/403, other statuses, transport errors, malformed
+│       │             #   bodies) and bounded retries
+│       ├── limiter.py # The AdaptiveLimiter every DiskClient request shares: pacing, concurrency cap, Retry-After
+│       ├── models.py # Parsing of account, resource, folder-page and download-link bodies
+│       ├── remote_paths.py # `disk:/` path normalization
+│       ├── errors.py # The RescueError subclasses of failed API requests
+│       └── transfer.py # ContentClient — fetches byte ranges from the download host into a write callback, with
+│                       #   no token, following redirects; its errors (expired link, transient, range not
+│                       #   honoured, refused, too many bytes) never quote the link
 └── tests/
     ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of the migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures
-    ├── fake_disk_server.py # Real-socket fake Disk API: an in-memory tree (`add_dir`, `add_file`, `remove`) served by
-    │                       #   built-in `GET /v1/disk/` and `GET /v1/disk/resources`; `page_cap`, `account`, `token`;
-    │                       #   `inject`ed faults (statuses, delays); a `routes` override table; the request log
+    ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
+    │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
+    │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
+    │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
+    │                       #   (`corrupt`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
+    │                       #   `inject`ed faults (statuses, delays, `Truncate`); a `routes` override table; the
+    │                       #   request log
     ├── test_api_client.py
     ├── test_auth.py
     ├── test_cli.py
     ├── test_config.py
+    ├── test_local_names.py
     ├── test_manifest.py
     ├── test_rate_limiter.py
-    └── test_scan.py
+    ├── test_scan.py
+    └── test_transfer.py
 ```

@@ -404,14 +404,17 @@ Three cases abort the run (exit 1):
     ```python
     class ContentClient:  # async context manager; own httpx.AsyncClient
         def __init__(self, *, timeout: float): ...
-        async def fetch(self, href: str, *, start: int, end: int, write: Callable[[int, bytes], None]) -> None: ...
+        async def fetch(
+            self, href: str, *, start: int, end: int, size: int, write: Callable[[int, bytes], None]
+        ) -> None: ...
     ```
     - **No token.** It never sends `Authorization`; the href is a signed link to another host.
     - **Redirects** are followed.
     - **Range.** `fetch` asks for bytes `[start, end)`. With `start > 0` it sends
       `Range: bytes=<start>-<end-1>` and requires `206` with `Content-Range: bytes <start>-<end-1>/<total>`.
-      With `start == 0` and `end ==` the full size it sends no Range, and `200` or a matching `206`
-      are both fine.
+      With `start == 0` and `end == size` it sends no Range, and `200` or a matching `206`
+      are both fine. `size` is the whole file's size, so a segment `[0, k)` is still ranged and the
+      `Content-Range` total must equal it. All errors subclass `TransferError` (`.reason`).
     - **Write callback.** `write(offset, chunk)` is called with absolute file offsets, in order.
       That lets #4 run several fetches into one file.
     - **Errors**, all internal to the transfer layer and not `RescueError`. Each carries a
