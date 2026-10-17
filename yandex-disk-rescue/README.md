@@ -90,11 +90,13 @@ yandex-disk-rescue/
 │   │                 #   the way, hard-link aliases), the per-file pipeline (adopt a matching local copy, or
 │   │                 #   resume a partial file once the cloud file is confirmed unchanged, link, fetch while
 │   │                 #   hashing with immediate retries after new data and one link refresh, verify, move aside
-│   │                 #   what is in the way, place, record), later passes over transiently failed files, the
-│   │                 #   summary lines
+│   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or file
+│   │                 #   name the destination refuses, later passes over transiently failed files, the summary
+│   │                 #   lines
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
-│   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
-│   │                 #   aside into the run's `replaced/` folder and placement, never through a link
+│   │                 #   RENAME_NOREPLACE probe, PATH_MAX, partial files, reading existing files, folder
+│   │                 #   creation, moving aside into the run's `replaced/` folder and placement, never through
+│   │                 #   a link
 │   ├── localfs.py    # Name-creating syscalls relative to folder descriptors: open without following links, mkdir,
 │   │                 #   renameat2(RENAME_NOREPLACE) through ctypes
 │   ├── units.py      # format_size — binary-unit byte counts for command output

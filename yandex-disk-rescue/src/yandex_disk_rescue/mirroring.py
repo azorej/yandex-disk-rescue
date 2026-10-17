@@ -11,6 +11,9 @@ looked at.
 A partial file left by an interrupted run or an earlier pass is resumed with an HTTP range once the cloud file is
 confirmed unchanged. A transfer that fails after receiving new data is resumed at once, within a retry budget; one
 that fails transiently otherwise waits for the next pass over the files still to download.
+
+A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
+conversion, which is then recorded as its local name.
 """
 
 import asyncio
@@ -18,7 +21,7 @@ import errno
 import hashlib
 import os
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
@@ -26,7 +29,7 @@ from pathlib import Path, PurePosixPath
 
 from yandex_disk_rescue import api
 from yandex_disk_rescue.destination import FATAL_ERRNOS, Destination, DestinationError, PartialFile
-from yandex_disk_rescue.local_names import map_local_names
+from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
     DownloadRecord,
     LocalFingerprint,
@@ -89,12 +92,43 @@ class MirrorReport:
 
 @dataclass(frozen=True)
 class FileOutcome:
-    """How a file came to be verified at its final path: `adopted` when the copy already there matched the cloud,
-    `moved_aside` when something else stood there and was moved to the replaced folder."""
+    """How a file came to be verified at its final path `local`: `adopted` when the copy already there matched the
+    cloud, `moved_aside` when something else stood there and was moved to the replaced folder."""
 
+    local: PurePosixPath
     verified_by: VerifiedBy
     adopted: bool
     moved_aside: bool
+
+
+class LocalNames:
+    """The local path of each entry of a mirror, kept current as names the destination refuses are converted."""
+
+    def __init__(self, mirror: Mirror, entries: Iterable[MirrorEntry]) -> None:
+        self._mirror = mirror
+        self._paths = {entry.entry_id: _local_path(entry) for entry in entries}
+
+    def __getitem__(self, entry_id: int) -> PurePosixPath:
+        return self._paths[entry_id]
+
+    def conversion(self, entry_id: int) -> PurePosixPath:
+        """The entry's local path with its last component converted by `rejected_name_conversion`, unique among its
+        siblings."""
+        local = self._paths[entry_id]
+        taken = {
+            collision_key(p.name) for other, p in self._paths.items() if other != entry_id and p.parent == local.parent
+        }
+        if local.parent == PurePosixPath():
+            taken.add(collision_key(WORK_DIR_NAME))
+        return local.with_name(rejected_name_conversion(local.name, taken))
+
+    def rename(self, entry_id: int, local: PurePosixPath) -> None:
+        """Record `local`, a sibling of the entry's local path, as its local path, moving everything below along."""
+        old = self._paths[entry_id]
+        self._mirror.rename_local(entry_id, local.name)
+        for other, path in self._paths.items():
+            if path == old or old in path.parents:
+                self._paths[other] = local / path.relative_to(old)
 
 
 class Digest:
@@ -143,6 +177,7 @@ class MirrorRun:
         self._mirror = mirror
         self._destination = destination
         self._entries = _assign_local_names(mirror)
+        self._names = LocalNames(mirror, self._entries)
         with _fatal_errors(destination.path):
             destination.keep_partials(
                 [e.entry_id for e in self._entries if e.download is not None and e.download.state == 'partial']
@@ -161,8 +196,9 @@ class MirrorRun:
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         blocked: dict[PurePosixPath, str] = {}
         deferred: list[tuple[MirrorEntry, FileDeferred]] = []
-        for entry in self._entries:
-            local = _local_path(entry)
+        for listed_entry in self._entries:
+            local = self._names[listed_entry.entry_id]
+            entry = replace(listed_entry, local_path=local)
             if local.name != entry.resource.path.rpartition('/')[2]:
                 report.renamed.append((entry.resource.path, local))
             if reason := _blocked_by(local, blocked):
@@ -179,6 +215,7 @@ class MirrorRun:
         report.replaced_folder = self._destination.replaced_folder
         report.failed += [Failure(display_path(e.path), _unencodable_reason(e)) for e in self._mirror.unencodable()]
         report.failed.sort(key=lambda failure: failure.path)
+        report.renamed.sort()
         return report
 
     def _make_folder(
@@ -186,7 +223,10 @@ class MirrorRun:
     ) -> None:
         try:
             with _local_errors(self._destination, local):
-                if self._destination.make_folder(local):
+                made, local = _create(entry, local, self._destination.make_folder, self._names, self._destination)
+                if local != entry.local_path:
+                    report.renamed.append((entry.resource.path, local))
+                if made:
                     return
                 self._destination.move_aside(local)
                 report.moved_aside.append(local)
@@ -240,6 +280,7 @@ class MirrorRun:
                 content=content,
                 mirror=self._mirror,
                 destination=self._destination,
+                names=self._names,
                 retries=retries,
             )
         except FileDeferred as deferred:
@@ -253,8 +294,10 @@ class MirrorRun:
         else:
             report.downloaded += 1
             report.downloaded_size += entry.resource.size or 0
+        if outcome.local != entry.local_path:
+            report.renamed.append((entry.resource.path, outcome.local))
         if outcome.moved_aside:
-            report.moved_aside.append(_local_path(entry))
+            report.moved_aside.append(outcome.local)
         _note_verified(report, entry, outcome.verified_by)
 
 
@@ -265,14 +308,16 @@ async def download_file(
     content: api.ContentClient,
     mirror: Mirror,
     destination: Destination,
+    names: LocalNames,
     retries: int,
 ) -> FileOutcome:
     """Make the file `entry` verified at its local path and record it; the only state it touches is the mirror's
-    records and the destination.
+    records, the destination and `names`.
 
     A file already at the local path is adopted when its content matches the cloud. Otherwise the file is
     downloaded and verified first, and only then is whatever stands at the local path moved aside and the new file
-    placed. A path that is the same file as another entry's verified copy is never adopted, moved or replaced.
+    placed. A path that is the same file as another entry's verified copy is never adopted, moved or replaced. A name
+    the destination refuses is converted, and the file placed under the converted name.
 
     A partial file whose `partial` record is for the entry's identity is resumed after `client.resource` confirms
     the cloud file still has it; any other partial file is discarded. A transfer that fails after new data is
@@ -290,18 +335,59 @@ async def download_file(
             if reason := _alias(entry, local, existing, mirror, destination):
                 raise FileFailed(reason)
             if (verified_by := _adopt(entry, local, identity, existing, mirror, destination)) is not None:
-                return FileOutcome(verified_by, adopted=True, moved_aside=False)
+                return FileOutcome(local, verified_by, adopted=True, moved_aside=False)
         verified_by = await _fetch_verified(
             entry, identity, client=client, content=content, mirror=mirror, destination=destination, retries=retries
         )
-        moved_aside = _clear_the_way(entry, local, mirror, destination)
-        try:
-            placed = destination.place(entry.entry_id, local)
-        except FileExistsError:
-            _discard(entry, mirror, destination)
-            raise FileFailed(f'something else was created at {local} while the file was being placed') from None
+
+        def place(path: PurePosixPath) -> tuple[os.stat_result, bool]:
+            moved_aside = _clear_the_way(entry, path, mirror, destination)
+            try:
+                return destination.place(entry.entry_id, path), moved_aside
+            except FileExistsError:
+                _discard(entry, mirror, destination)
+                raise FileFailed(f'something else was created at {path} while the file was being placed') from None
+
+        (placed, moved_aside), local = _create(entry, local, place, names, destination)
         mirror.record_verified(entry.entry_id, identity, verified_by, placed)
-    return FileOutcome(verified_by, adopted=False, moved_aside=moved_aside)
+    return FileOutcome(local, verified_by, adopted=False, moved_aside=moved_aside)
+
+
+def _create[T](
+    entry: MirrorEntry,
+    local: PurePosixPath,
+    create: Callable[[PurePosixPath], T],
+    names: LocalNames,
+    destination: Destination,
+) -> tuple[T, PurePosixPath]:
+    """Run `create(local)`, the call creating the entry's last component; when the destination refuses that name,
+    run it once more with the converted name, record that name and return it with the result.
+
+    Raises `FileFailed` when the converted name is refused too, or when the refusal is a whole path longer than
+    PATH_MAX, which no conversion of one name fixes.
+    """
+    try:
+        return create(local), local
+    except OSError as exc:
+        if exc.errno not in _NAME_ERRNOS:
+            raise
+        if exc.errno == errno.ENAMETOOLONG and destination.exceeds_path_max(local):
+            raise FileFailed(
+                f'the local path is longer than the destination filesystem allows ({exc.strerror})'
+            ) from None
+        refused = exc.strerror
+    converted = names.conversion(entry.entry_id)
+    try:
+        result = create(converted)
+    except OSError as exc:
+        if exc.errno not in _NAME_ERRNOS:
+            raise
+        raise FileFailed(
+            f'the destination filesystem refuses the name {local.name} ({refused}), and its converted form '
+            f'{converted.name} too'
+        ) from None
+    names.rename(entry.entry_id, converted)
+    return result, converted
 
 
 def _adopt(
@@ -556,8 +642,6 @@ def _local_errors(destination: Destination, local: PurePosixPath) -> Iterator[No
     except OSError as exc:
         if exc.errno in FATAL_ERRNOS:
             raise DestinationError.of(destination.path / local, exc) from None
-        if exc.errno in _NAME_ERRNOS:
-            raise FileFailed(f'the destination filesystem refuses the name {local.name} ({exc.strerror})') from None
         raise FileFailed(f'could not write {local}: {exc.strerror}') from None
 
 

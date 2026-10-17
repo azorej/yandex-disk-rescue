@@ -326,7 +326,7 @@ files are kept, and the next run resumes them.
 ### Local file names
 
 Names are kept exactly as the Disk has them, with no Unicode normalization
-and no character substitution, with two exceptions:
+and no character substitution, with three exceptions:
 
 - **Long names.** A name longer than 255 UTF-8 bytes, or than 255 UTF-16
   units in its decomposed (NFD) form (the HFS+ limit), is shortened: the
@@ -340,8 +340,23 @@ and no character substitution, with two exceptions:
   so on ext4 too `a.txt` next to `A.txt` becomes `a~<hex>.txt`, and a mirror
   can later be copied to a case-insensitive disk without loss. The name
   `.yandex-disk-rescue` at the top of DEST is reserved.
+- **Names the destination refuses.** When the filesystem refuses to create a
+  name (`EINVAL`, `EILSEQ` or `ENAMETOOLONG`; exFAT and NTFS refuse `?`, for
+  example), the name is converted and created again: each of
+  `\ : * ? " < > |` and each control character becomes `_`, so does every
+  character of a trailing run of dots and spaces, the long-name rule applies,
+  and `~<8 hex digits>` derived from the Disk name is always added (more
+  digits when a sibling already has that name). So `a?b.txt` becomes
+  `a_b~<hex>.txt`, and a folder `Q?` becomes `Q_~<hex>` with everything in it
+  below. When the converted name is refused too, the file fails with
+  `the destination filesystem refuses the name <name> (<reason>), and its
+  converted form <converted> too`; for a folder, it and everything below it
+  fail. A path longer than the filesystem's `PATH_MAX` is not converted; the
+  file fails with `the local path is longer than the destination filesystem
+  allows (<reason>)`.
 
-Once given, a local name is kept on later runs. The summary lists every
+Once given, a local name is kept on later runs, so a converted name is
+created directly and never refused again. The summary lists every
 entry whose local name differs from its Disk name.
 
 ## Exit codes

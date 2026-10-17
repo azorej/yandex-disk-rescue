@@ -70,13 +70,22 @@ class Destination:
     `path` is the resolved destination. Local paths are relative to it, '/'-separated. Partial files live in
     `.yandex-disk-rescue/partial/`, named by entry id. Things moved aside go to
     `.yandex-disk-rescue/replaced/<run start, UTC>/`, created on the first move; `replaced_folder` is that folder
-    relative to the destination once it exists.
+    relative to the destination once it exists. `path_max` is the filesystem's PATH_MAX.
     """
 
     def __init__(
-        self, path: Path, root_fd: int, work_fd: int, lock_fd: int, partial_fd: int, started: datetime
+        self,
+        path: Path,
+        root_fd: int,
+        work_fd: int,
+        lock_fd: int,
+        partial_fd: int,
+        *,
+        started: datetime,
+        path_max: int,
     ) -> None:
         self.path = path
+        self.path_max = path_max
         self.replaced_folder: PurePosixPath | None = None
         self._root_fd = root_fd
         self._work_fd = work_fd
@@ -102,13 +111,14 @@ class Destination:
             fds.append(_lock(fds[1], resolved))
             fds.append(_work_dir(PARTIAL_DIR_NAME, fds[1], resolved / WORK_DIR_NAME / PARTIAL_DIR_NAME))
             _probe_noreplace(fds[1], resolved)
+            path_max = os.pathconf(fds[0], 'PC_PATH_MAX')
         except OSError as exc:
             _close_all(fds)
             raise DestinationError.of(path, exc) from None
         except BaseException:
             _close_all(fds)
             raise
-        return cls(resolved, *fds, started=started)
+        return cls(resolved, *fds, started=started, path_max=path_max)
 
     def close(self) -> None:
         replaced = [] if self._replaced_fd is None else [self._replaced_fd]
@@ -121,6 +131,10 @@ class Destination:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
     ) -> None:
         self.close()
+
+    def exceeds_path_max(self, local: PurePosixPath) -> bool:
+        """Whether the absolute path of `local`, with its terminating null byte, is longer than `path_max`."""
+        return len(os.fsencode(self.path / local)) >= self.path_max
 
     def lstat(self, local: PurePosixPath) -> os.stat_result | None:
         """The `lstat` of `local`, or `None` when it, or a folder on the way to it, is missing or not a real folder."""

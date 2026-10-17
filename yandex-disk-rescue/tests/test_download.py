@@ -11,6 +11,7 @@ import signal
 import sqlite3
 import subprocess
 import time
+from collections.abc import Callable
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
@@ -278,6 +279,110 @@ def test_names_are_mapped_for_the_destination_and_kept_on_a_rerun(disk, dest):
     assert f'  disk:/Names/a.txt -> {lower}\n' in rerun.stdout
     assert _transfers(disk, earlier) == []
     assert sorted(p.name for p in dest.iterdir()) == sorted(['.yandex-disk-rescue', 'A.txt', lower, shortened])
+
+
+def _hex(name: str, digits: int = 8) -> str:
+    return hashlib.sha256(name.encode()).hexdigest()[:digits]
+
+
+def _refuse_names(monkeypatch, refused: Callable[[str], bool], code: int = errno.EINVAL) -> list[str]:
+    """Make the folder creation and the no-replace rename fail with `code` for every name `refused` accepts, as
+    exFAT does for a name holding `?`; return every name they were asked to create."""
+    seen: list[str] = []
+    make_dir, rename_noreplace = localfs.make_dir, localfs.rename_noreplace
+
+    def check(name: str) -> None:
+        seen.append(name)
+        if refused(name):
+            raise OSError(code, os.strerror(code), name)
+
+    def refusing_make_dir(name, *, dir_fd):
+        check(name)
+        make_dir(name, dir_fd=dir_fd)
+
+    def refusing_rename(src, dst, *, src_dir_fd, dst_dir_fd):
+        check(dst)
+        rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(localfs, 'make_dir', refusing_make_dir)
+    monkeypatch.setattr(localfs, 'rename_noreplace', refusing_rename)
+    return seen
+
+
+def test_names_the_destination_refuses_are_converted_recorded_and_kept_on_a_rerun(disk, dest, monkeypatch):
+    lookalike = f'a_b~{_hex("a?b.txt")}.txt'
+    disk.add_file('disk:/Odd/a?b.txt', b'question')
+    disk.add_file(f'disk:/Odd/{lookalike}', b'lookalike')
+    disk.add_file('disk:/Odd/Q?/x.txt', b'inside')
+    seen = _refuse_names(monkeypatch, lambda name: '?' in name)
+
+    result = _download('disk:/Odd', str(dest))
+
+    assert result.exit_code == 0, result.output
+    converted_file = f'a_b~{_hex("a?b.txt", 16)}.txt'
+    converted_folder = f'Q_~{_hex("Q?")}'
+    assert (dest / converted_file).read_bytes() == b'question'
+    assert (dest / lookalike).read_bytes() == b'lookalike'
+    assert (dest / converted_folder / 'x.txt').read_bytes() == b'inside'
+    assert sorted(p.name for p in dest.iterdir()) == sorted(
+        ['.yandex-disk-rescue', converted_file, converted_folder, lookalike]
+    )
+    renamed = (
+        f'Renamed for the destination: 2\n  disk:/Odd/Q? -> {converted_folder}\n'
+        f'  disk:/Odd/a?b.txt -> {converted_file}\n'
+    )
+    assert renamed in result.stdout
+    assert f'Mirrored disk:/Odd to {dest}: 3 downloaded' in result.stdout
+
+    seen.clear()
+    earlier = len(disk.requests)
+    rerun = _download('disk:/Odd', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _transfers(disk, earlier) == []
+    assert [name for name in seen if '?' in name] == []
+    assert renamed in rerun.stdout
+    assert f'Mirrored disk:/Odd to {dest}: 0 downloaded (0 B), 3 skipped, 0 failed\n' in rerun.stdout
+
+
+def test_a_converted_name_the_destination_refuses_too_fails_that_entry_only(disk, dest, monkeypatch):
+    disk.add_file('disk:/a?b.txt', b'question')
+    disk.add_file('disk:/Q?/x.txt', b'inside')
+    _refuse_names(monkeypatch, lambda name: '?' in name or '_' in name)
+
+    result = _download(str(dest))
+
+    assert result.exit_code == 1
+    strerror = os.strerror(errno.EINVAL)
+    folder_reason = (
+        f'the destination filesystem refuses the name Q? ({strerror}), and its converted form Q_~{_hex("Q?")} too'
+    )
+    assert (
+        f'Failed: 3\n  disk:/Q?: {folder_reason}\n  disk:/Q?/x.txt: {folder_reason}\n'
+        f'  disk:/a?b.txt: the destination filesystem refuses the name a?b.txt ({strerror}), '
+        f'and its converted form a_b~{_hex("a?b.txt")}.txt too\n'
+    ) in result.stdout
+    assert 'Renamed for the destination' not in result.stdout
+    assert _others_verified(dest, failed='')
+    assert sorted(p.name for p in dest.iterdir()) == sorted(
+        ['.yandex-disk-rescue', 'Docs', 'Empty', 'Photos', 'top.txt']
+    )
+
+
+def test_a_path_longer_than_path_max_fails_without_a_conversion(disk, dest, monkeypatch):
+    folders = '/'.join(f'{level:02}' + 'd' * 248 for level in range(17))
+    disk.add_file(f'disk:/Deep/{folders}/deep.txt', b'deep')
+    seen = _refuse_names(monkeypatch, lambda name: name == 'deep.txt', code=errno.ENAMETOOLONG)
+
+    result = _download('disk:/Deep', str(dest))
+
+    assert result.exit_code == 1
+    assert len(os.fsencode(dest / folders / 'deep.txt')) > os.pathconf(dest, 'PC_PATH_MAX')
+    assert (
+        f'  disk:/Deep/{folders}/deep.txt: the local path is longer than the destination filesystem allows '
+        f'({os.strerror(errno.ENAMETOOLONG)})\n'
+    ) in result.stdout
+    assert [name for name in seen if name.startswith('deep')] == ['deep.txt']
 
 
 def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
