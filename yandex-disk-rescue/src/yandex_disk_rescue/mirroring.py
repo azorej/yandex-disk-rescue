@@ -332,22 +332,28 @@ class _FileTurns:
 
 
 class MirrorRun:
-    """One run over a mirror: names are assigned, stray partial files deleted and the files still to download
-    counted on construction; `run` then walks the entries in path order.
+    """One run over a mirror: names are assigned, stray partial files deleted and the files this run will attempt
+    counted on construction; `run` then walks the run's entries in path order.
 
-    Each entry the manifest records as left out of its scan, because its name is not valid Unicode, is a failure of
-    the run.
+    With `retry_failed`, the run covers only the retry set: the files with a failure record or a `partial` download
+    record, and the folders with a failure record. Its walk visits them and the folders above them, and no other path
+    of the mirror is looked at. Otherwise the run covers every entry.
+
+    Every entry reported as failed gets a failure record with the reported reason when the failure happens; an entry
+    verified, adopted or made in place loses it. Each entry the manifest records as left out of its scan, because its
+    name is not valid Unicode, is a failure of the run, and has no record.
     """
 
-    def __init__(self, mirror: Mirror, destination: Destination) -> None:
+    def __init__(self, mirror: Mirror, destination: Destination, *, retry_failed: bool) -> None:
         self._mirror = mirror
         self._destination = destination
-        self._entries = _assign_local_names(mirror)
+        entries = _assign_local_names(mirror)
+        self._names = LocalNames(mirror, entries)
+        self._entries = _retry_walk(entries, self._names) if retry_failed else entries
         self._positions = {entry.entry_id: position for position, entry in enumerate(self._entries)}
-        self._names = LocalNames(mirror, self._entries)
         with _fatal_errors(destination.path):
             destination.keep_partials(
-                [e.entry_id for e in self._entries if e.download is not None and e.download.state == 'partial']
+                [e.entry_id for e in entries if e.download is not None and e.download.state == 'partial']
             )
             self._current = {e.entry_id for e in self._entries if _is_current(e, destination)}
         pending = [e for e in self._entries if e.resource.kind == 'file' and e.entry_id not in self._current]
@@ -394,12 +400,13 @@ class MirrorRun:
                 if local.name != entry.resource.path.rpartition('/')[2]:
                     report.renamed.append((entry.resource.path, local))
                 if reason := _blocked_by(local, blocked):
-                    report.failed.append(Failure(entry.resource.path, reason))
+                    self._fail(report, entry, reason)
                 elif entry.resource.kind == 'dir':
                     await self._make_folder(entry, local, blocked, tools)
                 elif entry.entry_id in self._current:
                     report.skipped += 1
                     _note_verified(report, entry, _recorded_method(entry))
+                    self._succeeded(entry)
                 else:
                     await turns.start(self._turn(entry, tools, deferred))
         return self._sorted(deferred)
@@ -407,6 +414,18 @@ class MirrorRun:
     async def _make_folder(
         self, entry: MirrorEntry, local: PurePosixPath, blocked: dict[PurePosixPath, str], tools: _RunTools
     ) -> None:
+        reason, local = await self._folder_failure(entry, local, tools)
+        if reason is None:
+            self._succeeded(entry)
+            return
+        blocked[local] = reason
+        self._fail(tools.report, entry, reason)
+
+    async def _folder_failure(
+        self, entry: MirrorEntry, local: PurePosixPath, tools: _RunTools
+    ) -> tuple[str | None, PurePosixPath]:
+        """Make the folder `entry` at `local`, or find it there; why it failed (`None` once it is in place), with the
+        local path it ended up under."""
         destination, report, threads = self._destination, tools.report, tools.threads
 
         def make_folder(path: PurePosixPath) -> Awaitable[bool]:
@@ -419,16 +438,14 @@ class MirrorRun:
                     if local != entry.local_path:
                         report.renamed.append((entry.resource.path, local))
                     if made:
-                        return
+                        return None, local
                     await threads.run(destination.move_aside, local)
                     report.moved_aside.append(local)
                     if await make_folder(local):
-                        return
-            reason = f'{local} was created again as something other than a folder while it was being moved aside'
+                        return None, local
+            return f'{local} was created again as something other than a folder while it was being moved aside', local
         except FileFailed as failed:
-            reason = failed.reason
-        blocked[local] = reason
-        report.failed.append(Failure(entry.resource.path, reason))
+            return failed.reason, local
 
     async def _later_passes(
         self, deferred: list[tuple[MirrorEntry, FileDeferred]], tools: _RunTools, *, passes: int
@@ -444,7 +461,8 @@ class MirrorRun:
                     await turns.start(self._turn(entry, tools, remaining))
             deferred = self._sorted(remaining)
         suffix = f' (after {used} passes)' if used > 1 else ''
-        tools.report.failed += [Failure(entry.resource.path, failure.reason + suffix) for entry, failure in deferred]
+        for entry, failure in deferred:
+            self._fail(tools.report, entry, failure.reason + suffix)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -453,6 +471,16 @@ class MirrorRun:
         """One file's turn in a pass; a deferred file is added to `deferred`."""
         if (later := await self._download(entry, tools)) is not None:
             deferred.append((entry, later))
+
+    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str) -> None:
+        report.failed.append(Failure(entry.resource.path, reason))
+        self._mirror.record_failure(entry.entry_id, reason)
+
+    def _succeeded(self, entry: MirrorEntry) -> None:
+        """Drop the failure a folder found in place, or a file skipped as current, had when the run started; placing
+        or adopting a file drops it with the verified record."""
+        if entry.failure is not None:
+            self._mirror.clear_failure(entry.entry_id)
 
     def _sorted(self, deferred: list[tuple[MirrorEntry, FileDeferred]]) -> list[tuple[MirrorEntry, FileDeferred]]:
         return sorted(deferred, key=lambda item: self._positions[item[0].entry_id])
@@ -484,7 +512,7 @@ class MirrorRun:
         except FileDeferred as deferred:
             return deferred
         except FileFailed as failed:
-            report.failed.append(Failure(entry.resource.path, failed.reason))
+            self._fail(report, entry, failed.reason)
             return None
         if outcome.adopted:
             report.skipped += 1
@@ -1153,6 +1181,19 @@ def _assign_local_names(mirror: Mirror) -> list[MirrorEntry]:
     if changed:
         mirror.assign_names(changed)
     return [replace(e, local_path=mapped[e.resource.path]) for e in entries]
+
+
+def _retry_walk(entries: list[MirrorEntry], names: LocalNames) -> list[MirrorEntry]:
+    """The entries a `--retry-failed` run walks, in path order: the retry set and the folders above its members."""
+    members = [
+        e
+        for e in entries
+        if e.failure is not None
+        or (e.resource.kind == 'file' and e.download is not None and e.download.state == 'partial')
+    ]
+    walked = {names[e.entry_id] for e in members}
+    walked.update(parent for e in members for parent in names[e.entry_id].parents)
+    return [e for e in entries if names[e.entry_id] in walked]
 
 
 def _is_current(entry: MirrorEntry, destination: Destination) -> bool:

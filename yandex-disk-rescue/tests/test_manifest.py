@@ -337,7 +337,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 4
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -361,7 +361,37 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 4
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
+
+
+V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
+
+
+def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    with closing(sqlite3.connect(db)) as connection:
+        connection.executescript(V4_FIXTURE.read_text())
+
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
+        entries = {e.resource.path: e for e in mirror.entries()}
+
+    assert {path: e.failure for path, e in entries.items()} == {
+        'disk:/Photos': None,
+        'disk:/Photos/a.jpg': None,
+        'disk:/Photos/big.bin': None,
+    }
+    verified, partial = entries['disk:/Photos/a.jpg'].download, entries['disk:/Photos/big.bin'].download
+    assert verified is not None
+    assert (verified.state, verified.verified_by, verified.segments) == ('verified', 'md5+sha256', ())
+    assert partial is not None
+    assert (partial.state, partial.segments) == (
+        'partial',
+        (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
+    )
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 5
+        assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
 
 
 def test_a_mirror_is_found_again_by_its_destination(tmp_path):
@@ -711,6 +741,59 @@ def test_verifying_or_forgetting_a_download_deletes_its_journal(tmp_path):
     assert verified is not None
     assert (verified.state, verified.segments) == ('verified', ())
     assert _segment_rows(db) == []
+
+
+def _failures(mirror: Mirror) -> dict[str, str]:
+    return {e.resource.path: e.failure for e in mirror.entries() if e.failure is not None}
+
+
+def test_a_failure_is_replaced_kept_by_forget_and_dropped_by_verifying_or_clearing(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep = next(r for r in TREE if r.path == 'disk:/A/keep.txt')
+    edit = next(r for r in TREE if r.path == 'disk:/A/edit.txt')
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_failure(ids['disk:/A'], 'could not write A: Permission denied')
+        mirror.record_failure(ids[keep.path], 'the download stalled: no data for 15 s')
+        mirror.record_failure(ids[edit.path], 'the download stalled: no data for 15 s')
+        mirror.record_failure(ids[edit.path], 'removed from the Disk after the scan')
+        recorded = _failures(mirror)
+
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), _unconfirmed(edit))
+        mirror.forget(ids[edit.path])
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), _unconfirmed(keep))
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        mirror.clear_failure(ids['disk:/A'])
+        mirror.clear_failure(ids['disk:/A'])
+        after = _failures(mirror)
+        elsewhere = _failures(other)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_failure(10_000, 'nowhere')
+
+    assert recorded == {
+        'disk:/A': 'could not write A: Permission denied',
+        'disk:/A/edit.txt': 'removed from the Disk after the scan',
+        'disk:/A/keep.txt': 'the download stalled: no data for 15 s',
+    }
+    assert after == {'disk:/A/edit.txt': 'removed from the Disk after the scan'}
+    assert elsewhere == {}
+
+
+def test_a_failure_survives_a_rescan_and_goes_with_its_removed_entry(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    with manifest:
+        for path in ('disk:/A/edit.txt', 'disk:/A/gone.txt'):
+            mirror.record_failure(ids[path], 'the download stalled: no data for 15 s')
+
+    _scan(db, [r for r in TREE if r.path != 'disk:/A/gone.txt'])
+    with Manifest.open(db) as manifest:
+        failures = _failures(manifest.mirror(UID, 'disk:/', Path('/dest')))
+
+    assert failures == {'disk:/A/edit.txt': 'the download stalled: no data for 15 s'}
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('SELECT entry_id FROM failures').fetchall() == [(ids['disk:/A/edit.txt'],)]
 
 
 def _stat(ino: int, size: int = 1) -> os.stat_result:

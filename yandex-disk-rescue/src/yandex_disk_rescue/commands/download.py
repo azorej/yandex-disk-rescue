@@ -1,5 +1,5 @@
 """`download`: scan a remote folder (unless a recent scan covers it), mirror it into a local folder with every file
-verified, and summarize the run."""
+verified, or retry only the files whose last attempt failed or never finished, and summarize the run."""
 
 import asyncio
 from dataclasses import dataclass
@@ -46,6 +46,14 @@ def download(
             help='Use the manifest as it is, whatever the age of its scan, instead of scanning REMOTE_PATH first.',
         ),
     ] = False,
+    retry_failed: Annotated[
+        bool,
+        typer.Option(
+            '--retry-failed',
+            help='Download only the files whose last attempt in DEST failed or never finished, and the folders that '
+            'failed; leave everything else alone.',
+        ),
+    ] = False,
     scan_max_age: settings.ScanMaxAge = settings.SCAN_MAX_AGE.default,
     download_timeout: settings.DownloadTimeout = settings.DOWNLOAD_TIMEOUT.default,
     download_retries: settings.DownloadRetries = settings.DOWNLOAD_RETRIES.default,
@@ -63,7 +71,7 @@ def download(
     api_url: settings.ApiUrl = settings.API_URL.default,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
-    skipped on a rerun."""
+    skipped on a rerun, or with --retry-failed only the failed and unfinished ones."""
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
@@ -81,6 +89,7 @@ def download(
                 base_url=api_url,
                 limits=limits,
                 scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
+                retry_failed=retry_failed,
                 transfers=_Transfers(
                     timeout=download_timeout,
                     retries=download_retries,
@@ -170,6 +179,7 @@ async def _run(
     base_url: str,
     limits: api.ApiLimits,
     scan_policy: _ScanPolicy,
+    retry_failed: bool,
     transfers: _Transfers,
     manifest_path: Path,
 ) -> MirrorReport:
@@ -185,14 +195,19 @@ async def _run(
                         typer.echo(line)
                 else:
                     typer.echo(reused)
-                return await _mirror(client, MirrorRun(mirror, destination), destination, transfers)
+                run = MirrorRun(mirror, destination, retry_failed=retry_failed)
+                return await _mirror(client, run, destination, transfers, retry_failed=retry_failed)
 
 
 async def _mirror(
-    client: api.DiskClient, run: MirrorRun, destination: Destination, transfers: _Transfers
+    client: api.DiskClient, run: MirrorRun, destination: Destination, transfers: _Transfers, *, retry_failed: bool
 ) -> MirrorReport:
     files = 'file' if run.pending_files == 1 else 'files'
-    typer.echo(f'Downloading {run.pending_files} {files} ({format_size(run.pending_size)}) to {destination.path}')
+    size = format_size(run.pending_size)
+    if retry_failed:
+        typer.echo(f'Retrying {run.pending_files} failed or unfinished {files} ({size}) in {destination.path}')
+    else:
+        typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
         policy = TransferPolicy(
             retries=transfers.retries,

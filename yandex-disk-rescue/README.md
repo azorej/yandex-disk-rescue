@@ -9,6 +9,7 @@ uv run yandex-disk-rescue auth status
 uv run yandex-disk-rescue scan disk:/Photos
 uv run yandex-disk-rescue download disk:/Photos /tmp/photos
 uv run yandex-disk-rescue download --no-scan disk:/Photos /tmp/photos
+uv run yandex-disk-rescue download --retry-failed disk:/Photos /tmp/photos
 ```
 
 Tests: `mise run test -- yandex-disk-rescue/tests`.
@@ -64,7 +65,10 @@ recorded for another folder or account (`MirrorMismatchError`, exit code 2).
   `Mirror.checkpoint` moves its confirmed offsets, `Mirror.download` reads the record as it is now; verifying or
   forgetting the download deletes its journal. A partial record from schema version 3 or older gets one segment
   confirming nothing on the upgrade, so its file is downloaded again from byte 0.
-- A rescan never touches names or records; removing an entry from the manifest deletes its name and record.
+- A failure record (`failures`) holds the reason the entry's last turn in the mirror failed, for files and folders
+  alike. `Mirror.record_failure` replaces any earlier reason and `Mirror.clear_failure` drops it; verifying the
+  entry's file (`record_verified`) drops it too, while `forget` keeps it. `MirrorEntry.failure` reads it.
+- A rescan never touches names, records or failures; removing an entry from the manifest deletes all three.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
   in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
@@ -92,12 +96,14 @@ yandex-disk-rescue/
 │   ├── commands/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
 │   │   └── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
-│   │                 #   destination, mirror run, summary, exit code
+│   │                 #   destination, mirror run of every entry or of the retry set (`--retry-failed`), its
+│   │                 #   start line, summary, exit code
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines
-│   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries (skip, folders, things in
-│   │                 #   the way, hard-link aliases) with up to `download_connections` files in progress at once
+│   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
+│   │                 #   over the retry set (failed or partial files, failed folders) and the folders above it
+│   │                 #   (skip, folders, things in the way, hard-link aliases) with up to `download_connections` files in progress at once
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
 │   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
@@ -109,7 +115,8 @@ yandex-disk-rescue/
 │   │                 #   fallback to one stream when the host ignores a range;
 │   │                 #   verify, by reading a segmented file back; move aside what is in the way, place,
 │   │                 #   record), the rejected-name conversion of a folder or file name the destination
-│   │                 #   refuses, later passes over transiently failed files, the summary lines; disk work
+│   │                 #   refuses, later passes over transiently failed files, failure records written as
+│   │                 #   entries fail and dropped as they succeed, the summary lines; disk work
 │   │                 #   (hashing, writes, preallocation, fsync, placement) runs in the run's worker threads,
 │   │                 #   one bounded call at a time, while the manifest and local names stay on the event loop
 │   ├── disk_threads.py # DiskThreads — the run's dedicated worker threads; a cancelled caller waits for its call
@@ -125,8 +132,8 @@ yandex-disk-rescue/
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest path
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
-│   │                 #   completion time, mirrors (local names, download records and their checkpoint journals
-│   │                 #   per destination)
+│   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
+│   │                 #   failure records per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry
@@ -148,6 +155,8 @@ yandex-disk-rescue/
 └── tests/
     ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of a migration test
     ├── data/manifest-v3.sql # A schema-v3 manifest dump with download records, the input of a migration test
+    ├── data/manifest-v4.sql # A schema-v4 manifest dump with a verified and a partial record, the input of a
+    │                        #   migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures
     ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the

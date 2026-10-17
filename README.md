@@ -182,8 +182,9 @@ gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
 `--download-connections`, `--download-checkpoint-mib`, `--download-segments`,
 `--download-segment-threshold-mib` and `--scan-max-age` (see
-[Configuration](#configuration)), and `--no-scan`. A file whose download host
-never answers holds one connection until it stalls and delays no other file.
+[Configuration](#configuration)), `--no-scan` and `--retry-failed`
+(below). A file whose download host never answers holds one connection until
+it stalls and delays no other file.
 
 **Segmented files.** A file larger than `download_segment_threshold_mib` MiB
 (default 256) is downloaded as `download_segments` segments (default 4): equal
@@ -283,6 +284,35 @@ stream, never appended to the bytes kept.
   file waits for the next pass, which starts with a new link; after the last
   pass its reason is `download link rejected again after a refresh (HTTP <n>)`.
 
+**Retrying failures.** Every file or folder a run reports under `Failed` is
+recorded in the manifest for that DEST with the reason shown, as soon as it
+fails: a file still failing after the last pass, a refused download, a file
+changed or removed in the cloud, a local error, a hard link to another file of
+the mirror, a refused name, a folder that could not be made, and every entry
+under such a folder. The record is dropped once the entry succeeds: a file
+verified or adopted, a folder made or found in place. Files stopped by Ctrl+C
+or by an error that stops the run get no failure record; their unfinished
+downloads stay recorded as partial.
+
+`download --retry-failed [REMOTE_PATH] DEST` covers only the *retry set*: the
+files with a failure record or with a download that started and never
+finished (for example one stopped by Ctrl+C), and the folders with a failure
+record. Files never started are not in it; a plain `download` gets them. The
+scan step runs as usual; the retry set is fixed once it is done. The run then
+visits only the retry set and the folders above its members, in path order,
+with the usual passes and rules, and never looks at any other path of DEST:
+those files are neither checked nor counted. It starts with
+
+```
+Retrying 3 failed or unfinished files (1.5 GiB) in /mnt/backup
+```
+
+in place of `Downloading …`, and its summary and exit code are those of a
+normal run over the retry set. With nothing to retry it prints `Retrying 0
+failed or unfinished files (0 B)`, downloads nothing and exits `0`. Entries
+whose names are not valid Unicode have no record; they fail every run,
+`--retry-failed` included.
+
 **Summary.**
 
 ```
@@ -306,7 +336,8 @@ Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 Every list is in path order, whatever the order the files finished in, and
 shows at most 20 entries, then `… and N more`. When anything
 failed, the run ends with `Error: N failed; see the list above.` and exit
-code `1`; a rerun retries exactly what is not verified yet.
+code `1`. A plain rerun retries every file that is not verified yet, and
+`download --retry-failed` only the failed and unfinished ones.
 
 **Files already in DEST.** DEST may already hold files, for example an
 earlier copy made by hand. A regular file at the path of a Disk file is read

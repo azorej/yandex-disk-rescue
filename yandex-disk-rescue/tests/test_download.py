@@ -60,6 +60,7 @@ SEGMENTED_PATH = 'disk:/Seg/large.bin'
 SEGMENTED = random.Random(17).randbytes(4 * MiB)
 SEGMENTED_ARGS = ('--download-segment-threshold-mib', '1')
 SEGMENT_RANGES = [f'bytes={n * MiB}-{(n + 1) * MiB - 1}' for n in range(4)]
+_CONTENT_PATHS = ('/v1/disk/resources/download', '/download', '/storage')
 _STAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z')
 
 
@@ -91,7 +92,7 @@ def _local(dest, remote_path: str):
 
 def _transfers(fake, since: int = 0) -> list[str]:
     """The paths of the link requests and content requests after the first `since` requests."""
-    return [r.path for r in fake.requests[since:] if r.path in ('/v1/disk/resources/download', '/download', '/storage')]
+    return [r.path for r in fake.requests[since:] if r.path in _CONTENT_PATHS]
 
 
 def _linked(fake) -> list[str]:
@@ -184,6 +185,14 @@ def _journal() -> list[tuple[int, int, int, str | None]]:
             ).fetchall()
     except sqlite3.OperationalError:
         return []
+
+
+def _failure_records() -> list[tuple[str, str]]:
+    """The (remote path, reason) of every failure record in the manifest, read with a connection of its own."""
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        return connection.execute(
+            'SELECT e.path, f.reason FROM failures f JOIN entries e ON e.id = f.entry_id ORDER BY e.path'
+        ).fetchall()
 
 
 def _confirmed() -> int:
@@ -800,7 +809,7 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
     assert '6 downloaded' in result.stdout
     assert all(_local(dest, path).read_bytes() == content for path, content in FILES.items())
 
-    for reuse in (['--no-scan'], []):
+    for reuse in (['--no-scan'], [], ['--retry-failed']):
         earlier = len(disk.requests)
         rerun = _download(*reuse, str(dest))
 
@@ -1214,6 +1223,67 @@ def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succee
     ) in result.stdout
     assert _fetches(big, BIG_PATH) == [None, None]
     assert _others_verified(dest, BIG_PATH)
+    assert _failure_records() == [(BIG_PATH, f'the download stalled: no data for {STALL_TIMEOUT} s (after 2 passes)')]
+
+
+def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_others(disk, dest):
+    failed = 'disk:/Docs/readme.txt'
+    disk.inject('GET', '/download', 503, where={'path': failed})
+    first = _download('--download-passes', '1', str(dest))
+
+    assert first.exit_code == 1
+    assert f'Failed: 1\n  {failed}: ' in first.stdout
+    assert [path for path, _ in _failure_records()] == [failed]
+
+    disk.add_file('disk:/New/n.txt', b'new', modified=MODIFIED)
+    # A plain run would fetch this one again; a retry never looks at it.
+    _local(dest, 'disk:/Photos/2024/b.jpg').unlink()
+    earlier = len(disk.requests)
+    retry = _download('--retry-failed', '--scan-max-age', '0', str(dest))
+
+    assert retry.exit_code == 0, retry.output
+    assert f'Retrying 1 failed or unfinished file (7 B) in {dest}\n' in retry.stdout
+    assert f'Mirrored disk:/ to {dest}: 1 downloaded (7 B), 0 skipped, 0 failed\n' in retry.stdout
+    assert [r.params['path'] for r in disk.requests[earlier:] if r.path in _CONTENT_PATHS] == [failed, failed]
+    assert _local(dest, failed).read_bytes() == FILES[failed]
+    assert not (dest / 'New').exists()
+    assert not _local(dest, 'disk:/Photos/2024/b.jpg').exists()
+    assert _failure_records() == []
+
+    earlier = len(disk.requests)
+    again = _download('--retry-failed', str(dest))
+
+    assert again.exit_code == 0, again.output
+    assert f'Retrying 0 failed or unfinished files (0 B) in {dest}\n' in again.stdout
+    assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 0 skipped, 0 failed\n' in again.stdout
+    assert _transfers(disk, earlier) == []
+
+
+def test_retry_failed_makes_a_failed_folder_and_the_files_under_it(disk, dest, monkeypatch):
+    disk.add_file('disk:/Q?/x.txt', b'inside')
+    refusing = True
+    _refuse_names(monkeypatch, lambda name: refusing and ('?' in name or '_' in name))
+    first = _download(str(dest))
+
+    assert first.exit_code == 1
+    assert 'Failed: 2\n  disk:/Q?: the destination filesystem refuses the name Q? ' in first.stdout
+    assert [path for path, _ in _failure_records()] == ['disk:/Q?', 'disk:/Q?/x.txt']
+
+    refusing = False
+    retry = _download('--retry-failed', str(dest))
+
+    assert retry.exit_code == 0, retry.output
+    assert f'Retrying 1 failed or unfinished file (6 B) in {dest}\n' in retry.stdout
+    assert f'Mirrored disk:/ to {dest}: 1 downloaded (6 B), 0 skipped, 0 failed\n' in retry.stdout
+    assert (dest / 'Q?' / 'x.txt').read_bytes() == b'inside'
+    assert _failure_records() == []
+
+    earlier = len(disk.requests)
+    again = _download('--retry-failed', str(dest))
+
+    assert again.exit_code == 0, again.output
+    assert f'Retrying 0 failed or unfinished files (0 B) in {dest}\n' in again.stdout
+    assert _transfers(disk, earlier) == []
 
 
 def test_a_corrupt_file_is_not_retried_in_a_later_pass(disk, dest):
@@ -1521,10 +1591,12 @@ def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_th
 
     big.chunk_delay = 0
     earlier = len(big.requests)
-    result = _download('disk:/Big', str(dest))
+    result = _download('--retry-failed', 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
+    assert f'Retrying 1 failed or unfinished file ({format_size(len(BIG))}) in {dest}\n' in result.stdout
     assert _fetches(big, BIG_PATH, earlier) == [_tail(held)]
+    assert _transfers(big, earlier) == ['/v1/disk/resources/download', '/download']
     assert (dest / 'big.bin').read_bytes() == BIG
 
 
@@ -1903,7 +1975,9 @@ async def _mirror_run(
         scan_root = await resolve_scan_root(client, root)
         with Manifest.open(manifest_path()) as manifest, Destination.open(dest) as destination:
             await scan_tree(client, manifest, account, scan_root)
-            run = MirrorRun(manifest.mirror(account.uid, scan_root.path, destination.path), destination)
+            run = MirrorRun(
+                manifest.mirror(account.uid, scan_root.path, destination.path), destination, retry_failed=False
+            )
             yield lambda: run.run(client, content, policy, passes=1)
 
 

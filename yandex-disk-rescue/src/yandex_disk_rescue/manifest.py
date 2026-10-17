@@ -8,8 +8,9 @@ the entries it left out because their names are not valid Unicode (`unencodable_
 scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
-the local name of every entry (`local_names`) and each file's download state (`downloads`), keyed by `entries.id`,
-with the checkpoint journal of a partial download (`download_segments`).
+the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
+of a partial download (`download_segments`), and the reason the last turn of an entry failed (`failures`), all keyed
+by `entries.id`.
 A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
 the manifest deletes its rows.
 
@@ -167,6 +168,17 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         SELECT mirror_id, entry_id, 0, size, 0, NULL FROM downloads WHERE state = 'partial' AND size > 0
         """,
     ),
+    (
+        # `reason` is the user-facing reason the entry's last turn in this mirror failed.
+        """
+        CREATE TABLE failures (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            reason TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id)
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -248,6 +260,7 @@ class MirrorEntry:
     resource: Resource
     local_path: PurePosixPath | None  # relative to the destination; `None` until a name is assigned
     download: DownloadRecord | None
+    failure: str | None  # why the entry's last turn in this mirror failed; `None` once it succeeded
 
 
 @dataclass(frozen=True)
@@ -499,8 +512,8 @@ class Mirror:
         self.destination = destination
 
     def entries(self) -> list[MirrorEntry]:
-        """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names and
-        download records, read in full so no read stays open across later writes."""
+        """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names,
+        download records and failures, read in full so no read stays open across later writes."""
         params = {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
         connection = self._manifest._connection
         with self._manifest._transaction('read'):
@@ -596,7 +609,7 @@ class Mirror:
     ) -> None:
         """Record the entry's file as verified against `identity`, placed at its final path with `lstat` `local`.
 
-        The record's segments are deleted. Any other verified record of this mirror holding the same inode is deleted:
+        The record's segments and the entry's failure are deleted. Any other verified record of this mirror holding the same inode is deleted:
         the caller has just placed this file there, so that record describes a file that is gone and whose inode
         number was reused.
         """
@@ -611,10 +624,23 @@ class Mirror:
         return None if row is None else _mirror_entry(row, ())
 
     def forget(self, entry_id: int) -> None:
-        """Delete the entry's download record and its segments, if any."""
+        """Delete the entry's download record and its segments, if any; its failure stays."""
         with self._manifest._transaction('update'):
             self._manifest._connection.execute(
                 'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            )
+
+    def record_failure(self, entry_id: int, reason: str) -> None:
+        """Record `reason` as why the entry's last turn failed, replacing any earlier reason."""
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            self._manifest._connection.execute(_RECORD_FAILURE_SQL, (self.id, entry_id, reason))
+
+    def clear_failure(self, entry_id: int) -> None:
+        """Delete the entry's failure, if any."""
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
 
     def _segments(self, entry_id: int) -> tuple[Segment, ...]:
@@ -661,8 +687,9 @@ class Mirror:
         ]
         with self._manifest._transaction('update'):
             self._check_entry(entry_id)
-            if local is not None:
+            if state == 'verified':
                 connection.execute(_RELEASE_INO_SQL, params)
+                connection.execute('DELETE FROM failures WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id))
             # The upsert updates the row in place, so no cascade deletes the old segments.
             connection.execute(
                 'DELETE FROM download_segments WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
@@ -679,12 +706,14 @@ class Mirror:
 
 _MIRROR_ENTRY_COLUMNS = """
     e.id, e.path, e.kind, e.size, e.md5, e.sha256, e.modified, n.local_path,
-    d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino
+    d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino,
+    f.reason
 """
 _MIRROR_JOINS = """
     FROM entries e
     LEFT JOIN local_names n ON n.mirror_id = :mirror AND n.entry_id = e.id
     LEFT JOIN downloads d ON d.mirror_id = :mirror AND d.entry_id = e.id
+    LEFT JOIN failures f ON f.mirror_id = :mirror AND f.entry_id = e.id
 """
 _MIRROR_ENTRIES_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
@@ -734,6 +763,10 @@ _RECORD_DOWNLOAD_SQL = """
         state = excluded.state, size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256,
         modified = excluded.modified, verified_by = excluded.verified_by, local_size = excluded.local_size,
         local_mtime_ns = excluded.local_mtime_ns, local_ino = excluded.local_ino
+"""
+_RECORD_FAILURE_SQL = """
+    INSERT INTO failures (mirror_id, entry_id, reason) VALUES (?, ?, ?)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET reason = excluded.reason
 """
 _UNENCODABLE_SQL = """
     SELECT path, kind FROM unencodable_entries
@@ -969,7 +1002,8 @@ def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
         entry_id=entry_id,
         resource=_resource(row[1:7]),
         local_path=None if local_path is None else PurePosixPath(local_path),
-        download=None if row[8] is None else _download_record(row[8:], segments),
+        download=None if row[8] is None else _download_record(row[8:17], segments),
+        failure=row[17],
     )
 
 
