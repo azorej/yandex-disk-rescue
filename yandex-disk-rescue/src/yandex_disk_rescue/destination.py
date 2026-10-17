@@ -12,7 +12,7 @@ import fcntl
 import os
 import stat
 from collections.abc import Collection, Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -29,7 +29,11 @@ _STAMP_FORMAT = '%Y-%m-%dT%H-%M-%SZ'
 _READ_SIZE = 1 << 20
 _PROBE_NAMES = ('probe', 'probe.renamed')
 # Errors that no other file of the run would escape: the run stops instead of failing every file in turn.
-FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS, errno.EACCES, errno.EPERM})
+FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS})
+# A permission error in the work directory, unlike one on a path of the mirror, would meet every file too.
+_WORK_FATAL_ERRNOS = FATAL_ERRNOS | {errno.EACCES, errno.EPERM}
+# How a filesystem refuses a name it cannot hold, as exFAT refuses `?`.
+NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
 _MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
 
 
@@ -70,7 +74,10 @@ class Destination:
     `path` is the resolved destination. Local paths are relative to it, '/'-separated. Partial files live in
     `.yandex-disk-rescue/partial/`, named by entry id. Things moved aside go to
     `.yandex-disk-rescue/replaced/<run start, UTC>/`, created on the first move; `replaced_folder` is that folder
-    relative to the destination once it exists. `path_max` is the filesystem's PATH_MAX.
+    relative to the destination once it exists.
+
+    An error in the work directory that every file would meet (a full disk, an I/O error, a read-only filesystem, a
+    permission error) raises `DestinationError`; other errors are the `OSError` of the call.
     """
 
     def __init__(
@@ -82,10 +89,8 @@ class Destination:
         partial_fd: int,
         *,
         started: datetime,
-        path_max: int,
     ) -> None:
         self.path = path
-        self.path_max = path_max
         self.replaced_folder: PurePosixPath | None = None
         self._root_fd = root_fd
         self._work_fd = work_fd
@@ -110,15 +115,14 @@ class Destination:
             fds.append(_work_dir(WORK_DIR_NAME, fds[0], resolved / WORK_DIR_NAME))
             fds.append(_lock(fds[1], resolved))
             fds.append(_work_dir(PARTIAL_DIR_NAME, fds[1], resolved / WORK_DIR_NAME / PARTIAL_DIR_NAME))
-            _probe_noreplace(fds[1], resolved)
-            path_max = os.pathconf(fds[0], 'PC_PATH_MAX')
+            _probe_noreplace(fds[3], resolved)
         except OSError as exc:
             _close_all(fds)
             raise DestinationError.of(path, exc) from None
         except BaseException:
             _close_all(fds)
             raise
-        return cls(resolved, *fds, started=started, path_max=path_max)
+        return cls(resolved, *fds, started=started)
 
     def close(self) -> None:
         replaced = [] if self._replaced_fd is None else [self._replaced_fd]
@@ -132,15 +136,12 @@ class Destination:
     ) -> None:
         self.close()
 
-    def exceeds_path_max(self, local: PurePosixPath) -> bool:
-        """Whether the absolute path of `local`, with its terminating null byte, is longer than `path_max`."""
-        return len(os.fsencode(self.path / local)) >= self.path_max
-
     def lstat(self, local: PurePosixPath) -> os.stat_result | None:
-        """The `lstat` of `local`, or `None` when it, or a folder on the way to it, is missing or not a real folder."""
+        """The `lstat` of `local`, or `None` when it, or a folder on the way to it, is missing or not a real folder, or
+        when the filesystem refuses its name (`NAME_ERRNOS`), so the call creating it meets the refusal."""
         try:
             with self._folder(local.parent) as parent_fd:
-                return os.stat(local.name, dir_fd=parent_fd, follow_symlinks=False)
+                return _lstat_name(local.name, parent_fd)
         except OSError as exc:
             if exc.errno in _MISSING_ERRNOS:
                 return None
@@ -164,29 +165,34 @@ class Destination:
     def partial(self, entry_id: int) -> Iterator[PartialFile]:
         """Open the partial file of `entry_id` for reading and writing, keeping its content; a missing one is created
         empty."""
-        fd = os.open(
-            str(entry_id),
-            os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
-            0o666,
-            dir_fd=self._partial_fd,
-        )
+        path = self._partial_path(entry_id)
+        with _work_errors(path):
+            fd = os.open(
+                str(entry_id),
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o666,
+                dir_fd=self._partial_fd,
+            )
         try:
-            yield PartialFile(fd)
+            yield PartialFile(fd, path)
         finally:
             os.close(fd)
 
     def remove_partial(self, entry_id: int) -> None:
-        try:
-            os.unlink(str(entry_id), dir_fd=self._partial_fd)
-        except FileNotFoundError:
-            pass
+        with _work_errors(self._partial_path(entry_id)):
+            try:
+                os.unlink(str(entry_id), dir_fd=self._partial_fd)
+            except FileNotFoundError:
+                pass
 
     def keep_partials(self, entry_ids: Collection[int]) -> None:
-        """Delete every file in the partial folder that is not the partial file of one of `entry_ids`."""
+        """Delete every regular file in the partial folder that is not the partial file of one of `entry_ids`; anything
+        else there is left alone."""
         keep = {str(entry_id) for entry_id in entry_ids}
-        for name in os.listdir(self._partial_fd):
-            if name not in keep:
-                os.unlink(name, dir_fd=self._partial_fd)
+        with os.scandir(self._partial_fd) as found:
+            stray = [entry.name for entry in found if entry.name not in keep and entry.is_file(follow_symlinks=False)]
+        for name in stray:
+            os.unlink(name, dir_fd=self._partial_fd)
 
     def place(self, entry_id: int, local: PurePosixPath) -> os.stat_result:
         """Move the finished partial file of `entry_id` to `local` without replacing anything, make the move
@@ -213,11 +219,16 @@ class Destination:
         """Move whatever is at `local` (a file, a folder with everything in it, or a link itself, never its target)
         to the same relative path in this run's replaced folder, without replacing anything, and make the move
         durable."""
-        run_fd = self._replaced_run_fd()
-        with self._folder(local.parent) as source_fd, _made_folder(run_fd, local.parent) as target_fd:
+        with ExitStack() as stack:
+            source_fd = stack.enter_context(self._folder(local.parent))
+            with _work_errors(self.path / WORK_DIR_NAME / REPLACED_DIR_NAME):
+                target_fd = stack.enter_context(_made_folder(self._replaced_run_fd(), local.parent))
             localfs.rename_noreplace(local.name, local.name, src_dir_fd=source_fd, dst_dir_fd=target_fd)
             os.fsync(target_fd)
             os.fsync(source_fd)
+
+    def _partial_path(self, entry_id: int) -> Path:
+        return self.path / WORK_DIR_NAME / PARTIAL_DIR_NAME / str(entry_id)
 
     def _replaced_run_fd(self) -> int:
         """The descriptor of this run's replaced folder, created on first use under a name no earlier run took."""
@@ -275,39 +286,65 @@ class ExistingFile:
 
 
 class PartialFile:
-    """An open partial file: its size, reading back and cutting what it holds, positional writes, then the final mtime
-    and an fsync."""
+    """An open partial file at `path`: its size, reading back and cutting what it holds, positional writes, then the
+    final mtime and an fsync."""
 
-    def __init__(self, fd: int) -> None:
+    def __init__(self, fd: int, path: Path) -> None:
         self._fd = fd
+        self._path = path
 
     def size(self) -> int:
-        return os.fstat(self._fd).st_size
+        with _work_errors(self._path):
+            return os.fstat(self._fd).st_size
 
     def chunks(self, end: int) -> Iterator[bytes]:
         """The bytes `[0, end)` in order; the file must hold at least `end` bytes."""
         offset = 0
         while offset < end:
-            chunk = os.pread(self._fd, min(_READ_SIZE, end - offset), offset)
+            with _work_errors(self._path):
+                chunk = os.pread(self._fd, min(_READ_SIZE, end - offset), offset)
             if not chunk:
                 raise ValueError(f'the partial file ends at {offset} bytes, before {end}')
             yield chunk
             offset += len(chunk)
 
     def truncate(self, length: int) -> None:
-        os.ftruncate(self._fd, length)
+        with _work_errors(self._path):
+            os.ftruncate(self._fd, length)
 
     def write(self, offset: int, chunk: bytes) -> None:
         view = memoryview(chunk)
-        while view:
-            written = os.pwrite(self._fd, view, offset)
-            view = view[written:]
-            offset += written
+        with _work_errors(self._path):
+            while view:
+                written = os.pwrite(self._fd, view, offset)
+                view = view[written:]
+                offset += written
 
     def finish(self, mtime_ns: int) -> None:
         """Set the modification time and flush the content and metadata to the disk."""
-        os.utime(self._fd, ns=(mtime_ns, mtime_ns))
-        os.fsync(self._fd)
+        with _work_errors(self._path):
+            os.utime(self._fd, ns=(mtime_ns, mtime_ns))
+            os.fsync(self._fd)
+
+
+@contextmanager
+def _work_errors(path: Path) -> Iterator[None]:
+    """Raise `DestinationError` for an error at `path` in the work directory that every other file would meet."""
+    try:
+        yield
+    except OSError as exc:
+        if exc.errno in _WORK_FATAL_ERRNOS:
+            raise DestinationError.of(path, exc) from None
+        raise
+
+
+def _lstat_name(name: str, dir_fd: int) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except OSError as exc:
+        if exc.errno in NAME_ERRNOS:
+            return None
+        raise
 
 
 @contextmanager
@@ -369,34 +406,34 @@ def _lock(work_fd: int, destination: Path) -> int:
     return fd
 
 
-def _probe_noreplace(work_fd: int, destination: Path) -> None:
-    """Check that a no-replace rename in the work directory moves a file and refuses an existing target."""
+def _probe_noreplace(partial_fd: int, destination: Path) -> None:
+    """Check that a no-replace rename in the partial folder moves a file and refuses an existing target."""
     first, second = _PROBE_NAMES
     for name in _PROBE_NAMES:
         try:
-            os.unlink(name, dir_fd=work_fd)
+            os.unlink(name, dir_fd=partial_fd)
         except FileNotFoundError:
             pass
     unsupported = DestinationError(
         f'Could not write {destination}: its filesystem does not support renaming without replacing '
         '(RENAME_NOREPLACE), which download needs so it never overwrites a file.'
     )
-    _touch(first, work_fd)
+    _touch(first, partial_fd)
     try:
-        localfs.rename_noreplace(first, second, src_dir_fd=work_fd, dst_dir_fd=work_fd)
+        localfs.rename_noreplace(first, second, src_dir_fd=partial_fd, dst_dir_fd=partial_fd)
     except OSError as exc:
         if exc.errno in (errno.EINVAL, errno.ENOSYS):
             raise unsupported from None
         raise
-    _touch(first, work_fd)
+    _touch(first, partial_fd)
     try:
-        localfs.rename_noreplace(first, second, src_dir_fd=work_fd, dst_dir_fd=work_fd)
+        localfs.rename_noreplace(first, second, src_dir_fd=partial_fd, dst_dir_fd=partial_fd)
     except FileExistsError:
         pass
     else:
         raise unsupported
     for name in _PROBE_NAMES:
-        os.unlink(name, dir_fd=work_fd)
+        os.unlink(name, dir_fd=partial_fd)
 
 
 def _touch(name: str, dir_fd: int) -> None:

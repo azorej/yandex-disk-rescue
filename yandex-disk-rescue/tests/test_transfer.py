@@ -258,17 +258,20 @@ async def test_a_response_that_stalls_past_the_timeout_is_transient(fake_disk_ap
     assert excinfo.value.reason == 'the download stalled: no data for 0.2 s'
 
 
-async def test_a_slow_but_steady_body_never_trips_the_stall_timeout(fake_disk_api, remote_file, partial):
-    fake_disk_api.chunk_delay = 0.15
-    href = await _link(fake_disk_api)
+async def test_a_slow_but_steady_body_never_trips_the_stall_timeout(fake_disk_api, partial):
+    slow = random.Random(5).randbytes(24 * 64 * 1024)
+    fake_disk_api.token = TOKEN
+    fake_disk_api.add_file('disk:/slow.bin', slow)
+    fake_disk_api.chunk_delay = 0.1
+    href = await _link(fake_disk_api, 'disk:/slow.bin')
 
-    async with api.ContentClient(timeout=0.4) as content:
+    async with api.ContentClient(timeout=1.5) as content:
         began = time.monotonic()
-        await content.fetch(href, start=0, end=SIZE, size=SIZE, write=partial.write)
+        await content.fetch(href, start=0, end=len(slow), size=len(slow), write=partial.write)
         elapsed = time.monotonic() - began
 
-    assert partial.read() == CONTENT
-    assert elapsed > 0.4
+    assert partial.read() == slow
+    assert elapsed > 1.5
 
 
 async def test_time_spent_writing_does_not_count_against_the_stall_timeout(fake_disk_api, remote_file, partial):
@@ -292,19 +295,6 @@ async def test_an_unreachable_host_is_transient_and_hides_the_link(closed_port_u
 
     assert excinfo.value.reason.startswith('the download failed: ')
     assert 's3cr3t' not in excinfo.value.reason
-
-
-async def test_chunk_delay_paces_the_body_in_64_kib_chunks(fake_disk_api, remote_file, partial):
-    fake_disk_api.chunk_delay = 0.1
-    href = await _link(fake_disk_api)
-
-    async with api.ContentClient(timeout=5) as content:
-        began = time.monotonic()
-        await content.fetch(href, start=0, end=SIZE, size=SIZE, write=partial.write)
-        elapsed = time.monotonic() - began
-
-    assert partial.read() == CONTENT
-    assert elapsed >= 0.9 * 0.1 * (-(-SIZE // (64 * 1024)) - 1)
 
 
 def test_the_download_host_refuses_a_token(fake_disk_api):

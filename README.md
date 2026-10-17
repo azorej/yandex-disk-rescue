@@ -293,7 +293,9 @@ symbolic link is moved as the link itself; the tool never follows one inside
 DEST and never writes to its target. DEST itself may be a link.
 
 **Nothing is deleted.** The tool never deletes or truncates anything outside
-`DEST/.yandex-disk-rescue/partial/`. Files and folders that are not on the
+`DEST/.yandex-disk-rescue/partial/`; there, at the start of a run, it also
+deletes every file that is not the partial file of a download in progress
+(folders and links there are left alone). Files and folders that are not on the
 Disk are left alone: a path with no Disk counterpart, such as `.DS_Store`,
 `.Spotlight-V100/`, `.Trashes/` or your own files inside a mirrored folder,
 is never opened, moved or reported, and the tool never lists a folder to find
@@ -313,9 +315,15 @@ work directory: it holds partial files, the `replaced/` folder and a lock, so
 only one run at a time can use a destination (`Another yandex-disk-rescue run
 is using DEST`), even runs with different manifests. The destination's filesystem must support
 renaming without replacing (`RENAME_NOREPLACE`; ext4, xfs, btrfs, tmpfs and
-HFS+ do); the run stops at the start otherwise. A full disk, an I/O error, a
-read-only filesystem or a permission error stops the run with
-`Error: Could not write <path>: <reason>.`
+HFS+ do); the run stops at the start otherwise. A full disk or quota, an I/O
+error or a read-only filesystem stops the run with
+`Error: Could not write <path>: <reason>.`, and so does a permission error
+inside `DEST/.yandex-disk-rescue/`. A permission error on a path of the
+mirror — a file or folder there owned by another user, or without the needed
+read, write or search permission — fails only the entries it affects, with
+`could not read <path>: <reason>`, `could not write <path>: <reason>` or
+`could not set the modification time of <path>: <reason>`, and leaves the path
+as it was.
 
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run; files already
@@ -351,13 +359,15 @@ and no character substitution, with three exceptions:
   below. When the converted name is refused too, the file fails with
   `the destination filesystem refuses the name <name> (<reason>), and its
   converted form <converted> too`; for a folder, it and everything below it
-  fail. A path longer than the filesystem's `PATH_MAX` is not converted; the
-  file fails with `the local path is longer than the destination filesystem
-  allows (<reason>)`.
+  fail.
 
 Once given, a local name is kept on later runs, so a converted name is
 created directly and never refused again. The summary lists every
 entry whose local name differs from its Disk name.
+
+Paths have no length limit: every folder and file is created and opened
+relative to its parent folder's descriptor, one name at a time, so a tree
+deeper than the filesystem's `PATH_MAX` is mirrored like any other.
 
 ## Exit codes
 

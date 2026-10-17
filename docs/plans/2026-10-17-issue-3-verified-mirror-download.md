@@ -157,7 +157,7 @@ per-entry download rows. They let #4 add concurrency, segments and checkpoints w
 | Code | `download` meaning |
 |---|---|
 | 0 | Every file in the subtree is verified at its final path, and no file failed in this run |
-| 1 | `RescueError`: every #2 code-1 case, plus one or more files failed (the summary is printed first, then `Error: N files failed; see the list above.`), and a fatal destination error (`Error: Could not write <path>: <strerror>.` for `ENOSPC`, `EIO`, `EROFS`, `EACCES`, or a filesystem without `RENAME_NOREPLACE`) |
+| 1 | `RescueError`: every #2 code-1 case, plus one or more files failed (the summary is printed first, then `Error: N files failed; see the list above.`), and a fatal destination error (`Error: Could not write <path>: <strerror>.` for `ENOSPC`, `EDQUOT`, `EIO`, `EROFS` anywhere, `EACCES` or `EPERM` inside the work directory, or a filesystem without `RENAME_NOREPLACE`; a permission error on a path of the mirror fails only that entry) |
 | 2 | Usage: 0 or more than 2 positional paths, an invalid option, `--no-scan` for a REMOTE_PATH no completed scan covers, a DEST that exists but is not a directory, a DEST whose parent does not exist, a DEST starting with `disk:` (a swapped argument order), a DEST already mirroring another remote folder or account |
 | 130 | Ctrl+C. Stderr shows `Interrupted; rerun to continue the download.`, and partial files and records are kept |
 
@@ -168,8 +168,7 @@ What counts as a per-file failure, rather than aborting the run:
 - The download host still fails after `download_retries`.
 - An expired link fails again after one refresh.
 - Verification fails, or the cloud file changed during the run.
-- The OS refuses the file's name *even after* the rejected-name conversion (Stage 9), or the full
-  path exceeds `PATH_MAX`.
+- The OS refuses the file's name *even after* the rejected-name conversion (Stage 9).
 
 Three cases abort the run (exit 1):
 
@@ -877,7 +876,8 @@ Three cases abort the run (exit 1):
   - **Retry fails.** The entry fails with `the destination filesystem refuses the name <name>
     (<strerror>), and its converted form <converted> too`. For a folder, every file below it fails
     with a reason naming that folder.
-  - **`ENAMETOOLONG` for the whole path** (over `PATH_MAX`) is not converted: the file fails.
+  - **No `PATH_MAX` limit.** Every call is relative to a folder descriptor with one name, so the
+    kernel never measures a whole path; `ENAMETOOLONG` is about one name and is converted.
   - **Stable.** Converted names live in `local_names`, so later runs create them directly with no
     error. `map_local_names` keeps them through the existing "assigned" stability rule.
   - **Summary.** Converted names join the "Renamed for the destination" list, in the same form as

@@ -21,7 +21,9 @@ import pytest
 from fake_disk_server import Delay, FakeResponse, Truncate
 from typer.testing import CliRunner
 from yandex_disk_rescue import localfs, mirroring
+from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.paths import manifest_path
 from yandex_disk_rescue.units import format_size
 
@@ -42,6 +44,9 @@ SIZE_ONLY = 'disk:/Photos/old.bmp'
 BIG_PATH = 'disk:/Big/big.bin'
 BIG = random.Random(3).randbytes(1024 * 1024)
 CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
+# A stall timeout no ordinary local transfer comes near, and an injected silence well past it.
+STALL_TIMEOUT = '3'
+STALL = Delay(4.5)
 _STAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z')
 
 
@@ -287,15 +292,23 @@ def _hex(name: str, digits: int = 8) -> str:
 
 
 def _refuse_names(monkeypatch, refused: Callable[[str], bool], code: int = errno.EINVAL) -> list[str]:
-    """Make the folder creation and the no-replace rename fail with `code` for every name `refused` accepts, as
-    exFAT does for a name holding `?`; return every name they were asked to create."""
+    """Make the folder creation, the no-replace rename and a look-up relative to a folder fail with `code` for every
+    name `refused` accepts, as exFAT does for a name holding `?`; return every name they were asked to create."""
     seen: list[str] = []
-    make_dir, rename_noreplace = localfs.make_dir, localfs.rename_noreplace
+    make_dir, rename_noreplace, lstat = localfs.make_dir, localfs.rename_noreplace, os.stat
+
+    def refuse(name: str) -> None:
+        if refused(name):
+            raise OSError(code, os.strerror(code), name)
 
     def check(name: str) -> None:
         seen.append(name)
-        if refused(name):
-            raise OSError(code, os.strerror(code), name)
+        refuse(name)
+
+    def refusing_stat(path, *, dir_fd=None, follow_symlinks=True):
+        if dir_fd is not None:
+            refuse(path)
+        return lstat(path, dir_fd=dir_fd, follow_symlinks=follow_symlinks)
 
     def refusing_make_dir(name, *, dir_fd):
         check(name)
@@ -307,15 +320,17 @@ def _refuse_names(monkeypatch, refused: Callable[[str], bool], code: int = errno
 
     monkeypatch.setattr(localfs, 'make_dir', refusing_make_dir)
     monkeypatch.setattr(localfs, 'rename_noreplace', refusing_rename)
+    monkeypatch.setattr(os, 'stat', refusing_stat)
     return seen
 
 
-def test_names_the_destination_refuses_are_converted_recorded_and_kept_on_a_rerun(disk, dest, monkeypatch):
+@pytest.mark.parametrize('code', [errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG], ids=errno.errorcode.get)
+def test_names_the_destination_refuses_are_converted_recorded_and_kept_on_a_rerun(disk, dest, monkeypatch, code):
     lookalike = f'a_b~{_hex("a?b.txt")}.txt'
     disk.add_file('disk:/Odd/a?b.txt', b'question')
     disk.add_file(f'disk:/Odd/{lookalike}', b'lookalike')
     disk.add_file('disk:/Odd/Q?/x.txt', b'inside')
-    seen = _refuse_names(monkeypatch, lambda name: '?' in name)
+    seen = _refuse_names(monkeypatch, lambda name: '?' in name, code)
 
     result = _download('disk:/Odd', str(dest))
 
@@ -369,6 +384,64 @@ def test_a_converted_name_the_destination_refuses_too_fails_that_entry_only(disk
         ['.yandex-disk-rescue', 'Docs', 'Empty', 'Photos', 'top.txt']
     )
 
+    rerun = _download(str(dest))
+
+    assert rerun.exit_code == 1
+    assert result.stdout.split('Failed: 3\n')[1] == rerun.stdout.split('Failed: 3\n')[1]
+
+
+def test_a_run_stopped_once_a_converted_file_is_placed_finds_it_there_on_the_next_run(disk, dest, monkeypatch):
+    disk.add_file('disk:/Odd/a?b.txt', b'question')
+    _refuse_names(monkeypatch, lambda name: '?' in name)
+    converted = f'a_b~{_hex("a?b.txt")}.txt'
+    rename_noreplace = localfs.rename_noreplace
+
+    def placed_then_failed(src, dst, *, src_dir_fd, dst_dir_fd):
+        rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+        if dst == converted:
+            raise OSError(errno.EIO, os.strerror(errno.EIO), dst)
+
+    monkeypatch.setattr(localfs, 'rename_noreplace', placed_then_failed)
+    stopped = _download('disk:/Odd', str(dest))
+
+    assert stopped.exit_code == 1
+    assert stopped.stderr == f'Error: Could not write {dest / converted}: {os.strerror(errno.EIO)}.\n'
+
+    monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
+    earlier = len(disk.requests)
+    rerun = _download('disk:/Odd', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert 'Already on disk and verified: 1\n  disk:/Odd/a?b.txt\n' in rerun.stdout
+    assert f'Renamed for the destination: 1\n  disk:/Odd/a?b.txt -> {converted}\n' in rerun.stdout
+    assert _transfers(disk, earlier) == []
+    assert sorted(p.name for p in dest.iterdir()) == ['.yandex-disk-rescue', converted]
+    assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+
+
+def test_converting_names_in_a_large_mirror_costs_one_folder_not_the_whole_mirror(tmp_path):
+    folders = [Resource(f'disk:/F{n:03}', 'dir', None, None, None, MODIFIED) for n in range(100)]
+    files = [Resource(f'disk:/F{n % 100:03}/f{n}.txt', 'file', 1, None, None, MODIFIED) for n in range(50_000)]
+    with Manifest.open(tmp_path / 'manifest.sqlite3') as manifest:
+        session = manifest.begin_scan('uid', 'disk:/')
+        session.add([*folders, *files])
+        session.commit(unencodable=())
+        mirror = manifest.mirror('uid', 'disk:/', tmp_path / 'dest')
+        ids = {e.resource.path: e.entry_id for e in mirror.entries()}
+        mirror.assign_names({entry_id: PurePosixPath(path.removeprefix('disk:/')) for path, entry_id in ids.items()})
+        names = mirroring.LocalNames(mirror, mirror.entries())
+
+        began = time.monotonic()
+        for refused in [*(f'disk:/F000/f{n * 100}.txt' for n in range(10)), 'disk:/F001']:
+            names.rename(ids[refused], names.conversion(ids[refused]))
+        elapsed = time.monotonic() - began
+        recorded = {e.entry_id: e.local_path for e in mirror.entries()}
+
+    assert elapsed < 1
+    assert names[ids['disk:/F000/f100.txt']] == PurePosixPath(f'F000/f100~{_hex("f100.txt")}.txt')
+    assert names[ids['disk:/F001/f1.txt']] == PurePosixPath(f'F001~{_hex("F001")}/f1.txt')
+    assert all(names[entry_id] == recorded[entry_id] for entry_id in ids.values())
+
 
 @pytest.fixture
 def removed_dest(dest):
@@ -378,21 +451,16 @@ def removed_dest(dest):
     shutil.rmtree(dest)
 
 
-def test_a_path_longer_than_path_max_fails_without_a_conversion(disk, removed_dest, monkeypatch):
+def test_a_path_deeper_than_path_max_is_mirrored(disk, removed_dest):
     dest = removed_dest
     folders = '/'.join(f'{level:02}' + 'd' * 248 for level in range(17))
     disk.add_file(f'disk:/Deep/{folders}/deep.txt', b'deep')
-    seen = _refuse_names(monkeypatch, lambda name: name == 'deep.txt', code=errno.ENAMETOOLONG)
 
     result = _download('disk:/Deep', str(dest))
 
-    assert result.exit_code == 1
+    assert result.exit_code == 0, result.output
     assert len(os.fsencode(dest / folders / 'deep.txt')) > os.pathconf(dest, 'PC_PATH_MAX')
-    assert (
-        f'  disk:/Deep/{folders}/deep.txt: the local path is longer than the destination filesystem allows '
-        f'({os.strerror(errno.ENAMETOOLONG)})\n'
-    ) in result.stdout
-    assert [name for name in seen if name.startswith('deep')] == ['deep.txt']
+    assert f'Mirrored disk:/Deep to {dest}: 1 downloaded (4 B), 0 skipped, 0 failed\n' in result.stdout
 
 
 def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
@@ -899,37 +967,119 @@ def test_a_filesystem_without_the_no_replace_rename_stops_the_run_before_any_dow
     assert sorted(p.name for p in dest.iterdir()) == ['.yandex-disk-rescue']
 
 
+@pytest.mark.parametrize('code', [errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS], ids=errno.errorcode.get)
+def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, dest, monkeypatch, code):
+    rename_noreplace = localfs.rename_noreplace
+
+    def failing(src, dst, *, src_dir_fd, dst_dir_fd):
+        if dst == 'top.txt':
+            raise OSError(code, os.strerror(code), dst)
+        rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
+
+    monkeypatch.setattr(localfs, 'rename_noreplace', failing)
+    result = _download(str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {dest / "top.txt"}: {os.strerror(code)}.\n'
+    assert 'Mirrored' not in result.stdout
+    assert _others_verified(dest, 'disk:/top.txt')
+    assert not (dest / 'top.txt').exists()
+
+    monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
+    rerun = _download(str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert f'Mirrored disk:/ to {dest}: 1 downloaded (0 B), 5 skipped, 0 failed\n' in rerun.stdout
+
+
+def _refuse_utime(monkeypatch, code: int, *, partial: bool) -> None:
+    """Make setting the times of an open file fail with `code`: of a partial file, or of every other file."""
+    utime = os.utime
+
+    def refusing(target, *args, **kwargs):
+        if isinstance(target, int):
+            opened = os.readlink(f'/proc/self/fd/{target}')
+            if ('/.yandex-disk-rescue/partial/' in opened) == partial:
+                raise OSError(code, os.strerror(code))
+        utime(target, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'utime', refusing)
+
+
+@pytest.mark.parametrize('code', [errno.EACCES, errno.EPERM], ids=errno.errorcode.get)
+def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monkeypatch, code):
+    _refuse_utime(monkeypatch, code, partial=True)
+
+    result = _download(str(dest))
+
+    assert result.exit_code == 1
+    [partial] = _partials(dest)
+    assert result.stderr == f'Error: Could not write {partial}: {os.strerror(code)}.\n'
+    assert 'Mirrored' not in result.stdout
+
+
+_AS_ROOT = pytest.mark.skipif(os.geteuid() == 0, reason='file permissions do not refuse root')
+
+
+@pytest.mark.parametrize(
+    'obstacle',
+    ['mtime-not-permitted', pytest.param('unreadable', marks=_AS_ROOT), pytest.param('untraversable', marks=_AS_ROOT)],
+)
+def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, dest, monkeypatch, obstacle):
+    readme, local = 'disk:/Docs/readme.txt', dest / 'Docs' / 'readme.txt'
+    blocked = dest / 'Photos' / '2024'
+    if obstacle == 'untraversable':
+        assert _download(str(dest)).exit_code == 0
+        blocked.chmod(0o600)
+        denied = os.strerror(errno.EACCES)
+        failed = [
+            (f'disk:/Photos/2024/{name}', f'could not read Photos/2024/{name}: {denied}') for name in ('a.jpg', 'b.jpg')
+        ]
+    else:
+        local.parent.mkdir(parents=True)
+        local.write_bytes(FILES[readme])
+        if obstacle == 'unreadable':
+            local.chmod(0)
+            failed = [(readme, f'could not read Docs/readme.txt: {os.strerror(errno.EACCES)}')]
+        else:
+            _refuse_utime(monkeypatch, errno.EPERM, partial=False)
+            failed = [(readme, f'could not set the modification time of Docs/readme.txt: {os.strerror(errno.EPERM)}')]
+    try:
+        result = _download(str(dest))
+    finally:
+        if obstacle == 'untraversable':
+            blocked.chmod(0o755)
+        else:
+            local.chmod(0o644)
+
+    assert result.exit_code == 1
+    listed = ''.join(f'  {path}: {reason}\n' for path, reason in failed)
+    assert f', {len(failed)} failed\n' in result.stdout
+    assert f'Failed: {len(failed)}\n{listed}' in result.stdout
+    assert result.stderr == f'Error: {len(failed)} failed; see the list above.\n'
+    assert _others_verified(dest, failed='')
+    assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+    if obstacle != 'untraversable':
+        assert local.stat().st_mtime_ns != _mtime_ns(MODIFIED)
+
+
 def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(disk, dest):
     path = 'disk:/Photos/2024/a.jpg'
-    disk.inject('GET', '/download', Delay(2), Delay(2), where={'path': path})
+    disk.inject('GET', '/download', STALL, STALL, where={'path': path})
 
-    result = _download('--download-timeout', '1', '--download-passes', '1', str(dest))
+    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', str(dest))
 
     assert result.exit_code == 1
     assert 'Passes: 1 of 1\n' in result.stdout
-    assert f'Failed: 1\n  {path}: the download stalled: no data for 1 s\n' in result.stdout
+    assert f'Failed: 1\n  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' in result.stdout
     assert _fetches(disk, path) == [None]
     assert _others_verified(dest, path)
 
 
-def test_a_slow_but_steady_download_never_stalls(disk, dest):
-    content = random.Random(5).randbytes(4 * 64 * 1024 + 1)
-    disk.add_file('disk:/Slow/slow.bin', content)
-    disk.chunk_delay = 0.4
-
-    began = time.monotonic()
-    result = _download('--download-timeout', '1', 'disk:/Slow', str(dest))
-
-    assert result.exit_code == 0, result.output
-    assert time.monotonic() - began > 1.5
-    assert (dest / 'slow.bin').read_bytes() == content
-    assert _fetches(disk, 'disk:/Slow/slow.bin') == [None]
-
-
 def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, dest):
-    big.inject('GET', '/download', Truncate(after_bytes=300_000), Delay(2), where={'path': BIG_PATH})
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), STALL, where={'path': BIG_PATH})
 
-    result = _download('--download-timeout', '1', 'disk:/Big', str(dest))
+    result = _download('--download-timeout', STALL_TIMEOUT, 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (
@@ -942,13 +1092,15 @@ def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, d
 
 
 def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succeed(big, dest):
-    big.inject('GET', '/download', Delay(2), Delay(2), where={'path': BIG_PATH})
+    big.inject('GET', '/download', STALL, STALL, where={'path': BIG_PATH})
 
-    result = _download('--download-timeout', '1', '--download-passes', '2', str(dest))
+    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '2', str(dest))
 
     assert result.exit_code == 1
     assert ', 1 failed\nPasses: 2 of 2\n' in result.stdout
-    assert f'Failed: 1\n  {BIG_PATH}: the download stalled: no data for 1 s (after 2 passes)\n' in result.stdout
+    assert (
+        f'Failed: 1\n  {BIG_PATH}: the download stalled: no data for {STALL_TIMEOUT} s (after 2 passes)\n'
+    ) in result.stdout
     assert _fetches(big, BIG_PATH) == [None, None]
     assert _others_verified(dest, BIG_PATH)
 
@@ -1042,7 +1194,10 @@ def test_an_expired_link_is_refreshed_once(big, dest, expiries):
 
 @pytest.mark.parametrize('ignore_range', [False, True], ids=['ranged', 'range-ignored'])
 def test_a_partial_file_is_resumed_by_the_next_run_once_the_cloud_file_is_confirmed(big, dest, ignore_range):
-    _leave_partial(big, dest)
+    partials = _leave_partial(big, dest).parent
+    (partials / '987654321').write_bytes(b'no entry has this id')
+    (partials / 'notes').write_bytes(b'not an entry id')
+    (partials / 'a folder').mkdir()
     big.ignore_range = ignore_range
     earlier = len(big.requests)
 
@@ -1053,7 +1208,7 @@ def test_a_partial_file_is_resumed_by_the_next_run_once_the_cloud_file_is_confir
     lookups = [r for r in big.requests[earlier:] if r.path == '/v1/disk/resources' and r.params['path'] == BIG_PATH]
     assert len(lookups) == 1
     assert _fetches(big, BIG_PATH, earlier) == ([_tail(300_000), None] if ignore_range else [_tail(300_000)])
-    assert _partials(dest) == []
+    assert _partials(dest) == [partials / 'a folder']
 
 
 @pytest.mark.parametrize('change', ['rescanned', 'changed', 'removed'])

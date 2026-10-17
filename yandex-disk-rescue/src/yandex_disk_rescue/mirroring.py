@@ -17,10 +17,10 @@ conversion, which is then recorded as its local name.
 """
 
 import asyncio
-import errno
 import hashlib
 import os
 import stat
+from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -28,7 +28,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 
 from yandex_disk_rescue import api
-from yandex_disk_rescue.destination import FATAL_ERRNOS, Destination, DestinationError, PartialFile
+from yandex_disk_rescue.destination import FATAL_ERRNOS, NAME_ERRNOS, Destination, DestinationError, PartialFile
 from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
     DownloadRecord,
@@ -43,7 +43,6 @@ from yandex_disk_rescue.scanning import display_path, listed
 from yandex_disk_rescue.units import format_size
 
 PASS_PAUSE_SECONDS = 5.0
-_NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
 
@@ -102,11 +101,23 @@ class FileOutcome:
 
 
 class LocalNames:
-    """The local path of each entry of a mirror, kept current as names the destination refuses are converted."""
+    """The local path of each entry of a mirror, kept current as names the destination refuses are converted.
+
+    Siblings are indexed by their parent entry (`None` for the destination root), so a conversion and a rename cost
+    the size of one folder and of the renamed subtree, not of the whole mirror.
+    """
 
     def __init__(self, mirror: Mirror, entries: Iterable[MirrorEntry]) -> None:
         self._mirror = mirror
         self._paths = {entry.entry_id: _local_path(entry) for entry in entries}
+        ids = {path: entry_id for entry_id, path in self._paths.items()}
+        self._parents = {entry_id: ids.get(path.parent) for entry_id, path in self._paths.items()}
+        self._children: defaultdict[int | None, list[int]] = defaultdict(list)
+        self._keys: defaultdict[int | None, set[str]] = defaultdict(set)
+        self._keys[None].add(collision_key(WORK_DIR_NAME))
+        for entry_id, parent in self._parents.items():
+            self._children[parent].append(entry_id)
+            self._keys[parent].add(collision_key(self._paths[entry_id].name))
 
     def __getitem__(self, entry_id: int) -> PurePosixPath:
         return self._paths[entry_id]
@@ -115,20 +126,26 @@ class LocalNames:
         """The entry's local path with its last component converted by `rejected_name_conversion`, unique among its
         siblings."""
         local = self._paths[entry_id]
-        taken = {
-            collision_key(p.name) for other, p in self._paths.items() if other != entry_id and p.parent == local.parent
-        }
-        if local.parent == PurePosixPath():
-            taken.add(collision_key(WORK_DIR_NAME))
-        return local.with_name(rejected_name_conversion(local.name, taken))
+        taken = self._keys[self._parents[entry_id]]
+        own = collision_key(local.name)
+        taken.discard(own)
+        try:
+            return local.with_name(rejected_name_conversion(local.name, taken))
+        finally:
+            taken.add(own)
 
     def rename(self, entry_id: int, local: PurePosixPath) -> None:
         """Record `local`, a sibling of the entry's local path, as its local path, moving everything below along."""
         old = self._paths[entry_id]
         self._mirror.rename_local(entry_id, local.name)
-        for other, path in self._paths.items():
-            if path == old or old in path.parents:
-                self._paths[other] = local / path.relative_to(old)
+        taken = self._keys[self._parents[entry_id]]
+        taken.discard(collision_key(old.name))
+        taken.add(collision_key(local.name))
+        below = [entry_id]
+        while below:
+            moved = below.pop()
+            self._paths[moved] = local / self._paths[moved].relative_to(old)
+            below += self._children[moved]
 
 
 class Digest:
@@ -222,7 +239,7 @@ class MirrorRun:
         self, entry: MirrorEntry, local: PurePosixPath, blocked: dict[PurePosixPath, str], report: MirrorReport
     ) -> None:
         try:
-            with _local_errors(self._destination, local):
+            with _local_errors(self._destination, local, 'write'):
                 made, local = _create(entry, local, self._destination.make_folder, self._names, self._destination)
                 if local != entry.local_path:
                     report.renamed.append((entry.resource.path, local))
@@ -329,8 +346,9 @@ async def download_file(
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
-    with _local_errors(destination, local):
-        existing = destination.lstat(local)
+    with _local_errors(destination, local, 'write'):
+        with _local_errors(destination, local, 'read'):
+            existing = destination.lstat(local)
         if existing is not None:
             if reason := _alias(entry, local, existing, mirror, destination):
                 raise FileFailed(reason)
@@ -361,33 +379,30 @@ def _create[T](
     destination: Destination,
 ) -> tuple[T, PurePosixPath]:
     """Run `create(local)`, the call creating the entry's last component; when the destination refuses that name,
-    run it once more with the converted name, record that name and return it with the result.
+    record the converted name, then run it once more with that name and return it with the result.
 
-    Raises `FileFailed` when the converted name is refused too, or when the refusal is a whole path longer than
-    PATH_MAX, which no conversion of one name fixes.
+    The name is recorded first, so a run killed once the entry is created under it finds it there. Raises
+    `FileFailed`, with the original name recorded again, when the converted name is refused too.
     """
     try:
         return create(local), local
     except OSError as exc:
-        if exc.errno not in _NAME_ERRNOS:
+        if exc.errno not in NAME_ERRNOS:
             raise
-        if exc.errno == errno.ENAMETOOLONG and destination.exceeds_path_max(local):
-            raise FileFailed(
-                f'the local path is longer than the destination filesystem allows ({exc.strerror})'
-            ) from None
         refused = exc.strerror
     converted = names.conversion(entry.entry_id)
-    try:
-        result = create(converted)
-    except OSError as exc:
-        if exc.errno not in _NAME_ERRNOS:
-            raise
-        raise FileFailed(
-            f'the destination filesystem refuses the name {local.name} ({refused}), and its converted form '
-            f'{converted.name} too'
-        ) from None
     names.rename(entry.entry_id, converted)
-    return result, converted
+    with _local_errors(destination, converted, 'write'):
+        try:
+            return create(converted), converted
+        except OSError as exc:
+            if exc.errno not in NAME_ERRNOS:
+                raise
+            names.rename(entry.entry_id, local)
+            raise FileFailed(
+                f'the destination filesystem refuses the name {local.name} ({refused}), and its converted form '
+                f'{converted.name} too'
+            ) from None
 
 
 def _adopt(
@@ -403,7 +418,7 @@ def _adopt(
     if not stat.S_ISREG(existing.st_mode) or existing.st_size != identity.size:
         return None
     digest = Digest()
-    with destination.existing_file(local) as file:
+    with _local_errors(destination, local, 'read'), destination.existing_file(local) as file:
         opened = file.stat()
         if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
             return None
@@ -411,7 +426,8 @@ def _adopt(
             digest.update(digest.size, chunk)
         if digest.mismatch(identity) is not None:
             return None
-        file.set_mtime(_mtime_ns(identity.modified))
+        with _local_errors(destination, local, 'set the modification time of'):
+            file.set_mtime(_mtime_ns(identity.modified))
         adopted = file.stat()
     verified_by = _method(identity)
     mirror.record_verified(entry.entry_id, identity, verified_by, adopted)
@@ -596,13 +612,21 @@ def _assign_local_names(mirror: Mirror) -> list[MirrorEntry]:
 
 
 def _is_current(entry: MirrorEntry, destination: Destination) -> bool:
-    """Whether the entry is a file verified for its current identity whose placed copy has the recorded `lstat`."""
+    """Whether the entry is a file verified for its current identity whose placed copy has the recorded `lstat`.
+
+    A placed copy that cannot be looked at is not current: the file's own turn meets the error and reports it.
+    """
     record = entry.download
     if entry.resource.kind != 'file' or record is None or record.state != 'verified':
         return False
     if record.identity != RemoteIdentity.of(entry.resource):
         return False
-    placed = destination.lstat(_local_path(entry))
+    try:
+        placed = destination.lstat(_local_path(entry))
+    except OSError as exc:
+        if exc.errno in FATAL_ERRNOS:
+            raise
+        return False
     return placed is not None and stat.S_ISREG(placed.st_mode) and LocalFingerprint.of(placed) == record.local
 
 
@@ -635,14 +659,15 @@ def _discard(entry: MirrorEntry, mirror: Mirror, destination: Destination) -> No
 
 
 @contextmanager
-def _local_errors(destination: Destination, local: PurePosixPath) -> Iterator[None]:
-    """Turn an `OSError` about `local` into a failure of that entry, or of the run when no entry could escape it."""
+def _local_errors(destination: Destination, local: PurePosixPath, action: str) -> Iterator[None]:
+    """Turn an `OSError` about `local` into a failure of that entry, `could not <action> <local>: <reason>`, or of the
+    run when no entry could escape it."""
     try:
         yield
     except OSError as exc:
         if exc.errno in FATAL_ERRNOS:
             raise DestinationError.of(destination.path / local, exc) from None
-        raise FileFailed(f'could not write {local}: {exc.strerror}') from None
+        raise FileFailed(f'could not {action} {local}: {exc.strerror}') from None
 
 
 @contextmanager

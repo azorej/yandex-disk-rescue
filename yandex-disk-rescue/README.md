@@ -94,9 +94,9 @@ yandex-disk-rescue/
 │   │                 #   name the destination refuses, later passes over transiently failed files, the summary
 │   │                 #   lines
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
-│   │                 #   RENAME_NOREPLACE probe, PATH_MAX, partial files, reading existing files, folder
-│   │                 #   creation, moving aside into the run's `replaced/` folder and placement, never through
-│   │                 #   a link
+│   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
+│   │                 #   aside into the run's `replaced/` folder and placement, never through a link; which
+│   │                 #   errors stop the run
 │   ├── localfs.py    # Name-creating syscalls relative to folder descriptors: open without following links, mkdir,
 │   │                 #   renameat2(RENAME_NOREPLACE) through ctypes
 │   ├── units.py      # format_size — binary-unit byte counts for command output
