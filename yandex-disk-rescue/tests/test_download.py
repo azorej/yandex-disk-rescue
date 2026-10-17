@@ -1,9 +1,11 @@
 """Tests for `yandex-disk-rescue download` against the fake Disk API and download host, into a real `tmp_path`
 destination, with the real manifest in the XDG state directory."""
 
+import asyncio
 import errno
 import fcntl
 import hashlib
+import itertools
 import os
 import random
 import re
@@ -11,20 +13,24 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import threading
 import time
-from collections.abc import Callable
-from contextlib import closing
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager, closing
 from datetime import UTC, datetime, timedelta
 from pathlib import PurePosixPath
 
 import pytest
 from fake_disk_server import Delay, FakeResponse, Truncate
 from typer.testing import CliRunner
-from yandex_disk_rescue import localfs, mirroring
+from yandex_disk_rescue import api, localfs, mirroring
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.destination import Destination, PartialFile
 from yandex_disk_rescue.manifest import Manifest
+from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
 from yandex_disk_rescue.paths import manifest_path
+from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
 runner = CliRunner()
@@ -1305,3 +1311,101 @@ def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_
     assert stderr == 'Interrupted; rerun to continue the download.\n'
     assert len(_fetches(big, BIG_PATH)) == 2
     assert _partial_size(dest) == 300_000
+
+
+FAST_API = api.ApiLimits(interval=0.001, concurrency=7, timeout=5, retries=0, backoff_initial=0.001, backoff_max=0.01)
+
+
+@asynccontextmanager
+async def _mirror_run(fake, root: str, dest) -> AsyncIterator[Callable[[], Awaitable[MirrorReport]]]:
+    """Scan `root` in this event loop, then yield a call running the mirror run of `root` into `dest` here too, with
+    real clients, the real manifest and a real destination."""
+    async with (
+        api.DiskClient(TOKEN, base_url=fake.base_url, limits=FAST_API) as client,
+        api.ContentClient(timeout=5) as content,
+    ):
+        account = await client.account()
+        scan_root = await resolve_scan_root(client, root)
+        with Manifest.open(manifest_path()) as manifest, Destination.open(dest) as destination:
+            await scan_tree(client, manifest, account, scan_root)
+            run = MirrorRun(manifest.mirror(account.uid, scan_root.path, destination.path), destination)
+            yield lambda: run.run(client, content, retries=0, passes=1)
+
+
+async def _until(condition: Callable[[], bool], what: str) -> None:
+    deadline = time.monotonic() + 10
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail(f'never {what}')
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.anyio
+async def test_a_cancelled_run_waits_for_the_write_in_flight_before_closing_the_partial_file(big, dest, monkeypatch):
+    big.chunk_delay = 0.01
+    blocked, release = threading.Event(), threading.Event()
+    written: list[bytes] = []
+    open_after_write: list[os.stat_result] = []
+    write = PartialFile.write
+
+    def blocking_write(partial, offset, chunk):
+        if written:
+            blocked.set()
+            release.wait(5)
+        write(partial, offset, chunk)
+        written.append(chunk)
+        open_after_write.append(os.fstat(partial._fd))
+
+    monkeypatch.setattr(PartialFile, 'write', blocking_write)
+    async with _mirror_run(big, 'disk:/Big', dest) as run:
+        task = asyncio.create_task(run())
+        await _until(blocked.is_set, 'blocked in the second write')
+        task.cancel()
+        await asyncio.sleep(0.3)
+        finished_while_blocked = task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert not finished_while_blocked
+    assert len(written) == 2
+    [partial] = _partials(dest)
+    assert [stat.st_ino for stat in open_after_write] == [partial.stat().st_ino] * 2
+    assert partial.read_bytes() == BIG[: len(written[0]) + len(written[1])]
+
+
+@pytest.mark.anyio
+async def test_the_event_loop_keeps_running_while_a_local_copy_is_hashed(disk, dest, monkeypatch):
+    copy = random.Random(11).randbytes(8 * 1024 * 1024)
+    disk.add_file('disk:/Hash/copy.bin', copy, modified=MODIFIED)
+    dest.mkdir()
+    (dest / 'copy.bin').write_bytes(copy)
+    reads: list[int] = []
+    read = localfs.read
+
+    def slow_read(fd, size, offset):
+        time.sleep(0.05)
+        reads.append(offset)
+        return read(fd, size, offset)
+
+    monkeypatch.setattr(localfs, 'read', slow_read)
+    ticks: list[float] = []
+
+    async def tick() -> None:
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.01)
+
+    async with _mirror_run(disk, 'disk:/Hash', dest) as run:
+        ticker = asyncio.create_task(tick())
+        began = time.monotonic()
+        try:
+            report = await run()
+        finally:
+            ended = time.monotonic()
+            ticker.cancel()
+
+    assert report.adopted == ['disk:/Hash/copy.bin']
+    assert len(reads) > 8
+    wakeups = [began, *ticks, ended]
+    assert max(later - earlier for earlier, later in itertools.pairwise(wakeups)) < 0.2

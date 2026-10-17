@@ -1,11 +1,11 @@
 """`ContentClient`: fetches file bytes from the download host a Disk API download link points to.
 
-It owns no file I/O: bytes go to a `write(offset, chunk)` callback. It never sends the OAuth token, and its
+It owns no file I/O: bytes go to an async `write(offset, chunk)` callback. It never sends the OAuth token, and its
 error reasons never include a link's path or query string, which carry the link's signature.
 """
 
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Self
@@ -74,12 +74,14 @@ class ContentClient:
     ) -> None:
         await self._http.aclose()
 
-    async def fetch(self, href: str, *, start: int, end: int, size: int, write: Callable[[int, bytes], None]) -> None:
-        """Fetch bytes `[start, end)` of a file of `size` bytes, calling `write(offset, chunk)` in offset order.
+    async def fetch(
+        self, href: str, *, start: int, end: int, size: int, write: Callable[[int, bytes], Awaitable[None]]
+    ) -> None:
+        """Fetch bytes `[start, end)` of a file of `size` bytes, awaiting `write(offset, chunk)` in offset order.
 
-        The whole file (`start == 0`, `end == size`) is requested without `Range`, and 200 or the matching 206
-        is accepted; any other range sends `Range: bytes=<start>-<end-1>` and requires that 206. Exceptions
-        from `write` propagate unchanged.
+        Each `write` is awaited before the next chunk is read. The whole file (`start == 0`, `end == size`) is
+        requested without `Range`, and 200 or the matching 206 is accepted; any other range sends
+        `Range: bytes=<start>-<end-1>` and requires that 206. Exceptions from `write` propagate unchanged.
         """
         whole = start == 0 and end == size
         if not whole and not 0 <= start < end <= size:
@@ -125,12 +127,14 @@ def _check_response(response: httpx.Response, *, start: int, end: int, size: int
         raise TransferRefusedError(f'the download host {host} sent Content-Encoding {encoding}')
 
 
-async def _write_body(response: httpx.Response, *, start: int, end: int, write: Callable[[int, bytes], None]) -> None:
+async def _write_body(
+    response: httpx.Response, *, start: int, end: int, write: Callable[[int, bytes], Awaitable[None]]
+) -> None:
     offset = start
     async for chunk in response.aiter_raw():
         if offset + len(chunk) > end:
             raise TooManyBytesError(f'the download host sent more than the {end - start} bytes requested')
-        write(offset, chunk)
+        await write(offset, chunk)
         offset += len(chunk)
     if offset < end:
         raise TransientTransferError(f'the download ended after {offset - start} of {end - start} bytes')

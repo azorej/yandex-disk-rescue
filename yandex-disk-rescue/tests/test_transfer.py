@@ -1,5 +1,6 @@
 """Tests for `ContentClient` against the fake download host, writing into real files."""
 
+import asyncio
 import os
 import random
 import time
@@ -26,7 +27,7 @@ class PartialFile:
         self.offsets: list[int] = []
         self._fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
 
-    def write(self, offset: int, chunk: bytes) -> None:
+    async def write(self, offset: int, chunk: bytes) -> None:
         self.offsets.append(offset)
         os.pwrite(self._fd, chunk, offset)
 
@@ -275,15 +276,35 @@ async def test_a_slow_but_steady_body_never_trips_the_stall_timeout(fake_disk_ap
 
 
 async def test_time_spent_writing_does_not_count_against_the_stall_timeout(fake_disk_api, remote_file, partial):
-    def slow_write(offset: int, chunk: bytes) -> None:
-        time.sleep(0.3)
-        partial.write(offset, chunk)
+    async def slow_write(offset: int, chunk: bytes) -> None:
+        await asyncio.sleep(0.3)
+        await partial.write(offset, chunk)
 
     href = await _link(fake_disk_api)
     async with api.ContentClient(timeout=0.2) as content:
         await content.fetch(href, start=0, end=SIZE, size=SIZE, write=slow_write)
 
     assert partial.read() == CONTENT
+    assert len(partial.offsets) > 1
+
+
+async def test_an_error_from_write_propagates_and_no_further_chunk_is_written(fake_disk_api, remote_file, partial):
+    class DiskFull(Exception):
+        pass
+
+    async def write_once(offset: int, chunk: bytes) -> None:
+        if partial.offsets:
+            raise DiskFull
+        await partial.write(offset, chunk)
+
+    href = await _link(fake_disk_api)
+    async with api.ContentClient(timeout=5) as content:
+        with pytest.raises(DiskFull):
+            await content.fetch(href, start=0, end=SIZE, size=SIZE, write=write_once)
+
+    assert partial.offsets == [0]
+    assert 0 < len(partial.read()) < SIZE
+    assert CONTENT.startswith(partial.read())
 
 
 async def test_an_unreachable_host_is_transient_and_hides_the_link(closed_port_url, partial):

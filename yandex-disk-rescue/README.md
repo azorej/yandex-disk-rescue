@@ -92,14 +92,17 @@ yandex-disk-rescue/
 │   │                 #   hashing with immediate retries after new data and one link refresh, verify, move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or file
 │   │                 #   name the destination refuses, later passes over transiently failed files, the summary
-│   │                 #   lines
+│   │                 #   lines; disk work (hashing, writes, fsync, placement) runs in the run's worker threads,
+│   │                 #   one bounded call at a time, while the manifest and local names stay on the event loop
+│   ├── disk_threads.py # DiskThreads — the run's dedicated worker threads; a cancelled caller waits for its call
+│   │                 #   in flight, so no descriptor is closed under a running call
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
 │   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
 │   │                 #   aside into the run's `replaced/` folder and placement, never through a link; which
 │   │                 #   errors stop the run
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
-│   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; setting the times of
-│   │                 #   an open file
+│   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
+│   │                 #   an open file and setting its times
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest path
@@ -117,9 +120,10 @@ yandex-disk-rescue/
 │       ├── models.py # Parsing of account, resource, folder-page and download-link bodies
 │       ├── remote_paths.py # `disk:/` path normalization
 │       ├── errors.py # The RescueError subclasses of failed API requests
-│       └── transfer.py # ContentClient — fetches byte ranges from the download host into a write callback, with
-│                       #   no token, following redirects, with a stall (silence) timeout; its errors (expired
-│                       #   link, transient, range not honoured, refused, too many bytes) never quote the link
+│       └── transfer.py # ContentClient — fetches byte ranges from the download host into an async write
+│                       #   callback, awaited before the next chunk is read, with no token, following redirects,
+│                       #   with a stall (silence) timeout; its errors (expired link, transient, range not
+│                       #   honoured, refused, too many bytes) never quote the link
 └── tests/
     ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of the migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures
