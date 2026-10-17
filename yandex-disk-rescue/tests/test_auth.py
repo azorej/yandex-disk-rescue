@@ -31,6 +31,30 @@ def test_saved_token_round_trips_from_a_private_file(tmp_path):
     assert [p.name for p in path.parent.iterdir()] == ['token']
 
 
+def test_save_token_narrows_an_existing_config_dir_but_not_its_parents():
+    directory = config_dir()
+    directory.mkdir(parents=True)
+    directory.chmod(0o755)
+    directory.parent.chmod(0o755)
+
+    auth.save_token(TOKEN)
+
+    assert _mode(directory) == 0o700
+    assert _mode(directory.parent) == 0o755
+
+
+def test_save_token_failure_is_a_clean_error_that_leaves_no_temp_file():
+    path = auth.token_path()
+    (path / 'occupied').mkdir(parents=True)
+
+    with pytest.raises(auth.TokenFileError) as excinfo:
+        auth.save_token(TOKEN)
+
+    assert str(excinfo.value) == f'Could not save the token to {path}: Is a directory.'
+    assert [p.name for p in path.parent.iterdir()] == ['token']
+    assert TOKEN not in str(excinfo.value)
+
+
 def test_save_token_overwrites_the_previous_token():
     auth.save_token('first')
     auth.save_token('second')
@@ -97,6 +121,65 @@ def test_token_file_readable_by_others_is_refused():
 
     assert str(excinfo.value) == f'Token file {path} is accessible by other users; run: chmod 600 {path}'
     assert TOKEN not in str(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ('value', 'defect'),
+    [
+        ('SECRETAAA\nSECRETBBB', 'the token must not contain whitespace.'),
+        ('SECRETöx', 'the token must contain only printable ASCII characters.'),
+        ('SECRET\x07x', 'the token must contain only printable ASCII characters.'),
+    ],
+)
+@pytest.mark.parametrize('source', ['env', 'file'])
+def test_status_refuses_a_malformed_token_naming_the_source_not_the_value(
+    monkeypatch, fake_disk_api, source, value, defect
+):
+    if source == 'env':
+        monkeypatch.setenv(auth.TOKEN_ENV_VAR, value)
+        expected = f'Error: YANDEX_DISK_RESCUE_TOKEN is not a valid token: {defect}\n'
+    else:
+        path = auth.save_token(TOKEN)
+        path.write_text(f'{value}\n')
+        expected = f'Error: Token file {path} does not hold a valid token: {defect}\n'
+
+    result = runner.invoke(app, ['auth', 'status'])
+
+    assert result.exit_code == 1
+    assert result.stderr == expected
+    assert 'SECRET' not in result.output
+    assert fake_disk_api.requests == []
+
+
+def test_status_refuses_a_token_file_that_is_not_utf8(fake_disk_api):
+    path = auth.save_token(TOKEN)
+    path.write_bytes(b'SEC\xffRET\n')
+
+    result = runner.invoke(app, ['auth', 'status'])
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Token file {path} is not valid UTF-8 text.\n'
+    assert fake_disk_api.requests == []
+
+
+def test_status_refuses_a_token_path_that_is_a_directory(fake_disk_api):
+    path = auth.token_path()
+    path.mkdir(parents=True, mode=0o700)
+
+    result = runner.invoke(app, ['auth', 'status'])
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Token file {path} is not a regular file.\n'
+    assert fake_disk_api.requests == []
+
+
+@pytest.mark.parametrize('token', ['SECRETAAA\nSECRETBBB', 'SECRETöx'])
+def test_fetch_account_refuses_a_token_unfit_for_a_header_before_any_request(fake_disk_api, token):
+    with pytest.raises(auth.InvalidTokenError) as excinfo:
+        auth.fetch_account(token)
+
+    assert 'SECRET' not in str(excinfo.value)
+    assert fake_disk_api.requests == []
 
 
 @pytest.mark.parametrize('source', ['file', 'env'])

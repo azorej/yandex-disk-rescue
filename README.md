@@ -77,9 +77,15 @@ The tool looks for the token in this order:
    the stored file.
 2. The token file `$XDG_CONFIG_HOME/yandex-disk-rescue/token`
    (`~/.config/yandex-disk-rescue/token` when `XDG_CONFIG_HOME` is unset or
-   not an absolute path). The file is mode `0600` inside a `0700`
-   directory. A token file readable by group or others is refused, as ssh
-   does; fix it with `chmod 600 <file>`.
+   not an absolute path). `auth login` writes it as mode `0600` and sets
+   the `yandex-disk-rescue` directory to `0700`. A token file readable by
+   group or others is refused, as ssh does; fix it with `chmod 600 <file>`.
+   A path that is not a regular file or a file that is not UTF-8 text is
+   refused too.
+
+Surrounding whitespace is stripped from either source. A token that still
+contains whitespace or anything but printable ASCII is refused with an error
+naming its source.
 
 The token is never accepted as a command-line argument (it would show in
 `ps` and shell history), and the tool never prints it.
@@ -95,7 +101,7 @@ Disk usage: 1.5 GiB of 10.0 GiB used (15.0%)
 ```
 
 It exits `0` when Yandex accepts the token and `1` otherwise (no token, a
-token Yandex rejects, an unreachable API or an unexpected response), with an
+malformed or unreadable token, a token Yandex rejects, an unreachable API or an unexpected response), with an
 `Error: ...` line on stderr. Every command reports such failures the same
 way; usage errors exit `2`.
 

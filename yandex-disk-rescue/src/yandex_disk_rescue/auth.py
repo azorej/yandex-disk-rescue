@@ -40,6 +40,10 @@ class TokenRejectedError(RescueError):
     pass
 
 
+class TokenFileError(RescueError):
+    pass
+
+
 class DiskApiError(RescueError):
     pass
 
@@ -96,29 +100,53 @@ def token_path() -> Path:
 def resolve_token() -> Token:
     """Return the token from the environment variable, else from the token file.
 
-    Raises `NoTokenError` when neither provides one (a set-but-blank variable is an error, not a
-    fallback to the file) and `InsecureTokenFileError` when the file is readable by group or others.
+    The value is stripped and must be usable in an HTTP header. Raises `NoTokenError` when neither
+    provides one (a set-but-blank variable is an error, not a fallback to the file), `InvalidTokenError`
+    when the value has whitespace or non-printable-ASCII characters (the message names the source, never
+    the value), `InsecureTokenFileError` when the file is readable by group or others, and
+    `TokenFileError` when the path is not a regular file or cannot be read.
     """
     env_value = os.environ.get(TOKEN_ENV_VAR)
     if env_value is not None:
         if not env_value.strip():
             raise NoTokenError(f'{TOKEN_ENV_VAR} is set but empty. Unset it or set it to a Yandex OAuth token.')
+        if defect := _token_defect(env_value.strip()):
+            raise InvalidTokenError(f'{TOKEN_ENV_VAR} is not a valid token: the token {defect}.')
         return Token(value=env_value.strip(), source=TokenSource.ENV)
 
     path = token_path()
+    value = _read_token_file(path)
+    if not value:
+        raise NoTokenError(f"Token file {path} is empty. Run 'yandex-disk-rescue auth login' or set {TOKEN_ENV_VAR}.")
+    if defect := _token_defect(value):
+        raise InvalidTokenError(f'Token file {path} does not hold a valid token: the token {defect}.')
+    return Token(value=value, source=TokenSource.FILE)
+
+
+def _read_token_file(path: Path) -> str:
+    # O_NONBLOCK keeps a FIFO at the token path from blocking the open; it has no effect on a regular file.
     try:
-        fd = os.open(path, os.O_RDONLY)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         raise NoTokenError(
             f"No Yandex OAuth token. Run 'yandex-disk-rescue auth login' or set {TOKEN_ENV_VAR}."
         ) from None
+    except OSError as exc:
+        raise TokenFileError(f'Cannot read token file {path}: {exc.strerror}.') from None
+    mode = os.fstat(fd).st_mode
+    if not stat.S_ISREG(mode):
+        os.close(fd)
+        raise TokenFileError(f'Token file {path} is not a regular file.')
+    if stat.S_IMODE(mode) & 0o077:
+        os.close(fd)
+        raise InsecureTokenFileError(f'Token file {path} is accessible by other users; run: chmod 600 {path}')
     with os.fdopen(fd, encoding='utf-8') as token_file:
-        if stat.S_IMODE(os.fstat(token_file.fileno()).st_mode) & 0o077:
-            raise InsecureTokenFileError(f'Token file {path} is accessible by other users; run: chmod 600 {path}')
-        value = token_file.read().strip()
-    if not value:
-        raise NoTokenError(f"Token file {path} is empty. Run 'yandex-disk-rescue auth login' or set {TOKEN_ENV_VAR}.")
-    return Token(value=value, source=TokenSource.FILE)
+        try:
+            return token_file.read().strip()
+        except UnicodeDecodeError:
+            raise InvalidTokenError(f'Token file {path} is not valid UTF-8 text.') from None
+        except OSError as exc:
+            raise TokenFileError(f'Cannot read token file {path}: {exc.strerror}.') from None
 
 
 def get_token() -> str:
@@ -128,34 +156,51 @@ def get_token() -> str:
 def save_token(value: str) -> Path:
     """Store the token atomically as a 0600 file in a 0700 config directory and return its path.
 
-    Raises `InvalidTokenError` for an empty value, internal whitespace or non-ASCII characters.
+    An existing config directory is narrowed to 0700; its parents are left as they are. Raises
+    `InvalidTokenError` for an empty value, internal whitespace or non-ASCII characters and
+    `TokenFileError` when the directory or file cannot be written; no temporary file is left behind.
     """
     token = _validated_token(value)
     path = token_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
+        _write_atomically(path, token + '\n')
+        _fsync_dir(path.parent)
+    except OSError as exc:
+        raise TokenFileError(f'Could not save the token to {path}: {exc.strerror}.') from None
+    return path
+
+
+def _write_atomically(path: Path, content: str) -> None:
     # mkstemp creates the file with mode 0600, so the token is never on disk with wider permissions.
     fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix='.token-')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as tmp_file:
-            tmp_file.write(token + '\n')
+            tmp_file.write(content)
             tmp_file.flush()
             os.fsync(tmp_file.fileno())
         os.replace(tmp_name, path)
     except BaseException:
         Path(tmp_name).unlink(missing_ok=True)
         raise
-    _fsync_dir(path.parent)
-    return path
+
+
+def _token_defect(token: str) -> str | None:
+    """Return why a stripped token cannot be sent in an `Authorization` header, as a predicate for "the token …"."""
+    if not token:
+        return 'is empty'
+    if any(char.isspace() for char in token):
+        return 'must not contain whitespace'
+    if not (token.isascii() and token.isprintable()):
+        return 'must contain only printable ASCII characters'
+    return None
 
 
 def _validated_token(value: str) -> str:
     token = value.strip()
-    if not token:
-        raise InvalidTokenError('The token is empty.')
-    if any(char.isspace() for char in token):
-        raise InvalidTokenError('The token must not contain whitespace.')
-    if not (token.isascii() and token.isprintable()):
-        raise InvalidTokenError('The token must contain only printable ASCII characters.')
+    if defect := _token_defect(token):
+        raise InvalidTokenError(f'The token {defect}.')
     return token
 
 
@@ -175,18 +220,20 @@ def api_base_url() -> str:
 def fetch_account(token: str) -> Account:
     """Return the account the token belongs to, with one `GET /v1/disk/` and no retries.
 
-    Raises `TokenRejectedError` on HTTP 401/403 and `DiskApiError` on any other failure: another
-    non-2xx status, a transport error, or a success body without a valid login and space counters.
+    Raises `InvalidTokenError` before any request when the token cannot be sent in a header,
+    `TokenRejectedError` on HTTP 401/403 and `DiskApiError` on any other failure: another non-2xx
+    status, a transport error, or a success body without a valid login and space counters.
     """
+    header_token = _validated_token(token)
     base_url = api_base_url()
     try:
         response = httpx.get(
             f'{base_url.rstrip("/")}/v1/disk/',
-            headers={'Authorization': f'OAuth {token}'},
+            headers={'Authorization': f'OAuth {header_token}'},
             timeout=API_TIMEOUT_SECONDS,
         )
     except httpx.TransportError as exc:
-        raise DiskApiError(f'Could not reach the Yandex Disk API at {base_url}: {exc}') from None
+        raise DiskApiError(f'Could not reach the Yandex Disk API at {base_url}: {_transport_failure(exc)}') from None
     if response.status_code == httpx.codes.UNAUTHORIZED:
         raise TokenRejectedError(
             'Yandex rejected the token (invalid, expired or revoked). '
@@ -200,6 +247,19 @@ def fetch_account(token: str) -> Account:
     if not response.is_success:
         raise DiskApiError(f'Yandex Disk API returned HTTP {response.status_code}: {_error_description(response)}')
     return _parse_account(response.content)
+
+
+def _transport_failure(exc: httpx.TransportError) -> str:
+    """Describe a transport error without echoing the request, whose headers carry the token.
+
+    Only errors raised by the connection, the server or the URL scheme keep their text; anything else
+    (such as httpx refusing to build the request) is reported by its type alone.
+    """
+    if isinstance(
+        exc, httpx.NetworkError | httpx.TimeoutException | httpx.RemoteProtocolError | httpx.UnsupportedProtocol
+    ):
+        return str(exc)
+    return f'the request could not be sent ({type(exc).__name__})'
 
 
 def _error_description(response: httpx.Response) -> str:
