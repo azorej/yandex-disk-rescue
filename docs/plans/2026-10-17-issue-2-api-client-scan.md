@@ -551,6 +551,34 @@ Error message rule (keeps #1's texts byte for byte):
     environment variable table.
   - `.env.example`: add a commented `YANDEX_DISK_RESCUE_CONFIG` entry.
 
+### Stage 6: A folder deleted during the scan is recorded as removed (added by main)
+
+User decision (2026-10-17, option b): a long walk of a 2 TiB account must not be thrown
+away because one folder vanished on the Disk mid-scan.
+
+- **Contract:**
+  - When listing a folder *below* the scan root returns 404 (`RemotePathNotFoundError`),
+    including a 404 on a later page of that folder, the walk does not fail. That folder
+    contributes no rows from this scan: rows already staged for it or its subtree are
+    discarded, so the commit records it, and everything under it, as removed (or absent
+    on a first scan).
+  - The summary gains a line `Folders that disappeared during the scan: N`, listing up
+    to 20 paths, then `… and N more`, following the existing list cap. Exit code stays 0.
+  - A 404 on the scan root itself, a 404 on `GET /v1/disk/`, and every other error keep
+    failing the scan as before.
+  - The manifest guarantee is unchanged: what is committed is a completed scan.
+- **Behaviour to lock:** `tests/test_scan.py`:
+  - After a first scan, a folder (with a nested sub-folder and files) is made to answer
+    404 when listed (`inject` with `where`, or `remove` from the tree after the parent
+    page was served). The rescan exits 0, lists that folder under the new line, and its
+    files appear as `-` removed. The manifest no longer holds them.
+  - A 404 on a later page of a folder (`page_cap` small) discards that folder's partial
+    rows too.
+  - `scan disk:/missing` still exits 1 (the root rule).
+- **Deliverable:** vanished sub-folders are tolerated and reported.
+- **Validation:** `mise run check`; `mise run test -- yandex-disk-rescue/tests/test_scan.py`.
+- **Doc updates:** root `README.md` "Scanning a folder": one sentence on vanished folders.
+
 ## Manual verification (main runs this with the user; not in CI)
 
 With a real token (`auth login`, or `YANDEX_DISK_RESCUE_TOKEN` from the user's `.env`):
