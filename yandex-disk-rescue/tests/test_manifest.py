@@ -145,6 +145,31 @@ def test_scanning_a_folder_leaves_its_siblings_and_other_accounts_alone(tmp_path
     assert [r.path for r in _entries(db, uid='2')] == ['disk:/A/other-account']
 
 
+def test_a_discarded_subtree_is_left_out_of_the_commit(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    _scan(db, [_dir('disk:/A'), _file('disk:/A/x'), _dir('disk:/A/B'), _file('disk:/A/B/y'), _file('disk:/AB')])
+
+    with Manifest.open(db) as manifest:
+        session = manifest.begin_scan(UID, 'disk:/')
+        session.add([_dir('disk:/A'), _file('disk:/A/x'), _dir('disk:/A/B'), _file('disk:/AB'), _file('disk:/A0')])
+        session.add([_file('disk:/A/B/y'), _file('disk:/A/B/z')])
+        session.discard('disk:/A/B')
+        assert [r.path for r in session.staged()] == ['disk:/A', 'disk:/A/x', 'disk:/A0', 'disk:/AB']
+        session.discard('disk:/A')
+        assert [r.path for r in session.staged()] == ['disk:/A0', 'disk:/AB']
+        diff = session.commit()
+
+    assert (diff.added, diff.removed) == (['disk:/A0'], ['disk:/A', 'disk:/A/B', 'disk:/A/B/y', 'disk:/A/x'])
+    assert [r.path for r in _entries(db)] == ['disk:/A0', 'disk:/AB']
+
+
+def test_discarding_outside_the_scan_root_is_refused(tmp_path):
+    with Manifest.open(tmp_path / 'manifest.sqlite3') as manifest:
+        session = manifest.begin_scan(UID, 'disk:/A')
+        with pytest.raises(ValueError, match='outside the scan root'):
+            session.discard('disk:/AB')
+
+
 def test_first_scan_is_per_subtree(tmp_path):
     db = tmp_path / 'manifest.sqlite3'
     _scan(db, [_file('disk:/A/x')], root='disk:/A')

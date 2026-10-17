@@ -72,6 +72,7 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
 SCHEMA_VERSION = len(_MIGRATIONS)
 
 _COLUMNS = 'path, kind, size, md5, sha256, modified'
+type _Row = tuple[str, Literal['file', 'dir'], int | None, str | None, str | None, str]
 
 
 class ManifestError(RescueError):
@@ -150,10 +151,7 @@ class Manifest:
                 f'SELECT {_COLUMNS} FROM entries e WHERE e.account_uid = :account AND {_SUBTREE} ORDER BY path',
                 _subtree_params(account_uid, root),
             ).fetchall()
-        return iter(
-            Resource(path=path, kind=kind, size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
-            for path, kind, size, md5, sha256, modified in rows
-        )
+        return iter(_resource(row) for row in rows)
 
     @contextmanager
     def _errors(self, action: str) -> Iterator[None]:
@@ -190,6 +188,28 @@ class ScanSession:
             self._manifest._connection.executemany(
                 f'INSERT OR REPLACE INTO staged_entries (session_id, {_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)', rows
             )
+
+    def discard(self, subtree_root: str) -> None:
+        """Unstage every row at `subtree_root` or below, a normalized path within the scan root."""
+        self._check_open()
+        _check_root(subtree_root)
+        if not _in_subtree(subtree_root, self._root):
+            raise ValueError(f'{subtree_root!r} is outside the scan root {self._root!r}')
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                f'DELETE FROM staged_entries AS e WHERE e.session_id = :session AND {_SUBTREE}',
+                {'session': self._id, **_subtree_bounds(subtree_root)},
+            )
+
+    def staged(self) -> Iterator[Resource]:
+        """Yield the staged rows ordered by path, reading them as the iteration goes."""
+        self._check_open()
+        with self._manifest._errors('read'):
+            cursor = self._manifest._connection.execute(
+                f'SELECT {_COLUMNS} FROM staged_entries WHERE session_id = ? ORDER BY path', (self._id,)
+            )
+            for row in cursor:
+                yield _resource(row)
 
     def commit(self) -> ScanDiff:
         """Replace the committed subtree of `root` with the staged rows in one transaction and return the diff."""
@@ -361,9 +381,13 @@ def _check_root(root: str) -> None:
 
 
 def _subtree_params(account_uid: str, root: str) -> dict[str, str]:
+    return {'account': account_uid, **_subtree_bounds(root)}
+
+
+def _subtree_bounds(root: str) -> dict[str, str]:
     prefix = _prefix(root)
     # '0' is the character right after '/', so [prefix, high) holds exactly the strings starting with prefix.
-    return {'account': account_uid, 'root': root, 'low': prefix, 'high': prefix[:-1] + '0'}
+    return {'root': root, 'low': prefix, 'high': prefix[:-1] + '0'}
 
 
 def _prefix(root: str) -> str:
@@ -374,7 +398,12 @@ def _in_subtree(path: str, root: str) -> bool:
     return path == root or path.startswith(_prefix(root))
 
 
-def _row(resource: Resource, root: str) -> tuple[str, Literal['file', 'dir'], int | None, str | None, str | None, str]:
+def _resource(row: _Row) -> Resource:
+    path, kind, size, md5, sha256, modified = row
+    return Resource(path=path, kind=kind, size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
+
+
+def _row(resource: Resource, root: str) -> _Row:
     if not _in_subtree(resource.path, root):
         raise ValueError(f'{resource.path!r} is outside the scan root {root!r}')
     if resource.modified.tzinfo is None:

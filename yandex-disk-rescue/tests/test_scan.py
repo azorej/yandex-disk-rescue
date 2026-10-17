@@ -7,10 +7,11 @@ import time
 from datetime import UTC
 
 import pytest
-from fake_disk_server import Delay
+from fake_disk_server import Delay, FakeResponse
 from typer.testing import CliRunner
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.paths import state_dir
 from yandex_disk_rescue.units import format_size
@@ -244,3 +245,120 @@ def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
     assert rescan.exit_code == 0, rescan.output
     assert '  + disk:/Photos/2024/new.jpg\n' in rescan.stdout
     assert _rows() == _tree_rows(disk)
+
+
+def test_a_folder_deleted_during_the_scan_is_reported_and_recorded_as_removed(disk):
+    assert _scan().exit_code == 0
+    disk.inject('GET', '/v1/disk/resources', 404, where={'path': 'disk:/Photos/2024'})
+
+    result = _scan()
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == (
+        f'Scanned disk:/: 3 files, 3 folders, {format_size(13)}\n'
+        'Files without a cloud checksum: 1\n'
+        '  disk:/Photos/old.bmp\n'
+        'Folders that disappeared during the scan: 1\n'
+        '  disk:/Photos/2024\n'
+        'Changes since the last scan: 0 added, 0 changed, 4 removed\n'
+        '  - disk:/Photos/2024\n'
+        '  - disk:/Photos/2024/a.jpg\n'
+        '  - disk:/Photos/2024/b.jpg\n'
+        '  - disk:/Photos/2024/c.jpg\n'
+        f'Manifest: {_manifest_path()}\n'
+    )
+    disk.remove('disk:/Photos/2024')
+    assert _rows() == _tree_rows(disk)
+
+
+def _add_vanishing_tree(fake) -> None:
+    """`disk:/Gone` lists `Sub` and `a.txt` on its first page (page cap 2) and `b.txt`, `c.txt` on the second."""
+    fake.add_file('disk:/Gone/Sub/Deep/x.txt', b'x')
+    fake.add_file('disk:/Gone/Sub/y.txt', b'y')
+    for name in ('a', 'b', 'c'):
+        fake.add_file(f'disk:/Gone/{name}.txt', name.encode())
+
+
+GONE_SECOND_PAGE = {'path': 'disk:/Gone', 'offset': '2'}
+
+
+def _last_listing(fake, params: dict[str, str]):
+    return [r for r in fake.requests if r.path == '/v1/disk/resources' and params.items() <= r.params.items()][-1]
+
+
+@pytest.mark.parametrize('stage_batch', [1, 1000], ids=['rows-staged', 'rows-buffered'])
+@pytest.mark.parametrize('first_scan', [True, False], ids=['first-scan', 'rescan'])
+def test_a_folder_vanishing_on_a_later_page_discards_the_rows_of_sub_folders_listed_before(
+    disk, monkeypatch, stage_batch, first_scan
+):
+    monkeypatch.setattr(scan_command, '_STAGE_BATCH', stage_batch)
+    _add_vanishing_tree(disk)
+    if not first_scan:
+        assert _scan().exit_code == 0
+    disk.inject('GET', '/v1/disk/resources', Delay(1, then=FakeResponse.error(404)), where=GONE_SECOND_PAGE)
+
+    result = _scan()
+
+    assert result.exit_code == 0, result.output
+    vanished_at = _last_listing(disk, GONE_SECOND_PAGE).started + 1
+    assert _last_listing(disk, {'path': 'disk:/Gone/Sub'}).started < vanished_at
+    assert _last_listing(disk, {'path': 'disk:/Gone/Sub/Deep'}).started < vanished_at
+    assert 'Folders that disappeared during the scan: 1\n  disk:/Gone\n' in result.stdout
+    disk.remove('disk:/Gone')
+    assert _rows() == _tree_rows(disk)
+    if first_scan:
+        assert 'First scan of disk:/\n' in result.stdout
+    else:
+        assert 'Changes since the last scan: 0 added, 0 changed, 8 removed\n  - disk:/Gone\n' in result.stdout
+
+
+def test_a_sub_folder_answering_after_its_parent_vanished_adds_no_rows(disk):
+    _add_vanishing_tree(disk)
+    disk.inject('GET', '/v1/disk/resources', Delay(1), where={'path': 'disk:/Gone/Sub'})
+    disk.inject('GET', '/v1/disk/resources', 404, where=GONE_SECOND_PAGE)
+
+    result = _scan()
+
+    assert result.exit_code == 0, result.output
+    assert 'Folders that disappeared during the scan: 1\n  disk:/Gone\n' in result.stdout
+    assert not any(r.params.get('path') == 'disk:/Gone/Sub/Deep' for r in disk.requests)
+    disk.remove('disk:/Gone')
+    assert _rows() == _tree_rows(disk)
+
+
+def test_a_sub_folder_queued_when_its_parent_vanished_is_never_listed(disk):
+    _add_vanishing_tree(disk)
+    disk.inject('GET', '/v1/disk/resources', 404, where=GONE_SECOND_PAGE)
+
+    result = _scan('--api-concurrency', '1')
+
+    assert result.exit_code == 0, result.output
+    assert 'Folders that disappeared during the scan: 1\n  disk:/Gone\n' in result.stdout
+    assert not any(r.params.get('path', '').startswith('disk:/Gone/') for r in disk.requests)
+
+
+@pytest.mark.parametrize('sub_first', [True, False], ids=['sub-folder-first', 'parent-first'])
+def test_a_vanished_sub_folder_is_reported_once_under_its_vanished_parent(disk, sub_first):
+    _add_vanishing_tree(disk)
+    vanish_later = Delay(1, then=FakeResponse.error(404))
+    sub, gone_page = (404, vanish_later) if sub_first else (vanish_later, 404)
+    disk.inject('GET', '/v1/disk/resources', sub, where={'path': 'disk:/Gone/Sub'})
+    disk.inject('GET', '/v1/disk/resources', gone_page, where=GONE_SECOND_PAGE)
+
+    result = _scan()
+
+    assert result.exit_code == 0, result.output
+    assert 'Folders that disappeared during the scan: 1\n  disk:/Gone\nFirst scan' in result.stdout
+    disk.remove('disk:/Gone')
+    assert _rows() == _tree_rows(disk)
+
+
+def test_the_scanned_folder_itself_vanishing_fails_the_scan(disk):
+    assert _scan().exit_code == 0
+    previous = _rows()
+    disk.inject('GET', '/v1/disk/resources', 404, where={'path': 'disk:/Photos', 'offset': '0'})
+
+    result = _scan('disk:/Photos')
+
+    assert (result.exit_code, result.stderr) == (1, "Error: Remote path 'disk:/Photos' does not exist.\n")
+    assert _rows() == previous

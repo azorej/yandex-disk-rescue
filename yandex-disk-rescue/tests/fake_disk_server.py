@@ -41,9 +41,13 @@ class FakeResponse:
 
 @dataclass(frozen=True)
 class Delay:
-    """A fault that waits `seconds` and then lets the request be answered normally."""
+    """A fault that waits `seconds`, then answers with `then`, or normally when `then` is None.
+
+    The normal answer is computed after the wait, so it reflects tree changes made meanwhile.
+    """
 
     seconds: float
+    then: FakeResponse | None = None
 
 
 @dataclass(frozen=True)
@@ -192,6 +196,8 @@ class FakeDiskApi:
             return fault
         if isinstance(fault, Delay):
             time.sleep(fault.seconds)
+            if fault.then is not None:
+                return fault.then
         if self.token is not None and request.headers.get('authorization') != f'OAuth {self.token}':
             return FakeResponse.json(401, {'error': 'UnauthorizedError', 'description': 'Unauthorized'})
         if routed := self.routes.get((request.method, request.path)):

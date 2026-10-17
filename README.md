@@ -146,6 +146,11 @@ they cannot be verified after download. The first scan of a folder prints
 changed when its kind, size, checksums or modification time differ. Each
 list of paths shows at most 20 entries, then `… and N more`.
 
+A folder deleted on the Disk while the scan runs does not stop it: the
+summary lists it under `Folders that disappeared during the scan: N`, and the
+manifest records that folder and everything under it as removed. Only the
+scanned folder itself disappearing fails the scan.
+
 The manifest only ever holds completed scans: a scan that fails or is
 interrupted (Ctrl+C, a kill, a crash) leaves the previous scan in place, and
 the next run scans again from the start. Scanning a folder replaces only
