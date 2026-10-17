@@ -1,6 +1,7 @@
 """Command-line entry point for yandex-disk-rescue."""
 
 import os
+import re
 from typing import Annotated, Any
 
 import typer
@@ -31,6 +32,7 @@ auth_app = typer.Typer(help='Manage the Yandex OAuth token.', no_args_is_help=Tr
 app.add_typer(auth_app, name='auth')
 
 REVOKE_URL = 'https://id.yandex.com/personal/data-access'
+CLIENT_ID_PATTERN = re.compile(r'[0-9a-f]{32}')
 
 
 def _print_version(value: bool) -> None:
@@ -47,6 +49,37 @@ def main(
     ] = False,
 ) -> None:
     """Download everything from a Yandex Disk account: resumable, verified, rate-limit aware."""
+
+
+def _validate_client_id(value: str) -> str:
+    if not CLIENT_ID_PATTERN.fullmatch(value):
+        raise typer.BadParameter('must be 32 lowercase hexadecimal characters (the ClientID of a Yandex OAuth app).')
+    return value
+
+
+@auth_app.command()
+def login(
+    client_id: Annotated[
+        str,
+        typer.Option(
+            envvar=auth.CLIENT_ID_ENV_VAR,
+            callback=_validate_client_id,
+            help='ClientID of the Yandex OAuth app to authorize; the default is the built-in app.',
+        ),
+    ] = auth.DEFAULT_CLIENT_ID,
+) -> None:
+    """Get a token in the browser, check it against the Disk API and store it."""
+    typer.echo('Open this URL in a browser, sign in to Yandex and allow access:', err=True)
+    typer.echo('', err=True)
+    typer.echo(f'  {auth.authorize_url(client_id)}', err=True)
+    typer.echo('', err=True)
+    typer.echo('Yandex then shows a token. Copy it (or the whole address-bar URL) and paste it here.', err=True)
+    token = auth.token_from_paste(typer.prompt('Paste the token', hide_input=True, err=True))
+    account = auth.fetch_account(token)
+    path = auth.save_token(token)
+    typer.echo(f'Logged in as {account.login}. Token saved to {path}.')
+    if auth.TOKEN_ENV_VAR in os.environ:
+        typer.echo(f'Warning: {auth.TOKEN_ENV_VAR} is set and overrides the saved token.', err=True)
 
 
 @auth_app.command()

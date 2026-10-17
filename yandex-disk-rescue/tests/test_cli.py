@@ -3,6 +3,7 @@
 import os
 import subprocess
 
+import pytest
 from typer.testing import CliRunner
 from yandex_disk_rescue import __version__
 from yandex_disk_rescue.cli import app
@@ -27,17 +28,12 @@ def test_installed_console_script_runs():
     assert result.stdout.strip() == f'yandex-disk-rescue {__version__}'
 
 
-def test_auth_help_lists_logout():
+@pytest.mark.parametrize('command', ['login', 'status', 'logout'])
+def test_auth_help_lists_the_commands(command):
     result = runner.invoke(app, ['auth', '--help'])
     assert result.exit_code == 0
     assert 'Manage the Yandex OAuth token.' in result.stdout
-    assert 'logout' in result.stdout
-
-
-def test_auth_help_lists_status():
-    result = runner.invoke(app, ['auth', '--help'])
-    assert result.exit_code == 0
-    assert 'status' in result.stdout
+    assert command in result.stdout
 
 
 def test_console_script_renders_rescue_error_without_traceback(fake_disk_api):

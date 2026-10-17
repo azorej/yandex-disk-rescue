@@ -1,10 +1,11 @@
-"""Storage and resolution of the Yandex OAuth token."""
+"""The Yandex OAuth token: the authorization URL to obtain one, its storage and resolution, and the account check."""
 
 import enum
 import json
 import os
 import stat
 import tempfile
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,6 +18,10 @@ TOKEN_ENV_VAR = 'YANDEX_DISK_RESCUE_TOKEN'
 API_URL_ENV_VAR = 'YANDEX_DISK_RESCUE_API_URL'
 DEFAULT_API_URL = 'https://cloud-api.yandex.net'
 API_TIMEOUT_SECONDS = 30.0
+CLIENT_ID_ENV_VAR = 'YANDEX_DISK_RESCUE_CLIENT_ID'
+DEFAULT_CLIENT_ID = '9e2a0382c430429c9d57913b61d7d48f'
+REQUESTED_SCOPES = ('cloud_api:disk.read', 'cloud_api:disk.info')
+AUTHORIZE_ENDPOINT = 'https://oauth.yandex.ru/authorize'
 
 
 class NoTokenError(RescueError):
@@ -55,6 +60,33 @@ class Account:
     login: str
     total_space: int
     used_space: int
+
+
+def authorize_url(client_id: str) -> str:
+    """Return the Yandex ID implicit-flow URL that shows a token for `client_id` after the user consents.
+
+    Only `REQUESTED_SCOPES` are asked for, so the app must have both rights registered. Yandex expects
+    the scopes space-separated and rejects commas with `invalid_scope`; the space is sent as `%20`.
+    """
+    query = urllib.parse.urlencode(
+        {'response_type': 'token', 'client_id': client_id, 'scope': ' '.join(REQUESTED_SCOPES)},
+        quote_via=urllib.parse.quote,
+    )
+    return f'{AUTHORIZE_ENDPOINT}?{query}'
+
+
+def token_from_paste(pasted: str) -> str:
+    """Return the token from what the user pasted: the bare token or a redirect URL with `access_token=`.
+
+    Raises `InvalidTokenError` when the result is empty or contains whitespace or non-ASCII characters.
+    """
+    text = pasted.strip()
+    if 'access_token=' in text:
+        params = urllib.parse.parse_qs(text[text.index('access_token=') :])
+        if 'access_token' not in params:
+            raise InvalidTokenError('The pasted URL has an empty access_token parameter.')
+        text = params['access_token'][0]
+    return _validated_token(text)
 
 
 def token_path() -> Path:
@@ -96,14 +128,9 @@ def get_token() -> str:
 def save_token(value: str) -> Path:
     """Store the token atomically as a 0600 file in a 0700 config directory and return its path.
 
-    Raises `InvalidTokenError` for an empty value or one with internal whitespace.
+    Raises `InvalidTokenError` for an empty value, internal whitespace or non-ASCII characters.
     """
-    token = value.strip()
-    if not token:
-        raise InvalidTokenError('The token is empty.')
-    if any(char.isspace() for char in token):
-        raise InvalidTokenError('The token must not contain whitespace.')
-
+    token = _validated_token(value)
     path = token_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     # mkstemp creates the file with mode 0600, so the token is never on disk with wider permissions.
@@ -119,6 +146,17 @@ def save_token(value: str) -> Path:
         raise
     _fsync_dir(path.parent)
     return path
+
+
+def _validated_token(value: str) -> str:
+    token = value.strip()
+    if not token:
+        raise InvalidTokenError('The token is empty.')
+    if any(char.isspace() for char in token):
+        raise InvalidTokenError('The token must not contain whitespace.')
+    if not (token.isascii() and token.isprintable()):
+        raise InvalidTokenError('The token must contain only printable ASCII characters.')
+    return token
 
 
 def delete_token() -> bool:

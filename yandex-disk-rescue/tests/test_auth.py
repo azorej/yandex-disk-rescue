@@ -2,6 +2,7 @@
 
 import socket
 import stat
+import urllib.parse
 from pathlib import Path
 
 import pytest
@@ -37,7 +38,7 @@ def test_save_token_overwrites_the_previous_token():
     assert auth.get_token() == 'second'
 
 
-@pytest.mark.parametrize('value', ['', '   \n', 'two words', 'tab\tinside'])
+@pytest.mark.parametrize('value', ['', '   \n', 'two words', 'tab\tinside', 'y0_t\u00f6ken', 'nul\x00byte'])
 def test_save_token_rejects_empty_or_whitespace_values_without_echoing_them(value):
     with pytest.raises(auth.InvalidTokenError) as excinfo:
         auth.save_token(value)
@@ -274,3 +275,147 @@ def test_api_base_url_defaults_to_yandex(monkeypatch):
     assert auth.api_base_url() == 'https://cloud-api.yandex.net'
     monkeypatch.setenv(auth.API_URL_ENV_VAR, 'http://127.0.0.1:1')
     assert auth.api_base_url() == 'http://127.0.0.1:1'
+
+
+def _authorize_url_from(output: str) -> str:
+    [url] = [line.strip() for line in output.splitlines() if line.strip().startswith('https://oauth.yandex.ru/')]
+    return url
+
+
+def test_login_stores_a_verified_token_that_status_then_uses(fake_disk_api):
+    result = runner.invoke(app, ['auth', 'login'], input=f'{TOKEN}\n')
+
+    assert result.exit_code == 0, result.output
+    path = auth.token_path()
+    assert result.stdout.splitlines()[-1] == f'Logged in as rescue.tester. Token saved to {path}.'
+    assert _mode(path) == 0o600
+    assert path.read_text() == f'{TOKEN}\n'
+    assert TOKEN not in result.output
+    assert fake_disk_api.requests[0].headers['authorization'] == f'OAuth {TOKEN}'
+
+    status_result = runner.invoke(app, ['auth', 'status'])
+    assert status_result.exit_code == 0, status_result.output
+    assert 'Account: rescue.tester' in status_result.stdout
+
+
+@pytest.mark.parametrize(
+    ('args', 'env_client_id', 'expected_client_id'),
+    [
+        ([], None, '9e2a0382c430429c9d57913b61d7d48f'),
+        (['--client-id', '0123456789abcdef0123456789abcdef'], None, '0123456789abcdef0123456789abcdef'),
+        ([], 'fedcba9876543210fedcba9876543210', 'fedcba9876543210fedcba9876543210'),
+        (
+            ['--client-id', '0123456789abcdef0123456789abcdef'],
+            'fedcba9876543210fedcba9876543210',
+            '0123456789abcdef0123456789abcdef',
+        ),
+    ],
+)
+def test_login_prints_the_implicit_flow_url_on_stderr(
+    monkeypatch, fake_disk_api, args, env_client_id, expected_client_id
+):
+    if env_client_id is not None:
+        monkeypatch.setenv(auth.CLIENT_ID_ENV_VAR, env_client_id)
+
+    result = runner.invoke(app, ['auth', 'login', *args], input=f'{TOKEN}\n')
+
+    assert result.exit_code == 0, result.output
+    url = _authorize_url_from(result.stderr)
+    parts = urllib.parse.urlsplit(url)
+    assert (parts.scheme, parts.netloc, parts.path) == ('https', 'oauth.yandex.ru', '/authorize')
+    assert urllib.parse.parse_qs(parts.query, strict_parsing=True) == {
+        'response_type': ['token'],
+        'client_id': [expected_client_id],
+        'scope': ['cloud_api:disk.read cloud_api:disk.info'],
+    }
+    assert 'scope=cloud_api%3Adisk.read%20cloud_api%3Adisk.info' in url
+    assert 'https://oauth.yandex.ru/' not in result.stdout
+
+
+@pytest.mark.parametrize(
+    'pasted',
+    [
+        f'https://oauth.yandex.ru/verification_code#access_token={TOKEN}&token_type=bearer&expires_in=31536000',
+        f'  access_token={TOKEN}&token_type=bearer  ',
+    ],
+)
+def test_login_accepts_a_pasted_redirect_url(fake_disk_api, pasted):
+    result = runner.invoke(app, ['auth', 'login'], input=f'{pasted}\n')
+
+    assert result.exit_code == 0, result.output
+    assert auth.token_path().read_text() == f'{TOKEN}\n'
+    assert fake_disk_api.requests[0].headers['authorization'] == f'OAuth {TOKEN}'
+
+
+@pytest.mark.parametrize(
+    ('pasted', 'expected'),
+    [
+        ('   ', 'Error: The token is empty.\n'),
+        ('two words', 'Error: The token must not contain whitespace.\n'),
+        ('y0_t\u00f6ken', 'Error: The token must contain only printable ASCII characters.\n'),
+        (
+            'https://oauth.yandex.ru/verification_code#access_token=&token_type=bearer',
+            'Error: The pasted URL has an empty access_token parameter.\n',
+        ),
+    ],
+)
+def test_login_rejects_an_unusable_paste_before_calling_the_api(fake_disk_api, pasted, expected):
+    result = runner.invoke(app, ['auth', 'login'], input=f'{pasted}\n')
+
+    assert result.exit_code == 1
+    assert result.stderr.endswith(expected)
+    assert fake_disk_api.requests == []
+    assert not auth.token_path().exists()
+
+
+def test_login_with_a_rejected_token_stores_nothing(fake_disk_api):
+    fake_disk_api.route_json('GET', '/v1/disk/', 401, {'error': 'UnauthorizedError', 'description': 'Unauthorized'})
+
+    result = runner.invoke(app, ['auth', 'login'], input=f'{TOKEN}\n')
+
+    assert result.exit_code == 1
+    assert result.stderr.endswith(
+        "Error: Yandex rejected the token (invalid, expired or revoked). Run 'yandex-disk-rescue auth login' to store a new one.\n"
+    )
+    assert 'Logged in' not in result.stdout
+    assert not auth.token_path().exists()
+    assert not config_dir().exists()
+    assert TOKEN not in result.output
+
+
+def test_login_warns_that_the_env_var_overrides_the_saved_token(monkeypatch, fake_disk_api):
+    monkeypatch.setenv(auth.TOKEN_ENV_VAR, 'from-env')
+
+    result = runner.invoke(app, ['auth', 'login'], input=f'{TOKEN}\n')
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr.endswith('Warning: YANDEX_DISK_RESCUE_TOKEN is set and overrides the saved token.\n')
+    assert fake_disk_api.requests[0].headers['authorization'] == f'OAuth {TOKEN}'
+
+
+@pytest.mark.parametrize('source', ['option', 'env'])
+@pytest.mark.parametrize('client_id', ['nothex', '9E2A0382C430429C9D57913B61D7D48F', '9e2a0382c430429c9d57913b61d7d48'])
+def test_login_rejects_a_malformed_client_id_as_a_usage_error(monkeypatch, fake_disk_api, source, client_id):
+    if source == 'option':
+        args = ['--client-id', client_id]
+    else:
+        args = []
+        monkeypatch.setenv(auth.CLIENT_ID_ENV_VAR, client_id)
+
+    result = runner.invoke(app, ['auth', 'login', *args], input=f'{TOKEN}\n')
+
+    assert result.exit_code == 2
+    assert 'must be 32 lowercase hexadecimal characters' in result.stderr
+    assert fake_disk_api.requests == []
+    assert not auth.token_path().exists()
+
+
+@pytest.mark.parametrize('command', [[], ['auth'], ['auth', 'login'], ['auth', 'status'], ['auth', 'logout']])
+def test_help_never_shows_the_token(monkeypatch, command):
+    monkeypatch.setenv(auth.TOKEN_ENV_VAR, TOKEN)
+    auth.save_token(TOKEN)
+
+    result = runner.invoke(app, [*command, '--help'])
+
+    assert result.exit_code == 0, result.output
+    assert TOKEN not in result.output
