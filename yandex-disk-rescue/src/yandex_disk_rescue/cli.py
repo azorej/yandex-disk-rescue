@@ -9,7 +9,7 @@ import typer
 import typer.core
 
 from yandex_disk_rescue import __version__, api, auth, config, settings
-from yandex_disk_rescue.commands import download, scan
+from yandex_disk_rescue.commands import download, scan, verify
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.units import format_size
 
@@ -35,6 +35,7 @@ auth_app = typer.Typer(help='Manage the Yandex OAuth token.', no_args_is_help=Tr
 app.add_typer(auth_app, name='auth')
 app.command()(scan.scan)
 app.command()(download.download)
+app.command()(verify.verify)
 
 REVOKE_URL = 'https://id.yandex.com/personal/data-access'
 

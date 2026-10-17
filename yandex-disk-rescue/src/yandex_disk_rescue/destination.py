@@ -1,5 +1,5 @@
 """The destination folder of a download: its checks, the run lock and work directory, and every file operation inside
-it.
+it; and the read-only view of a destination that `verify` uses.
 
 All operations go through open folder descriptors and `localfs`, so none follows a symbolic link inside the
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
@@ -70,7 +70,113 @@ def check_destination(raw: str) -> Path:
     return path
 
 
-class Destination:
+class _Tree:
+    """The files below an open destination folder, looked up and opened through folder descriptors opened one
+    component at a time without following a link."""
+
+    def __init__(self, path: Path, root_fd: int) -> None:
+        self.path = path
+        self._root_fd = root_fd
+
+    def lstat(self, local: PurePosixPath) -> os.stat_result | None:
+        """The `lstat` of `local`, or `None` when it, or a folder on the way to it, is missing or not a real folder, or
+        when the filesystem refuses its name (`NAME_ERRNOS`), so the call creating it meets the refusal."""
+        try:
+            with self._folder(local.parent) as parent_fd:
+                return _lstat_name(local.name, parent_fd)
+        except OSError as exc:
+            if exc.errno in _MISSING_ERRNOS:
+                return None
+            raise
+
+    @contextmanager
+    def existing_file(self, local: PurePosixPath) -> Iterator[ExistingFile]:
+        """Open the file at `local` for reading without following a link; the caller checks what it opened."""
+        with self._folder(local.parent) as parent_fd:
+            fd = localfs.open_file(local.name, dir_fd=parent_fd)
+        try:
+            yield ExistingFile(fd)
+        finally:
+            os.close(fd)
+
+    @contextmanager
+    def _folder(self, local: PurePosixPath) -> Iterator[int]:
+        """An open descriptor of the folder `local`, every component opened without following a link."""
+        fd = self._root_fd
+        try:
+            for part in local.parts:
+                parent_fd = fd
+                fd = localfs.open_dir(part, dir_fd=parent_fd)
+                if parent_fd != self._root_fd:
+                    os.close(parent_fd)
+            yield fd
+        finally:
+            if fd != self._root_fd:
+                os.close(fd)
+
+
+class ReadOnlyDestination(_Tree):
+    """An existing destination opened for reading only; use `ReadOnlyDestination.open` as a context manager.
+
+    It creates, modifies, moves and deletes nothing in the destination; reading a file may update its access time, as
+    any read does, unless the destination is mounted `ro` or `noatime`. `path` is the resolved destination.
+    """
+
+    def __init__(self, path: Path, root_fd: int, lock_fd: int | None) -> None:
+        super().__init__(path, root_fd)
+        self._lock_fd = lock_fd
+
+    @classmethod
+    def open(cls, path: Path) -> ReadOnlyDestination:
+        """Open the existing folder `path` (or a link to one) and, when its work directory holds a lock file, take the
+        run lock on that file, opened read-only; with no work directory or no lock file no run can be using it.
+
+        Raises `DestinationUsageError` when `path` is not an existing folder, `RescueError` when another run holds the
+        lock, and `DestinationError` when the destination cannot be read.
+        """
+        if not path.is_dir():
+            raise DestinationUsageError(f'Destination {path} is not an existing folder.')
+        fds: list[int] = []
+        try:
+            resolved = path.resolve(strict=True)
+            fds.append(os.open(resolved, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC))
+            lock_fd = _read_lock(fds[0], resolved)
+        except OSError as exc:
+            _close_all(fds)
+            raise DestinationError(f'Could not read {path}: {exc.strerror}.') from None
+        except BaseException:
+            _close_all(fds)
+            raise
+        return cls(resolved, fds[0], lock_fd)
+
+    def reachable(self) -> bool:
+        """Whether the destination itself can still be read: its path `lstat`ed afresh and its folder listed through a
+        new descriptor, so a disk that is gone fails even where open descriptors still answer."""
+        try:
+            os.lstat(self.path)
+            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                with os.scandir(fd) as found:
+                    next(found, None)
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return True
+
+    def close(self) -> None:
+        _close_all([self._root_fd] if self._lock_fd is None else [self._root_fd, self._lock_fd])
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
+    ) -> None:
+        self.close()
+
+
+class Destination(_Tree):
     """An open destination holding its run lock; use `Destination.open` as a context manager.
 
     `path` is the resolved destination. Local paths are relative to it, '/'-separated. Partial files live in
@@ -96,8 +202,7 @@ class Destination:
         *,
         started: datetime,
     ) -> None:
-        self.path = path
-        self._root_fd = root_fd
+        super().__init__(path, root_fd)
         self._work_fd = work_fd
         self._lock_fd = lock_fd
         self._partial_fd = partial_fd
@@ -148,17 +253,6 @@ class Destination:
         self, exc_type: type[BaseException] | None, exc: BaseException | None, traceback: TracebackType | None
     ) -> None:
         self.close()
-
-    def lstat(self, local: PurePosixPath) -> os.stat_result | None:
-        """The `lstat` of `local`, or `None` when it, or a folder on the way to it, is missing or not a real folder, or
-        when the filesystem refuses its name (`NAME_ERRNOS`), so the call creating it meets the refusal."""
-        try:
-            with self._folder(local.parent) as parent_fd:
-                return _lstat_name(local.name, parent_fd)
-        except OSError as exc:
-            if exc.errno in _MISSING_ERRNOS:
-                return None
-            raise
 
     def make_folder(self, local: PurePosixPath) -> bool:
         """Create the folder `local` unless it exists; `False` when something other than a real folder is there.
@@ -217,16 +311,6 @@ class Destination:
             localfs.rename_noreplace(str(entry_id), local.name, src_dir_fd=self._partial_fd, dst_dir_fd=parent_fd)
             os.fsync(parent_fd)
             return localfs.lstat(local.name, dir_fd=parent_fd)
-
-    @contextmanager
-    def existing_file(self, local: PurePosixPath) -> Iterator[ExistingFile]:
-        """Open the file at `local` for reading without following a link; the caller checks what it opened."""
-        with self._folder(local.parent) as parent_fd:
-            fd = localfs.open_file(local.name, dir_fd=parent_fd)
-        try:
-            yield ExistingFile(fd)
-        finally:
-            os.close(fd)
 
     def move_aside(self, local: PurePosixPath) -> None:
         """Move whatever is at `local` (a file, a folder with everything in it, or a link itself, never its target)
@@ -288,21 +372,6 @@ class Destination:
             run_fd = localfs.open_dir(name, dir_fd=kind_fd)
         self._run_folders[kind] = (run_fd, PurePosixPath(WORK_DIR_NAME, kind, name))
         return run_fd
-
-    @contextmanager
-    def _folder(self, local: PurePosixPath) -> Iterator[int]:
-        """An open descriptor of the folder `local`, every component opened without following a link."""
-        fd = self._root_fd
-        try:
-            for part in local.parts:
-                parent_fd = fd
-                fd = localfs.open_dir(part, dir_fd=parent_fd)
-                if parent_fd != self._root_fd:
-                    os.close(parent_fd)
-            yield fd
-        finally:
-            if fd != self._root_fd:
-                os.close(fd)
 
 
 class ExistingFile:
@@ -443,6 +512,33 @@ def _work_dir(name: str, parent_fd: int, shown: Path) -> int:
 
 def _lock(work_fd: int, destination: Path) -> int:
     fd = os.open(LOCK_FILE_NAME, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=work_fd)
+    _flock(fd, destination)
+    return fd
+
+
+def _read_lock(root_fd: int, destination: Path) -> int | None:
+    """The lock file of the work directory below `root_fd`, opened read-only and locked; `None` when the work directory
+    or its lock file is missing or not what a run creates (a run could not use either)."""
+    try:
+        work_fd = localfs.open_dir(WORK_DIR_NAME, dir_fd=root_fd)
+    except OSError as exc:
+        if exc.errno in _MISSING_ERRNOS:
+            return None
+        raise
+    try:
+        fd = os.open(LOCK_FILE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=work_fd)
+    except OSError as exc:
+        if exc.errno in _MISSING_ERRNOS:
+            return None
+        raise
+    finally:
+        os.close(work_fd)
+    _flock(fd, destination)
+    return fd
+
+
+def _flock(fd: int, destination: Path) -> None:
+    """Take the run lock on `fd`, closing it when another run holds it."""
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -450,7 +546,6 @@ def _lock(work_fd: int, destination: Path) -> int:
         raise RescueError(
             f'Another yandex-disk-rescue run is using {destination}; wait for it to finish and try again.'
         ) from None
-    return fd
 
 
 def _probe_noreplace(partial_fd: int, destination: Path) -> None:

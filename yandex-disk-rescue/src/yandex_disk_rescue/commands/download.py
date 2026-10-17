@@ -213,7 +213,9 @@ async def _mirror(
     files = 'file' if run.pending_files == 1 else 'files'
     size = format_size(run.pending_size)
     if retry_failed:
-        typer.echo(f'Retrying {run.pending_files} failed or unfinished {files} ({size}) in {destination.path}')
+        typer.echo(
+            f'Retrying {run.pending_files} failed, quarantined or unfinished {files} ({size}) in {destination.path}'
+        )
     else:
         typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:

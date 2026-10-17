@@ -23,7 +23,18 @@ from pathlib import PurePosixPath
 
 import pytest
 from fake_disk_server import Delay, FakeResponse, Truncate
-from typer.testing import CliRunner
+from mirror_tree import (
+    FILES,
+    MODIFIED,
+    SIZE_ONLY,
+    TOKEN,
+    corrupted_bytes,
+    local_file,
+    quarantine_runs,
+    replaced_runs,
+    run_download,
+    runner,
+)
 from yandex_disk_rescue import api, localfs, mirroring
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
@@ -34,22 +45,11 @@ from yandex_disk_rescue.paths import manifest_path
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
-runner = CliRunner()
-
-TOKEN = 'y0_AgAAAAB-download-sentinel-token'
-CYRILLIC = 'disk:/Docs/Отчёт за 2024 год.txt'
-MODIFIED = datetime(2023, 2, 3, 4, 5, 6, 789012, tzinfo=UTC)
-FILES = {
-    'disk:/Photos/2024/a.jpg': b'a' * 70_000,
-    'disk:/Photos/2024/b.jpg': b'b' * 3000,
-    'disk:/Photos/old.bmp': b'bitmap',
-    'disk:/Docs/readme.txt': b'read me',
-    CYRILLIC: 'годовой отчёт'.encode(),
-    'disk:/top.txt': b'',
-}
-SIZE_ONLY = 'disk:/Photos/old.bmp'
 BIG_PATH = 'disk:/Big/big.bin'
 BIG = random.Random(3).randbytes(1024 * 1024)
+QUARANTINE_HINT = (
+    'Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).'
+)
 CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
 # A stall timeout no ordinary local transfer comes near, and an injected silence well past it.
 STALL_TIMEOUT = '3'
@@ -62,32 +62,6 @@ SEGMENTED_ARGS = ('--download-segment-threshold-mib', '1')
 SEGMENT_RANGES = [f'bytes={n * MiB}-{(n + 1) * MiB - 1}' for n in range(4)]
 _CONTENT_PATHS = ('/v1/disk/resources/download', '/download', '/storage')
 _STAMP = re.compile(r'\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z')
-
-
-@pytest.fixture
-def disk(fake_disk_api, monkeypatch):
-    """The fake API with a nested tree, an empty folder, a size-only file, a zero-byte file and a Cyrillic name."""
-    monkeypatch.setenv('YANDEX_DISK_RESCUE_TOKEN', TOKEN)
-    monkeypatch.setenv('YANDEX_DISK_RESCUE_API_INTERVAL_MS', '25')
-    fake_disk_api.token = TOKEN
-    for path, content in FILES.items():
-        checksums = {'md5': None, 'sha256': None} if path == SIZE_ONLY else {}
-        fake_disk_api.add_file(path, content, modified=MODIFIED, **checksums)
-    fake_disk_api.add_dir('disk:/Empty')
-    return fake_disk_api
-
-
-@pytest.fixture
-def dest(tmp_path):
-    return tmp_path / 'dest'
-
-
-def _download(*args: str):
-    return runner.invoke(app, ['download', *args])
-
-
-def _local(dest, remote_path: str):
-    return dest / remote_path.removeprefix('disk:/')
 
 
 def _transfers(fake, since: int = 0) -> list[str]:
@@ -109,10 +83,6 @@ def _set_scan_times(moment: datetime) -> None:
     """Set the completion time of every scan recorded in the real manifest file, outside any run."""
     with closing(sqlite3.connect(manifest_path())) as connection, connection:
         connection.execute('UPDATE scans SET completed_at = ?', (moment.isoformat(timespec='microseconds'),))
-
-
-def _replaced_runs(dest) -> list:
-    return sorted((dest / '.yandex-disk-rescue' / 'replaced').iterdir())
 
 
 def _overwrite_keeping_mtime(local, content: bytes) -> None:
@@ -167,7 +137,7 @@ def _tail(start: int) -> str:
 def _leave_partial(fake, dest, *, after_bytes: int = 300_000):
     """Run a download of `disk:/Big` cut short with no retry and no later pass, which keeps its partial file."""
     fake.inject('GET', '/download', Truncate(after_bytes=after_bytes), where={'path': BIG_PATH})
-    result = _download('--download-retries', '0', '--download-passes', '1', 'disk:/Big', str(dest))
+    result = run_download('--download-retries', '0', '--download-passes', '1', 'disk:/Big', str(dest))
     assert result.exit_code == 1
     [partial] = _partials(dest)
     assert partial.stat().st_size == after_bytes
@@ -200,18 +170,18 @@ def _confirmed() -> int:
 
 
 def _others_verified(dest, failed: str) -> bool:
-    return all(_local(dest, path).read_bytes() == content for path, content in FILES.items() if path != failed)
+    return all(local_file(dest, path).read_bytes() == content for path, content in FILES.items() if path != failed)
 
 
 @pytest.mark.parametrize('redirect', [False, True], ids=['direct', 'redirected'])
 def test_a_fresh_mirror_holds_every_file_with_its_bytes_and_cloud_mtime(disk, dest, redirect):
     disk.redirect_downloads = redirect
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
     for path, content in FILES.items():
-        local = _local(dest, path)
+        local = local_file(dest, path)
         assert local.read_bytes() == content
         assert local.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     assert (dest / 'Empty').is_dir()
@@ -231,41 +201,28 @@ def test_a_fresh_mirror_holds_every_file_with_its_bytes_and_cloud_mtime(disk, de
 
 
 def test_a_rerun_skips_verified_files_without_reading_them(disk, dest):
-    assert _download(str(dest)).exit_code == 0
+    assert run_download(str(dest)).exit_code == 0
     altered = {}
     for path, content in FILES.items():
         altered[path] = bytes(byte ^ 0xFF for byte in content)
-        _overwrite_keeping_mtime(_local(dest, path), altered[path])
+        _overwrite_keeping_mtime(local_file(dest, path), altered[path])
     earlier = len(disk.requests)
 
-    rerun = _download(str(dest))
+    rerun = run_download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert f'Downloading 0 files (0 B) to {dest}\n' in rerun.stdout
     assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
     assert f'Verified by size only (no cloud checksum): 1\n  {SIZE_ONLY}\n' in rerun.stdout
     assert _transfers(disk, earlier) == []
-    assert all(_local(dest, path).read_bytes() == content for path, content in altered.items())
+    assert all(local_file(dest, path).read_bytes() == content for path, content in altered.items())
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
-
-
-def _quarantine_runs(dest) -> list:
-    folder = dest / '.yandex-disk-rescue' / 'quarantine'
-    return sorted(folder.iterdir()) if folder.is_dir() else []
-
-
-def _corrupted(content: bytes, offset: int) -> tuple[bytes, str]:
-    """The bytes the fake serves for `content` corrupted at `offset`, and the MD5 mismatch reason they fail with."""
-    corrupted = bytearray(content)
-    corrupted[offset] ^= 0xFF
-    good, bad = hashlib.md5(content).hexdigest(), hashlib.md5(corrupted).hexdigest()
-    return bytes(corrupted), f'MD5 mismatch (expected {good}, got {bad})'
 
 
 def _quarantined(run, path: str, reason: str) -> str:
     """The `Quarantined` list of a run holding the one copy of `path` in the quarantine folder `run`."""
     copy = PurePosixPath('.yandex-disk-rescue', 'quarantine', run.name, path.removeprefix('disk:/'))
-    return f'Quarantined: 1\n  {path}: {reason}; kept at {copy}\nDownload them again with --retry-failed.\n'
+    return f'Quarantined: 1\n  {path}: {reason}; kept at {copy}\n{QUARANTINE_HINT}\n'
 
 
 @pytest.mark.parametrize('segmented', [False, True], ids=['one-stream', 'segmented'])
@@ -275,14 +232,14 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     content, offset, args = (SEGMENTED, 2 * MiB + 10, SEGMENTED_ARGS) if segmented else (FILES[path], 10, ())
     disk.add_file(path, content, modified=MODIFIED)
     disk.corrupt(path, offset=offset)
-    corrupted, reason = _corrupted(content, offset)
+    corrupted, reason = corrupted_bytes(content, offset)
 
-    result = _download(*args, str(dest))
+    result = run_download(*args, str(dest))
 
     assert result.exit_code == 1
     others = sum(map(len, FILES.values())) - len(FILES[path])
     assert f'5 downloaded ({format_size(others)}), 0 skipped, 1 quarantined, 0 failed\n' in result.stdout
-    [run] = _quarantine_runs(dest)
+    [run] = quarantine_runs(dest)
     assert _STAMP.fullmatch(run.name)
     assert _quarantined(run, path, reason) in result.stdout
     assert 'Failed' not in result.stdout
@@ -290,13 +247,13 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     copy = run / 'Photos' / '2024' / 'a.jpg'
     assert copy.read_bytes() == corrupted
     assert copy.stat().st_mtime_ns == _mtime_ns(MODIFIED)
-    assert not _local(dest, path).exists()
+    assert not local_file(dest, path).exists()
     assert _partials(dest) == []
     assert _journal() == []
     assert _failure_records() == []
 
     earlier = len(disk.requests)
-    held = _download(*args, '--scan-max-age', '0', str(dest))
+    held = run_download(*args, '--scan-max-age', '0', str(dest))
 
     assert held.exit_code == 1
     assert f'Downloading 0 files (0 B) to {dest}\n' in held.stdout
@@ -307,37 +264,39 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
 
     disk.repair(path)
     earlier = len(disk.requests)
-    retry = _download(*args, '--retry-failed', str(dest))
+    retry = run_download(*args, '--retry-failed', str(dest))
 
     assert retry.exit_code == 0, retry.output
-    assert f'Retrying 1 failed or unfinished file ({format_size(len(content))}) in {dest}\n' in retry.stdout
+    assert (
+        f'Retrying 1 failed, quarantined or unfinished file ({format_size(len(content))}) in {dest}\n' in retry.stdout
+    )
     assert f'1 downloaded ({format_size(len(content))}), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
-    assert _local(dest, path).read_bytes() == content
+    assert local_file(dest, path).read_bytes() == content
     assert copy.read_bytes() == corrupted
     assert _transfers(disk, earlier) == ['/v1/disk/resources/download'] + ['/download'] * (4 if segmented else 1)
     assert sorted(_fetches(disk, path, earlier), key=str) == (SEGMENT_RANGES if segmented else [None])
 
-    again = _download(*args, str(dest))
+    again = run_download(*args, str(dest))
 
     assert again.exit_code == 0, again.output
     assert '0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in again.stdout
     assert 'Quarantined' not in again.stdout
-    assert _quarantine_runs(dest) == [run]
+    assert quarantine_runs(dest) == [run]
 
 
 def test_a_retry_failing_verification_again_adds_a_copy_under_its_own_run_folder(disk, dest):
     path = 'disk:/Docs/readme.txt'
     disk.corrupt(path, offset=0)
-    corrupted, reason = _corrupted(FILES[path], 0)
-    assert _download(str(dest)).exit_code == 1
-    [first] = _quarantine_runs(dest)
+    corrupted, reason = corrupted_bytes(FILES[path], 0)
+    assert run_download(str(dest)).exit_code == 1
+    [first] = quarantine_runs(dest)
     before = (first / 'Docs' / 'readme.txt').stat()
 
-    retry = _download('--retry-failed', str(dest))
+    retry = run_download('--retry-failed', str(dest))
 
     assert retry.exit_code == 1
     assert '0 downloaded (0 B), 0 skipped, 1 quarantined, 0 failed\n' in retry.stdout
-    [kept, second] = _quarantine_runs(dest)
+    [kept, second] = quarantine_runs(dest)
     assert kept == first
     assert _quarantined(second, path, reason) in retry.stdout
     assert (second / 'Docs' / 'readme.txt').read_bytes() == corrupted
@@ -345,7 +304,7 @@ def test_a_retry_failing_verification_again_adds_a_copy_under_its_own_run_folder
     assert old.read_bytes() == corrupted
     assert (old.stat().st_ino, old.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
 
-    plain = _download(str(dest))
+    plain = run_download(str(dest))
 
     assert plain.exit_code == 1
     assert _quarantined(second, path, reason) in plain.stdout
@@ -354,13 +313,13 @@ def test_a_retry_failing_verification_again_adds_a_copy_under_its_own_run_folder
 def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_with_that_failure(disk, dest):
     path = 'disk:/Docs/readme.txt'
     disk.corrupt(path, offset=0)
-    _, reason = _corrupted(FILES[path], 0)
-    assert _download(str(dest)).exit_code == 1
-    [run] = _quarantine_runs(dest)
+    _, reason = corrupted_bytes(FILES[path], 0)
+    assert run_download(str(dest)).exit_code == 1
+    [run] = quarantine_runs(dest)
     disk.repair(path)
     disk.inject('GET', '/download', 503, where={'path': path})
 
-    retry = _download('--retry-failed', '--download-passes', '1', str(dest))
+    retry = run_download('--retry-failed', '--download-passes', '1', str(dest))
 
     assert retry.exit_code == 1
     assert '0 downloaded (0 B), 0 skipped, 1 quarantined, 0 failed\n' in retry.stdout
@@ -369,7 +328,7 @@ def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_wit
     assert 'Failed' not in retry.stdout
     assert [failed for failed, _ in _failure_records()] == [path]
 
-    plain = _download(str(dest))
+    plain = run_download(str(dest))
 
     assert plain.exit_code == 1
     assert shown in plain.stdout
@@ -380,19 +339,19 @@ def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_wit
 def test_a_new_disk_version_of_a_quarantined_file_is_not_held(disk, dest):
     path = 'disk:/Docs/readme.txt'
     disk.corrupt(path, offset=0)
-    assert _download(str(dest)).exit_code == 1
-    [run] = _quarantine_runs(dest)
+    assert run_download(str(dest)).exit_code == 1
+    [run] = quarantine_runs(dest)
     disk.repair(path)
     disk.add_file(path, b'read me, edited', modified=MODIFIED)
 
-    rescanned = _download('--scan-max-age', '0', str(dest))
+    rescanned = run_download('--scan-max-age', '0', str(dest))
 
     assert rescanned.exit_code == 0, rescanned.output
     assert '1 downloaded (15 B), 5 skipped, 0 quarantined, 0 failed\n' in rescanned.stdout
-    assert _local(dest, path).read_bytes() == b'read me, edited'
+    assert local_file(dest, path).read_bytes() == b'read me, edited'
     assert (run / 'Docs' / 'readme.txt').exists()
 
-    again = _download(str(dest))
+    again = run_download(str(dest))
 
     assert again.exit_code == 0, again.output
     assert 'Quarantined' not in again.stdout
@@ -401,28 +360,28 @@ def test_a_new_disk_version_of_a_quarantined_file_is_not_held(disk, dest):
 def test_a_run_killed_between_quarantining_a_copy_and_recording_it_downloads_the_file_again(disk, dest, monkeypatch):
     path = 'disk:/Docs/readme.txt'
     disk.corrupt(path, offset=0)
-    corrupted, _ = _corrupted(FILES[path], 0)
+    corrupted, _ = corrupted_bytes(FILES[path], 0)
 
     def killed(*args, **kwargs):
         raise KeyboardInterrupt
 
     with monkeypatch.context() as patch:
         patch.setattr(Mirror, 'record_quarantined', killed)
-        stopped = _download('disk:/Docs', str(dest))
+        stopped = run_download('disk:/Docs', str(dest))
 
     assert stopped.exit_code == 130
     assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
-    [run] = _quarantine_runs(dest)
+    [run] = quarantine_runs(dest)
     copy = run / 'readme.txt'
     assert copy.read_bytes() == corrupted
 
     disk.repair(path)
-    rerun = _download('disk:/Docs', str(dest))
+    rerun = run_download('disk:/Docs', str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert (dest / 'readme.txt').read_bytes() == FILES[path]
     assert copy.read_bytes() == corrupted
-    assert _quarantine_runs(dest) == [run]
+    assert quarantine_runs(dest) == [run]
 
 
 def test_a_quarantined_copy_whose_name_the_destination_refuses_gets_the_converted_name(disk, dest, monkeypatch):
@@ -431,10 +390,10 @@ def test_a_quarantined_copy_whose_name_the_destination_refuses_gets_the_converte
     disk.corrupt(path, offset=0)
     _refuse_names(monkeypatch, lambda name: '?' in name)
 
-    result = _download('disk:/Odd', str(dest))
+    result = run_download('disk:/Odd', str(dest))
 
     assert result.exit_code == 1
-    [run] = _quarantine_runs(dest)
+    [run] = quarantine_runs(dest)
     converted = f'a_b~{_hex("a?b.txt")}.txt'
     assert (run / converted).read_bytes() == bytes([ord('q') ^ 0xFF]) + b'uestion'
     assert f'; kept at .yandex-disk-rescue/quarantine/{run.name}/{converted}\n' in result.stdout
@@ -448,11 +407,11 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
     disk.add_file('disk:/Checks/short.bin', b'0123456789', md5=None, sha256=None)
     disk.inject('GET', '/download', Truncate(after_bytes=4), where={'path': 'disk:/Checks/short.bin'})
 
-    result = _download('--download-retries', '0', '--download-passes', '1', 'disk:/Checks', str(dest))
+    result = run_download('--download-retries', '0', '--download-passes', '1', 'disk:/Checks', str(dest))
 
     assert result.exit_code == 1
     actual = hashlib.sha256(content).hexdigest()
-    [run] = _quarantine_runs(dest)
+    [run] = quarantine_runs(dest)
     assert (
         f'Mirrored disk:/Checks to {dest}: 1 downloaded (9 B), 0 skipped, 1 quarantined, 1 failed\n'
         'Passes: 1 of 1\n'
@@ -461,7 +420,7 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
         'Quarantined: 1\n'
         f'  disk:/Checks/sha.bin: SHA-256 mismatch (expected {"0" * 64}, got {actual}); '
         f'kept at .yandex-disk-rescue/quarantine/{run.name}/sha.bin\n'
-        'Download them again with --retry-failed.\n'
+        f'{QUARANTINE_HINT}\n'
         'Failed: 1\n'
         '  disk:/Checks/short.bin: the download failed: '
     ) in result.stdout
@@ -478,7 +437,7 @@ def test_names_are_mapped_for_the_destination_and_kept_on_a_rerun(disk, dest):
     disk.add_file('disk:/Names/a.txt', b'lower')
     disk.add_file(f'disk:/Names/{long_name}', b'long')
 
-    result = _download('disk:/Names', str(dest))
+    result = run_download('disk:/Names', str(dest))
 
     assert result.exit_code == 0, result.output
     lower = f'a~{hashlib.sha256(b"a.txt").hexdigest()[:8]}.txt'
@@ -493,7 +452,7 @@ def test_names_are_mapped_for_the_destination_and_kept_on_a_rerun(disk, dest):
     ) in result.stdout
 
     earlier = len(disk.requests)
-    rerun = _download('disk:/Names', str(dest))
+    rerun = run_download('disk:/Names', str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert f'  disk:/Names/a.txt -> {lower}\n' in rerun.stdout
@@ -545,7 +504,7 @@ def test_names_the_destination_refuses_are_converted_recorded_and_kept_on_a_reru
     disk.add_file('disk:/Odd/Q?/x.txt', b'inside')
     seen = _refuse_names(monkeypatch, lambda name: '?' in name, code)
 
-    result = _download('disk:/Odd', str(dest))
+    result = run_download('disk:/Odd', str(dest))
 
     assert result.exit_code == 0, result.output
     converted_file = f'a_b~{_hex("a?b.txt", 16)}.txt'
@@ -565,7 +524,7 @@ def test_names_the_destination_refuses_are_converted_recorded_and_kept_on_a_reru
 
     seen.clear()
     earlier = len(disk.requests)
-    rerun = _download('disk:/Odd', str(dest))
+    rerun = run_download('disk:/Odd', str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert _transfers(disk, earlier) == []
@@ -579,7 +538,7 @@ def test_a_converted_name_the_destination_refuses_too_fails_that_entry_only(disk
     disk.add_file('disk:/Q?/x.txt', b'inside')
     _refuse_names(monkeypatch, lambda name: '?' in name or '_' in name)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     strerror = os.strerror(errno.EINVAL)
@@ -597,7 +556,7 @@ def test_a_converted_name_the_destination_refuses_too_fails_that_entry_only(disk
         ['.yandex-disk-rescue', 'Docs', 'Empty', 'Photos', 'top.txt']
     )
 
-    rerun = _download(str(dest))
+    rerun = run_download(str(dest))
 
     assert rerun.exit_code == 1
     assert result.stdout.split('Failed: 3\n')[1] == rerun.stdout.split('Failed: 3\n')[1]
@@ -615,14 +574,14 @@ def test_a_run_stopped_once_a_converted_file_is_placed_finds_it_there_on_the_nex
             raise OSError(errno.EIO, os.strerror(errno.EIO), dst)
 
     monkeypatch.setattr(localfs, 'rename_noreplace', placed_then_failed)
-    stopped = _download('disk:/Odd', str(dest))
+    stopped = run_download('disk:/Odd', str(dest))
 
     assert stopped.exit_code == 1
     assert stopped.stderr == f'Error: Could not write {dest / converted}: {os.strerror(errno.EIO)}.\n'
 
     monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
     earlier = len(disk.requests)
-    rerun = _download('disk:/Odd', str(dest))
+    rerun = run_download('disk:/Odd', str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert 'Already on disk and verified: 1\n  disk:/Odd/a?b.txt\n' in rerun.stdout
@@ -669,7 +628,7 @@ def test_a_path_deeper_than_path_max_is_mirrored(disk, removed_dest):
     folders = '/'.join(f'{level:02}' + 'd' * 248 for level in range(17))
     disk.add_file(f'disk:/Deep/{folders}/deep.txt', b'deep')
 
-    result = _download('disk:/Deep', str(dest))
+    result = run_download('disk:/Deep', str(dest))
 
     assert result.exit_code == 0, result.output
     assert len(os.fsencode(dest / folders / 'deep.txt')) > os.pathconf(dest, 'PC_PATH_MAX')
@@ -682,7 +641,7 @@ def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
     readme.write_bytes(FILES['disk:/Docs/readme.txt'])
     inode = readme.stat().st_ino
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
     assert f'Mirrored disk:/ to {dest}: 5 downloaded ' in result.stdout
@@ -697,7 +656,7 @@ def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
 
     _overwrite_keeping_mtime(readme, b'X' * readme.stat().st_size)
     earlier = len(disk.requests)
-    rerun = _download(str(dest))
+    rerun = run_download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert '0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
@@ -707,18 +666,18 @@ def test_an_untracked_identical_file_is_adopted_without_a_download(disk, dest):
 
 
 def test_a_mirror_whose_manifest_was_lost_is_adopted_without_any_transfer(disk, dest, tmp_path, monkeypatch):
-    assert _download(str(dest)).exit_code == 0
-    inodes = {path: _local(dest, path).stat().st_ino for path in FILES}
+    assert run_download(str(dest)).exit_code == 0
+    inodes = {path: local_file(dest, path).stat().st_ino for path in FILES}
     monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'new-state'))
     earlier = len(disk.requests)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
     assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in result.stdout
     assert 'Already on disk and verified: 6\n  disk:/Docs/readme.txt\n' in result.stdout
     assert _transfers(disk, earlier) == []
-    assert {path: _local(dest, path).stat().st_ino for path in FILES} == inodes
+    assert {path: local_file(dest, path).stat().st_ino for path in FILES} == inodes
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
@@ -729,10 +688,10 @@ def test_an_untracked_different_file_is_moved_aside_and_the_cloud_file_placed(di
     readme.write_bytes(mine)
     os.utime(readme, ns=(10**18, 10**18))
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
-    [run] = _replaced_runs(dest)
+    [run] = replaced_runs(dest)
     assert _STAMP.fullmatch(run.name)
     assert (
         f'Moved aside to .yandex-disk-rescue/replaced/{run.name}/: 1\n  Docs/readme.txt\nManifest: '
@@ -749,9 +708,9 @@ def test_a_run_never_reuses_the_replaced_folder_of_an_earlier_run(disk, dest):
     taken = [(now + timedelta(seconds=s)).strftime('%Y-%m-%dT%H-%M-%SZ') for s in range(-1, 30)]
     for name in taken:
         (replaced / name).mkdir(parents=True)
-    _local(dest, 'disk:/top.txt').write_bytes(b'mine')
+    local_file(dest, 'disk:/top.txt').write_bytes(b'mine')
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
     [run] = [p for p in replaced.iterdir() if p.name not in taken]
@@ -764,18 +723,18 @@ def test_a_run_never_reuses_the_replaced_folder_of_an_earlier_run(disk, dest):
 @pytest.mark.parametrize('fault', [None, 'corrupt'])
 def test_a_file_changed_in_the_cloud_replaces_the_old_copy_only_once_verified(disk, dest, fault):
     path = 'disk:/Docs/readme.txt'
-    readme = _local(dest, path)
-    assert _download(str(dest)).exit_code == 0
+    readme = local_file(dest, path)
+    assert run_download(str(dest)).exit_code == 0
     before = readme.stat()
     disk.add_file(path, b'read me, edited', modified=MODIFIED)
     if fault:
         disk.corrupt(path, offset=0)
 
-    result = _download('--scan-max-age', '0', str(dest))
+    result = run_download('--scan-max-age', '0', str(dest))
 
     if fault:
         assert result.exit_code == 1
-        [run] = _quarantine_runs(dest)
+        [run] = quarantine_runs(dest)
         assert f'Quarantined: 1\n  {path}: MD5 mismatch' in result.stdout
         assert readme.read_bytes() == FILES[path]
         assert (readme.stat().st_ino, readme.stat().st_mtime_ns) == (before.st_ino, before.st_mtime_ns)
@@ -783,7 +742,7 @@ def test_a_file_changed_in_the_cloud_replaces_the_old_copy_only_once_verified(di
         assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
     else:
         assert result.exit_code == 0, result.output
-        [run] = _replaced_runs(dest)
+        [run] = replaced_runs(dest)
         assert '1 downloaded (15 B), 5 skipped, 0 quarantined, 0 failed\n' in result.stdout
         assert f'Moved aside to .yandex-disk-rescue/replaced/{run.name}/: 1\n  Docs/readme.txt\n' in result.stdout
         assert (run / 'Docs' / 'readme.txt').read_bytes() == FILES[path]
@@ -804,10 +763,10 @@ def test_things_in_the_way_are_moved_aside_and_links_are_never_followed(disk, de
     (dest / 'top.txt').mkdir()
     (dest / 'top.txt' / 'inside.txt').write_bytes(b'kept')
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
-    [run] = _replaced_runs(dest)
+    [run] = replaced_runs(dest)
     assert (
         f'Moved aside to .yandex-disk-rescue/replaced/{run.name}/: 4\n  Docs\n  Links/target.txt\n  Photos\n  top.txt\n'
     ) in result.stdout
@@ -819,7 +778,7 @@ def test_things_in_the_way_are_moved_aside_and_links_are_never_followed(disk, de
     assert sorted(outside.iterdir()) == [secret]
     assert secret.read_bytes() == b'linked'
     for path, content in {**FILES, 'disk:/Links/target.txt': b'linked'}.items():
-        local = _local(dest, path)
+        local = local_file(dest, path)
         assert not local.is_symlink()
         assert local.read_bytes() == content
 
@@ -827,21 +786,21 @@ def test_things_in_the_way_are_moved_aside_and_links_are_never_followed(disk, de
 @pytest.mark.parametrize('change', ['content', 'mtime'])
 def test_a_verified_file_touched_locally_is_hashed_again(disk, dest, change):
     path = 'disk:/Photos/2024/b.jpg'
-    local = _local(dest, path)
-    assert _download(str(dest)).exit_code == 0
+    local = local_file(dest, path)
+    assert run_download(str(dest)).exit_code == 0
     if change == 'content':
         local.write_bytes(b'B' * len(FILES[path]))
     else:
         os.utime(local, ns=(10**18, 10**18))
     earlier = len(disk.requests)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
     assert local.read_bytes() == FILES[path]
     assert local.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     if change == 'content':
-        [run] = _replaced_runs(dest)
+        [run] = replaced_runs(dest)
         assert (run / 'Photos' / '2024' / 'b.jpg').read_bytes() == b'B' * len(FILES[path])
         assert _transfers(disk, earlier) == ['/v1/disk/resources/download', '/download']
     else:
@@ -866,7 +825,7 @@ def test_local_only_content_is_never_touched_or_reported(disk, dest):
     stats = {relative: (dest / relative).stat() for relative in local_only}
 
     for _ in range(2):
-        result = _download(str(dest))
+        result = run_download(str(dest))
 
         assert result.exit_code == 0, result.output
         for relative, content in local_only.items():
@@ -884,14 +843,14 @@ def test_local_only_content_is_never_touched_or_reported(disk, dest):
 def test_a_hard_link_to_another_verified_file_is_never_replaced(disk, dest):
     disk.add_file('disk:/Pair/a.bin', b'first')
     disk.add_file('disk:/Pair/b.bin', b'second')
-    assert _download('disk:/Pair', str(dest)).exit_code == 0
+    assert run_download('disk:/Pair', str(dest)).exit_code == 0
     (dest / 'b.bin').unlink()
     os.link(dest / 'a.bin', dest / 'b.bin')
     disk.add_file('disk:/Pair/b.bin', b'second, edited')
     inode = (dest / 'a.bin').stat().st_ino
 
     for _ in range(2):
-        result = _download('--scan-max-age', '0', 'disk:/Pair', str(dest))
+        result = run_download('--scan-max-age', '0', 'disk:/Pair', str(dest))
 
         assert result.exit_code == 1
         assert (
@@ -914,7 +873,7 @@ def test_hard_linked_untracked_copies_handled_at_once_adopt_only_one(disk, tmp_p
         (dest / 'a.bin').write_bytes(b'same bytes')
         os.link(dest / 'a.bin', dest / 'b.bin')
 
-        result = _download('disk:/Pair', str(dest))
+        result = run_download('disk:/Pair', str(dest))
 
         assert result.exit_code == 1, result.output
         match = re.search(r'Already on disk and verified: 1\n  disk:/Pair/(\w)\.bin\n', result.stdout)
@@ -941,7 +900,7 @@ def test_hard_linked_untracked_copies_handled_at_once_adopt_only_one(disk, tmp_p
 def test_a_link_refused_for_one_file_fails_only_that_file(disk, dest, status, reason):
     disk.inject('GET', '/v1/disk/resources/download', status, where={'path': 'disk:/Docs/readme.txt'})
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert '5 downloaded' in result.stdout
@@ -952,7 +911,7 @@ def test_a_link_refused_for_one_file_fails_only_that_file(disk, dest, status, re
 def test_a_token_rejected_on_a_link_request_stops_the_run(disk, dest):
     disk.inject('GET', '/v1/disk/resources/download', 401)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert result.stderr.startswith('Error: Yandex rejected the token (invalid, expired or revoked).')
@@ -970,16 +929,16 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
         '  disk:/Docs/bad\\udc80.txt: the name is not valid Unicode, so the Disk API cannot download it\n'
     )
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert failed in result.stdout
     assert '6 downloaded' in result.stdout
-    assert all(_local(dest, path).read_bytes() == content for path, content in FILES.items())
+    assert all(local_file(dest, path).read_bytes() == content for path, content in FILES.items())
 
     for reuse in (['--no-scan'], [], ['--retry-failed']):
         earlier = len(disk.requests)
-        rerun = _download(*reuse, str(dest))
+        rerun = run_download(*reuse, str(dest))
 
         assert rerun.exit_code == 1
         assert 'Using the scan of disk:/ completed ' in rerun.stdout
@@ -988,7 +947,7 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
 
     disk.remove('disk:/Docs/bad\udc80.txt')
     disk.remove('disk:/Bad\udc81')
-    rescan = _download('--scan-max-age', '0', str(dest))
+    rescan = run_download('--scan-max-age', '0', str(dest))
 
     assert rescan.exit_code == 0, rescan.output
     assert 'not valid Unicode' not in rescan.stdout
@@ -1005,10 +964,10 @@ def _reused_scan(result) -> tuple[str, str]:
 
 
 def test_a_rerun_inside_the_scan_window_lists_nothing_and_a_window_of_zero_scans_again(disk, dest):
-    assert _download(str(dest)).exit_code == 0
+    assert run_download(str(dest)).exit_code == 0
     earlier = len(disk.requests)
 
-    rerun = _download(str(dest))
+    rerun = run_download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert _reused_scan(rerun) == ('disk:/', '0 min ago')
@@ -1017,7 +976,7 @@ def test_a_rerun_inside_the_scan_window_lists_nothing_and_a_window_of_zero_scans
     assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 6 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
 
     earlier = len(disk.requests)
-    always = _download('--scan-max-age', '0', str(dest))
+    always = run_download('--scan-max-age', '0', str(dest))
 
     assert always.exit_code == 0, always.output
     assert always.stdout.startswith('Scanned disk:/: 6 files, 4 folders')
@@ -1029,7 +988,7 @@ def test_a_scan_of_an_ancestor_inside_the_window_is_reused(disk, dest):
     assert runner.invoke(app, ['scan']).exit_code == 0
     earlier = len(disk.requests)
 
-    result = _download('disk:/Photos', str(dest))
+    result = run_download('disk:/Photos', str(dest))
 
     assert result.exit_code == 0, result.output
     assert _reused_scan(result) == ('disk:/', '0 min ago')
@@ -1039,11 +998,11 @@ def test_a_scan_of_an_ancestor_inside_the_window_is_reused(disk, dest):
 
 @pytest.mark.parametrize('age', [timedelta(hours=2), timedelta(hours=-1)], ids=['old', 'future'])
 def test_a_scan_outside_the_window_is_done_again(disk, dest, age):
-    assert _download(str(dest)).exit_code == 0
+    assert run_download(str(dest)).exit_code == 0
     _set_scan_times(datetime.now(UTC) - age)
     earlier = len(disk.requests)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 0, result.output
     assert result.stdout.startswith('Scanned disk:/: 6 files, 4 folders')
@@ -1055,7 +1014,7 @@ def test_no_scan_needs_a_scan_covering_the_folder_and_then_never_lists(disk, des
     assert runner.invoke(app, ['scan', 'disk:/Docs']).exit_code == 0
     earlier = len(disk.requests)
 
-    refused = _download('--no-scan', 'disk:/Photos', str(dest))
+    refused = run_download('--no-scan', 'disk:/Photos', str(dest))
 
     assert refused.exit_code == 2
     assert refused.stderr == (
@@ -1066,7 +1025,7 @@ def test_no_scan_needs_a_scan_covering_the_folder_and_then_never_lists(disk, des
 
     _set_scan_times(datetime.now(UTC) - timedelta(days=30))
     earlier = len(disk.requests)
-    result = _download('--no-scan', 'disk:/Docs', str(dest))
+    result = run_download('--no-scan', 'disk:/Docs', str(dest))
 
     assert result.exit_code == 0, result.output
     assert _reused_scan(result) == ('disk:/Docs', '--no-scan')
@@ -1075,7 +1034,7 @@ def test_no_scan_needs_a_scan_covering_the_folder_and_then_never_lists(disk, des
 
 
 def test_a_scan_max_age_out_of_range_is_a_usage_error(disk, dest):
-    result = _download('--scan-max-age', '10081', str(dest))
+    result = run_download('--scan-max-age', '10081', str(dest))
 
     assert result.exit_code == 2
     assert 'must be an integer from 0 to 10080' in result.stderr
@@ -1107,29 +1066,29 @@ def test_a_file_changed_after_the_reused_scan_is_never_kept_as_verified(
     assert runner.invoke(app, ['scan']).exit_code == 0
     disk.add_file(path, edited, modified=MODIFIED)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert _reused_scan(result)[0] == 'disk:/'
     assert f'{listed}: 1\n  {path}: {reason}' in result.stdout
-    assert not _local(dest, path).exists()
+    assert not local_file(dest, path).exists()
 
-    rerun = _download(str(dest))
+    rerun = run_download(str(dest))
 
     assert rerun.exit_code == 1
     assert f'{listed}: 1\n  {path}: {rerun_reason}' in rerun.stdout
-    assert not _local(dest, path).exists()
+    assert not local_file(dest, path).exists()
     assert _partials(dest) == []
 
-    rescanned = _download('--scan-max-age', '0', str(dest))
+    rescanned = run_download('--scan-max-age', '0', str(dest))
 
     assert rescanned.exit_code == 0, rescanned.output
-    assert _local(dest, path).read_bytes() == edited
+    assert local_file(dest, path).read_bytes() == edited
 
 
 @pytest.mark.parametrize('args', [[], ['a', 'b', 'c']], ids=['none', 'three'])
 def test_download_takes_one_or_two_paths(disk, args):
-    result = _download(*args)
+    result = run_download(*args)
 
     assert result.exit_code == 2
     assert disk.requests == []
@@ -1150,7 +1109,7 @@ def test_an_unusable_destination_is_a_usage_error_that_creates_nothing(disk, tmp
         ([str(tmp_path / 'x'), 'disk:/A'], 'disk:/A is a Disk path'),
     ]
     for args, message in cases:
-        result = _download(*args)
+        result = run_download(*args)
 
         assert result.exit_code == 2
         assert message in result.stderr
@@ -1162,9 +1121,9 @@ def test_an_unusable_destination_is_a_usage_error_that_creates_nothing(disk, tmp
 
 
 def test_a_destination_mirrors_one_remote_folder(disk, dest):
-    assert _download('disk:/Photos', str(dest)).exit_code == 0
+    assert run_download('disk:/Photos', str(dest)).exit_code == 0
 
-    result = _download('disk:/Docs', str(dest))
+    result = run_download('disk:/Docs', str(dest))
 
     assert result.exit_code == 2
     assert result.stderr == (
@@ -1191,7 +1150,7 @@ def test_a_destination_mirrors_one_remote_folder(disk, dest):
 )
 def test_a_transfer_option_out_of_range_is_a_usage_error(disk, dest, monkeypatch, flag, value, valid):
     monkeypatch.setenv('COLUMNS', '200')
-    result = _download(flag, value, str(dest))
+    result = run_download(flag, value, str(dest))
 
     assert result.exit_code == 2
     assert f'must be an integer from {valid}' in result.stderr
@@ -1206,7 +1165,7 @@ def test_a_destination_in_use_by_another_run_is_refused_whatever_the_manifest(di
     fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'other-state'))
     try:
-        result = _download(str(dest))
+        result = run_download(str(dest))
     finally:
         os.close(lock_fd)
 
@@ -1228,7 +1187,7 @@ def test_a_filesystem_without_the_no_replace_rename_stops_the_run_before_any_dow
 
     monkeypatch.setattr(localfs, 'rename_noreplace', unsupported if rename == 'refused' else replacing)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert result.stderr == (
@@ -1249,7 +1208,7 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
         rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
     monkeypatch.setattr(localfs, 'rename_noreplace', failing)
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert result.stderr == f'Error: Could not write {dest / "top.txt"}: {os.strerror(code)}.\n'
@@ -1257,7 +1216,7 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
     assert not (dest / 'top.txt').exists()
 
     monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
-    rerun = _download(str(dest))
+    rerun = run_download(str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     counts = re.search(
@@ -1286,7 +1245,7 @@ def _refuse(monkeypatch, call: str, code: int, refused: Callable[[str | int], bo
 def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monkeypatch, code):
     _refuse(monkeypatch, 'set_times', code, lambda fd: True)
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     partials = _partials(dest)
@@ -1298,7 +1257,7 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
 def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, dest, monkeypatch, obstacle):
     readme, local = 'disk:/Docs/readme.txt', dest / 'Docs' / 'readme.txt'
     if obstacle == 'untraversable':
-        assert _download(str(dest)).exit_code == 0
+        assert run_download(str(dest)).exit_code == 0
         _refuse(monkeypatch, 'lstat', errno.EACCES, lambda name: name in {'a.jpg', 'b.jpg'})
         denied = os.strerror(errno.EACCES)
         failed = [
@@ -1315,7 +1274,7 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
             _refuse(monkeypatch, 'set_times', errno.EPERM, lambda fd: os.fstat(fd).st_ino == inode)
             failed = [(readme, f'could not set the modification time of Docs/readme.txt: {os.strerror(errno.EPERM)}')]
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     listed = ''.join(f'  {path}: {reason}\n' for path, reason in failed)
@@ -1332,7 +1291,7 @@ def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(dis
     path = 'disk:/Photos/2024/a.jpg'
     disk.inject('GET', '/download', STALL, STALL, where={'path': path})
 
-    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', str(dest))
+    result = run_download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', str(dest))
 
     assert result.exit_code == 1
     assert 'Passes: 1 of 1\n' in result.stdout
@@ -1349,7 +1308,7 @@ def test_dead_files_do_not_hold_up_the_healthy_ones(disk, dest):
     for path in dead:
         disk.inject('GET', '/download', STALL, where={'path': path})
 
-    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', 'disk:/Mixed', str(dest))
+    result = run_download('--download-timeout', STALL_TIMEOUT, '--download-passes', '1', 'disk:/Mixed', str(dest))
 
     assert result.exit_code == 1
     stalled = ''.join(f'  {path}: the download stalled: no data for {STALL_TIMEOUT} s\n' for path in dead)
@@ -1358,7 +1317,7 @@ def test_dead_files_do_not_hold_up_the_healthy_ones(disk, dest):
         in result.stdout
     )
     assert f'Passes: 1 of 1\nFailed: 3\n{stalled}' in result.stdout
-    assert all(_local(dest, path.replace('Mixed/', '')).read_bytes() == path.encode() * 100 for path in healthy)
+    assert all(local_file(dest, path.replace('Mixed/', '')).read_bytes() == path.encode() * 100 for path in healthy)
     started = {r.params['path']: r.started for r in disk.requests if r.path == '/download'}
     first_dead = min(started[path] for path in dead)
     assert max(started[path] for path in healthy) - first_dead < float(STALL_TIMEOUT)
@@ -1374,7 +1333,7 @@ def test_throughput_scales_with_the_connection_cap_and_never_passes_it(disk, tmp
         disk.peak_content_in_flight = 0
         earlier = len(disk.requests)
 
-        result = _download('--download-connections', str(cap), 'disk:/Load', str(tmp_path / f'dest-{cap}'))
+        result = run_download('--download-connections', str(cap), 'disk:/Load', str(tmp_path / f'dest-{cap}'))
 
         assert result.exit_code == 0, result.output
         assert disk.peak_content_in_flight == cap
@@ -1388,7 +1347,7 @@ def test_throughput_scales_with_the_connection_cap_and_never_passes_it(disk, tmp
 def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, dest):
     big.inject('GET', '/download', Truncate(after_bytes=300_000), STALL, where={'path': BIG_PATH})
 
-    result = _download('--download-timeout', STALL_TIMEOUT, 'disk:/Big', str(dest))
+    result = run_download('--download-timeout', STALL_TIMEOUT, 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (
@@ -1403,7 +1362,7 @@ def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, d
 def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succeed(big, dest):
     big.inject('GET', '/download', STALL, STALL, where={'path': BIG_PATH})
 
-    result = _download('--download-timeout', STALL_TIMEOUT, '--download-passes', '2', str(dest))
+    result = run_download('--download-timeout', STALL_TIMEOUT, '--download-passes', '2', str(dest))
 
     assert result.exit_code == 1
     assert ', 1 failed\nPasses: 2 of 2\n' in result.stdout
@@ -1418,7 +1377,7 @@ def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succee
 def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_others(disk, dest):
     failed = 'disk:/Docs/readme.txt'
     disk.inject('GET', '/download', 503, where={'path': failed})
-    first = _download('--download-passes', '1', str(dest))
+    first = run_download('--download-passes', '1', str(dest))
 
     assert first.exit_code == 1
     assert f'Failed: 1\n  {failed}: ' in first.stdout
@@ -1426,24 +1385,24 @@ def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_other
 
     disk.add_file('disk:/New/n.txt', b'new', modified=MODIFIED)
     # A plain run would fetch this one again; a retry never looks at it.
-    _local(dest, 'disk:/Photos/2024/b.jpg').unlink()
+    local_file(dest, 'disk:/Photos/2024/b.jpg').unlink()
     earlier = len(disk.requests)
-    retry = _download('--retry-failed', '--scan-max-age', '0', str(dest))
+    retry = run_download('--retry-failed', '--scan-max-age', '0', str(dest))
 
     assert retry.exit_code == 0, retry.output
-    assert f'Retrying 1 failed or unfinished file (7 B) in {dest}\n' in retry.stdout
+    assert f'Retrying 1 failed, quarantined or unfinished file (7 B) in {dest}\n' in retry.stdout
     assert f'Mirrored disk:/ to {dest}: 1 downloaded (7 B), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert [r.params['path'] for r in disk.requests[earlier:] if r.path in _CONTENT_PATHS] == [failed, failed]
-    assert _local(dest, failed).read_bytes() == FILES[failed]
+    assert local_file(dest, failed).read_bytes() == FILES[failed]
     assert not (dest / 'New').exists()
-    assert not _local(dest, 'disk:/Photos/2024/b.jpg').exists()
+    assert not local_file(dest, 'disk:/Photos/2024/b.jpg').exists()
     assert _failure_records() == []
 
     earlier = len(disk.requests)
-    again = _download('--retry-failed', str(dest))
+    again = run_download('--retry-failed', str(dest))
 
     assert again.exit_code == 0, again.output
-    assert f'Retrying 0 failed or unfinished files (0 B) in {dest}\n' in again.stdout
+    assert f'Retrying 0 failed, quarantined or unfinished files (0 B) in {dest}\n' in again.stdout
     assert f'Mirrored disk:/ to {dest}: 0 downloaded (0 B), 0 skipped, 0 quarantined, 0 failed\n' in again.stdout
     assert _transfers(disk, earlier) == []
 
@@ -1452,26 +1411,26 @@ def test_retry_failed_makes_a_failed_folder_and_the_files_under_it(disk, dest, m
     disk.add_file('disk:/Q?/x.txt', b'inside')
     refusing = True
     _refuse_names(monkeypatch, lambda name: refusing and ('?' in name or '_' in name))
-    first = _download(str(dest))
+    first = run_download(str(dest))
 
     assert first.exit_code == 1
     assert 'Failed: 2\n  disk:/Q?: the destination filesystem refuses the name Q? ' in first.stdout
     assert [path for path, _ in _failure_records()] == ['disk:/Q?', 'disk:/Q?/x.txt']
 
     refusing = False
-    retry = _download('--retry-failed', str(dest))
+    retry = run_download('--retry-failed', str(dest))
 
     assert retry.exit_code == 0, retry.output
-    assert f'Retrying 1 failed or unfinished file (6 B) in {dest}\n' in retry.stdout
+    assert f'Retrying 1 failed, quarantined or unfinished file (6 B) in {dest}\n' in retry.stdout
     assert f'Mirrored disk:/ to {dest}: 1 downloaded (6 B), 0 skipped, 0 quarantined, 0 failed\n' in retry.stdout
     assert (dest / 'Q?' / 'x.txt').read_bytes() == b'inside'
     assert _failure_records() == []
 
     earlier = len(disk.requests)
-    again = _download('--retry-failed', str(dest))
+    again = run_download('--retry-failed', str(dest))
 
     assert again.exit_code == 0, again.output
-    assert f'Retrying 0 failed or unfinished files (0 B) in {dest}\n' in again.stdout
+    assert f'Retrying 0 failed, quarantined or unfinished files (0 B) in {dest}\n' in again.stdout
     assert _transfers(disk, earlier) == []
 
 
@@ -1480,12 +1439,12 @@ def test_a_corrupt_file_is_not_retried_in_a_later_pass(disk, dest):
     disk.corrupt(corrupt, offset=0)
     disk.inject('GET', '/download', 503, where={'path': deferred})
 
-    result = _download(str(dest))
+    result = run_download(str(dest))
 
     assert result.exit_code == 1
     assert 'Passes: 2 of 7\n' in result.stdout
     assert ', 1 quarantined, 0 failed\n' in result.stdout
-    [run] = _quarantine_runs(dest)
+    [run] = quarantine_runs(dest)
     [line] = [line for line in result.stdout.splitlines() if line.startswith(f'  {corrupt}: ')]
     assert line.startswith(f'  {corrupt}: MD5 mismatch (expected ')
     assert line.endswith(f'; kept at .yandex-disk-rescue/quarantine/{run.name}/Photos/2024/a.jpg')
@@ -1498,7 +1457,7 @@ def test_a_corrupt_file_is_not_retried_in_a_later_pass(disk, dest):
 def test_unlimited_passes_go_on_until_the_file_is_done(big, dest):
     big.inject('GET', '/download', 503, 503, 503, where={'path': BIG_PATH})
 
-    result = _download('--download-passes', '0', 'disk:/Big', str(dest))
+    result = run_download('--download-passes', '0', 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert ', 0 failed\nPasses: 4 of unlimited\n' in result.stdout
@@ -1509,7 +1468,7 @@ def test_unlimited_passes_go_on_until_the_file_is_done(big, dest):
 def test_the_next_pass_waits_as_long_as_the_download_host_asks(big, dest):
     big.inject('GET', '/download', FakeResponse.error(503, {'Retry-After': '1'}), where={'path': BIG_PATH})
 
-    result = _download('disk:/Big', str(dest))
+    result = run_download('disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert 'Passes: 2 of 7\n' in result.stdout
@@ -1520,7 +1479,7 @@ def test_the_next_pass_waits_as_long_as_the_download_host_asks(big, dest):
 def test_a_download_cut_short_resumes_at_once_from_the_bytes_received(big, dest):
     big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
 
-    result = _download('disk:/Big', str(dest))
+    result = run_download('disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert 'Passes' not in result.stdout
@@ -1533,7 +1492,7 @@ def test_a_download_cut_short_resumes_at_once_from_the_bytes_received(big, dest)
 def test_retries_after_new_data_are_bounded_by_download_retries(big, dest, cuts, requests):
     big.inject('GET', '/download', *[Truncate(after_bytes=1000)] * cuts, where={'path': BIG_PATH})
 
-    result = _download('--download-passes', '1', 'disk:/Big', str(dest))
+    result = run_download('--download-passes', '1', 'disk:/Big', str(dest))
 
     assert _fetches(big, BIG_PATH) == [None] + [_tail(1000 * n) for n in range(1, requests)]
     if requests > cuts:
@@ -1553,7 +1512,7 @@ def test_retries_after_new_data_are_bounded_by_download_retries(big, dest, cuts,
 def test_an_expired_link_is_refreshed_once_per_pass(big, dest, expiries, passes):
     big.inject('GET', '/download', Truncate(after_bytes=300_000), *[410] * expiries, where={'path': BIG_PATH})
 
-    result = _download('--download-passes', passes, str(dest))
+    result = run_download('--download-passes', passes, str(dest))
 
     assert _others_verified(dest, BIG_PATH)
     if expiries == 1:
@@ -1585,7 +1544,7 @@ def test_a_partial_file_is_resumed_by_the_next_run_once_the_cloud_file_is_confir
     big.ignore_range = ignore_range
     earlier = len(big.requests)
 
-    result = _download('disk:/Big', str(dest))
+    result = run_download('disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (dest / 'big.bin').read_bytes() == BIG
@@ -1605,7 +1564,7 @@ def test_a_partial_file_of_a_file_changed_in_the_cloud_is_never_resumed(big, des
         big.add_file(BIG_PATH, edited, modified=MODIFIED)
     earlier = len(big.requests)
 
-    result = _download(*(['--scan-max-age', '0'] if change == 'rescanned' else []), 'disk:/Big', str(dest))
+    result = run_download(*(['--scan-max-age', '0'] if change == 'rescanned' else []), 'disk:/Big', str(dest))
 
     assert _partials(dest) == []
     if change == 'rescanned':
@@ -1633,7 +1592,7 @@ def test_a_partial_file_keeps_only_what_its_journal_confirms(big, dest, held):
             file.write(b'never confirmed' * 1000)
     earlier = len(big.requests)
 
-    result = _download('disk:/Big', str(dest))
+    result = run_download('disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert f'1 downloaded ({format_size(len(BIG))}), ' in result.stdout
@@ -1656,7 +1615,7 @@ def test_a_partial_file_whose_confirmed_bytes_changed_on_disk_is_fetched_again_f
         partial.unlink()
     earlier = len(big.requests)
 
-    result = _download('disk:/Big', str(dest))
+    result = run_download('disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert _fetches(big, BIG_PATH, earlier) == [None]
@@ -1666,7 +1625,7 @@ def test_a_partial_file_whose_confirmed_bytes_changed_on_disk_is_fetched_again_f
 def test_a_file_deferred_after_new_bytes_resumes_in_the_next_pass_from_its_journal(big, dest):
     big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
 
-    result = _download('--download-retries', '0', 'disk:/Big', str(dest))
+    result = run_download('--download-retries', '0', 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
     assert 'Passes: 2 of 7\n' in result.stdout
@@ -1679,7 +1638,7 @@ def test_a_slow_download_takes_a_checkpoint_every_checkpoint_seconds(big, dest, 
     big.chunk_delay = 0.2
     results = []
     # `asyncio.run` installs no signal handler outside the main thread, so the command runs as it would there.
-    worker = threading.Thread(target=lambda: results.append(_download('disk:/Big', str(dest))))
+    worker = threading.Thread(target=lambda: results.append(run_download('disk:/Big', str(dest))))
     worker.start()
     while_running: set[int] = set()
     try:
@@ -1734,7 +1693,7 @@ def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_
 
     monkeypatch.setattr(localfs, 'rename_noreplace', failing_once_the_others_have_bytes)
 
-    result = _download('disk:/Stop', str(dest))
+    result = run_download('disk:/Stop', str(dest))
 
     assert result.exit_code == 1
     assert result.stderr == f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.\n'
@@ -1783,10 +1742,10 @@ def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_th
 
     big.chunk_delay = 0
     earlier = len(big.requests)
-    result = _download('--retry-failed', 'disk:/Big', str(dest))
+    result = run_download('--retry-failed', 'disk:/Big', str(dest))
 
     assert result.exit_code == 0, result.output
-    assert f'Retrying 1 failed or unfinished file ({format_size(len(BIG))}) in {dest}\n' in result.stdout
+    assert f'Retrying 1 failed, quarantined or unfinished file ({format_size(len(BIG))}) in {dest}\n' in result.stdout
     assert _fetches(big, BIG_PATH, earlier) == [_tail(held)]
     assert _transfers(big, earlier) == ['/v1/disk/resources/download', '/download']
     assert (dest / 'big.bin').read_bytes() == BIG
@@ -1818,7 +1777,7 @@ def test_a_download_killed_mid_file_fetches_at_most_one_checkpoint_interval_agai
 
     disk.chunk_delay = 0
     earlier = len(disk.requests)
-    result = _download('disk:/Kill', str(dest))
+    result = run_download('disk:/Kill', str(dest))
 
     assert result.exit_code == 0, result.output
     assert _fetches(disk, path, earlier) == [f'bytes={confirmed}-{len(content) - 1}']
@@ -1929,7 +1888,7 @@ def test_a_file_above_the_segment_threshold_is_fetched_as_parallel_segments_tili
     disk.add_file(SEGMENTED_PATH, content, modified=MODIFIED)
     disk.chunk_delay = 0.02
 
-    result = _download(*args, 'disk:/Seg', str(dest))
+    result = run_download(*args, 'disk:/Seg', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (
@@ -1984,7 +1943,7 @@ def test_a_segmented_download_killed_midway_fetches_at_most_one_checkpoint_inter
 
     disk.chunk_delay = 0
     earlier = len(disk.requests)
-    result = _download(*SEGMENTED_ARGS, 'disk:/Kill', str(dest))
+    result = run_download(*SEGMENTED_ARGS, 'disk:/Kill', str(dest))
 
     assert result.exit_code == 0, result.output
     assert sorted(_fetches(disk, path, earlier)) == sorted(
@@ -2038,7 +1997,7 @@ def test_an_interrupted_segmented_download_resumes_each_segment_from_its_own_che
     segmented.chunk_delay = 0
     earlier = len(segmented.requests)
 
-    result = _download(*args, 'disk:/Seg', str(dest))
+    result = run_download(*args, 'disk:/Seg', str(dest))
 
     assert result.exit_code == 0, result.output
     assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier)) == sorted(
@@ -2052,7 +2011,7 @@ def test_a_stalled_segment_alone_is_fetched_again_in_the_next_pass(segmented, de
         'GET', '/download', STALL, where={'path': SEGMENTED_PATH}, where_headers={'range': SEGMENT_RANGES[2]}
     )
 
-    result = _download('--download-timeout', STALL_TIMEOUT, *SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+    result = run_download('--download-timeout', STALL_TIMEOUT, *SEGMENTED_ARGS, 'disk:/Seg', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (
@@ -2077,7 +2036,7 @@ def test_a_segment_failing_for_good_fails_the_file_and_its_other_segments_keep_t
         where_headers={'range': failing},
     )
 
-    result = _download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+    result = run_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
 
     assert result.exit_code == 1
     assert f'Failed: 1\n  {SEGMENTED_PATH}: the download host 127.0.0.1 returned HTTP 404\n' in result.stdout
@@ -2093,7 +2052,7 @@ def test_a_segment_failing_for_good_fails_the_file_and_its_other_segments_keep_t
 
     segmented.chunk_delay = 0
     earlier = len(segmented.requests)
-    rerun = _download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+    rerun = run_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier)) == sorted(
@@ -2107,7 +2066,7 @@ def test_a_file_takes_its_download_link_only_once_it_holds_a_connection(segmente
     segmented.add_file('disk:/Seg/small.txt', b'queued behind the segments', modified=MODIFIED)
     segmented.chunk_delay = 0.05
 
-    result = _download(*SEGMENTED_ARGS, '--download-connections', '2', 'disk:/Seg', str(dest))
+    result = run_download(*SEGMENTED_ARGS, '--download-connections', '2', 'disk:/Seg', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (dest / 'small.txt').read_bytes() == b'queued behind the segments'
@@ -2139,7 +2098,7 @@ def test_a_host_ignoring_the_range_of_a_segment_gets_the_file_as_one_stream(segm
     monkeypatch.setattr(PartialFile, 'truncate', recording_truncate)
     monkeypatch.setattr(PartialFile, 'write', recording_write)
 
-    result = _download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+    result = run_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
 
     assert result.exit_code == 0, result.output
     assert (dest / 'large.bin').read_bytes() == SEGMENTED

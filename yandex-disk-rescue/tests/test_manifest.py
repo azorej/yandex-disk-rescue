@@ -15,6 +15,7 @@ from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.manifest import (
     SCHEMA_VERSION,
     DownloadRecord,
+    Finding,
     LocalFingerprint,
     Manifest,
     ManifestError,
@@ -338,7 +339,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 6
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 7
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -362,7 +363,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 6
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 7
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -391,9 +392,10 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 6
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 7
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
+        assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
 
 
 def test_a_mirror_is_found_again_by_its_destination(tmp_path):
@@ -409,6 +411,23 @@ def test_a_mirror_is_found_again_by_its_destination(tmp_path):
 
     assert (again.id, again.destination, again.remote_root) == (first.id, dest, 'disk:/A')
     assert other.id != first.id
+
+
+def test_a_recorded_mirror_is_looked_up_by_its_destination_without_creating_one(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    dest = tmp_path / 'dest'
+    with Manifest.open(db) as manifest:
+        recorded = manifest.mirror(UID, 'disk:/A', dest)
+        found = manifest.mirror_at(dest)
+        missing = manifest.mirror_at(tmp_path / 'elsewhere')
+        with pytest.raises(ValueError, match='not an absolute path'):
+            manifest.mirror_at(Path('relative'))
+
+    assert found is not None
+    assert (found.id, found.account_uid, found.remote_root, found.destination) == (recorded.id, UID, 'disk:/A', dest)
+    assert missing is None
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('SELECT count(*) FROM mirrors').fetchone()[0] == 1
 
 
 @pytest.mark.parametrize(
@@ -953,4 +972,56 @@ def test_entries_left_out_for_their_names_are_kept_per_subtree_until_a_scan_cove
         assert whole.unencodable() == [UnencodableEntry('disk:/B\udc81', 'dir')]
         assert manifest.mirror('2', 'disk:/', tmp_path / 'other').unencodable() == [
             UnencodableEntry('disk:/A/other\udc82', 'file')
+        ]
+
+
+def _findings(mirror: Mirror) -> dict[str, Finding]:
+    return {e.resource.path: e.finding for e in mirror.entries() if e.finding is not None}
+
+
+def test_a_finding_survives_download_record_changes_and_goes_with_verifying_clearing_or_removing_the_entry(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep, edit, gone, top = (
+        next(r for r in TREE if r.path == p)
+        for p in ('disk:/A/keep.txt', 'disk:/A/edit.txt', 'disk:/A/gone.txt', 'disk:/top.bin')
+    )
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    corrupt = Finding('corrupt', 'MD5 mismatch (expected aa, got ff)')
+    copy = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/A/edit.txt')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        mirror.record_finding(ids[keep.path], Finding('missing', 'A/keep.txt is missing'))
+        mirror.record_finding(ids[keep.path], corrupt)
+        for resource in (edit, gone, top):
+            mirror.record_finding(ids[resource.path], Finding('modified', 'A/x is no longer a regular file'))
+        recorded = _findings(mirror)
+
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 10, 0, None)])
+        mirror.checkpoint(ids[keep.path], [Segment(0, 10, 6, 'aa')])
+        mirror.forget(ids[keep.path])
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), _unconfirmed(edit))
+        mirror.record_quarantined(ids[edit.path], RemoteIdentity.of(edit), copy, 'size mismatch')
+        mirror.record_verified(ids[top.path], RemoteIdentity.of(top), 'md5+sha256', os.lstat(placed))
+        mirror.clear_finding(ids['disk:/A/gone.txt'])
+        mirror.clear_finding(ids['disk:/A/gone.txt'])
+        kept = _findings(mirror)
+        elsewhere = _findings(other)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_finding(10_000, corrupt)
+
+    assert recorded == {
+        keep.path: corrupt,
+        edit.path: Finding('modified', 'A/x is no longer a regular file'),
+        gone.path: Finding('modified', 'A/x is no longer a regular file'),
+        top.path: Finding('modified', 'A/x is no longer a regular file'),
+    }
+    assert kept == {keep.path: corrupt, edit.path: Finding('modified', 'A/x is no longer a regular file')}
+    assert elsewhere == {}
+
+    _scan(db, [r for r in TREE if r.path != keep.path])
+    with closing(sqlite3.connect(db)) as connection:
+        assert connection.execute('SELECT entry_id, finding FROM verify_findings').fetchall() == [
+            (ids[edit.path], 'modified')
         ]

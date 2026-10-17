@@ -10,6 +10,7 @@ uv run yandex-disk-rescue scan disk:/Photos
 uv run yandex-disk-rescue download disk:/Photos /tmp/photos
 uv run yandex-disk-rescue download --no-scan disk:/Photos /tmp/photos
 uv run yandex-disk-rescue download --retry-failed disk:/Photos /tmp/photos
+uv run yandex-disk-rescue verify /tmp/photos
 ```
 
 Tests: `mise run test -- yandex-disk-rescue/tests`.
@@ -50,7 +51,8 @@ mirror's root), so a run reusing a scan still reports them.
 
 For each destination directory ("mirror") it records the local name of every entry and each file's download state.
 A destination mirrors exactly one remote folder of one account; `Manifest.mirror` refuses a destination already
-recorded for another folder or account (`MirrorMismatchError`, exit code 2).
+recorded for another folder or account (`MirrorMismatchError`, exit code 2). `Manifest.mirror_at` looks a recorded
+mirror up by its destination without creating one.
 
 - Local names (`local_names`) are paths relative to the destination, unique within the mirror.
   `Mirror.rename_local` renames one entry and moves everything below it along.
@@ -73,8 +75,13 @@ recorded for another folder or account (`MirrorMismatchError`, exit code 2).
   `Mirror.record_quarantined` replaces any earlier record and deletes the entry's download record (with its journal)
   and its failure; verifying the file (`record_verified`) deletes it, while `forget` keeps it.
   `MirrorEntry.quarantine` reads it.
-- A rescan never touches names, records, failures or quarantine records; removing an entry from the manifest deletes
-  them all.
+- A finding (`verify_findings`) is what `verify` found wrong with the file at the entry's final path: `missing`,
+  `modified` or `corrupt`, with the reason. It belongs to the entry, not to its download record, so `record_partial`,
+  `checkpoint`, `forget` and `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there),
+  `Mirror.clear_finding` and removing the entry drop it. `Mirror.record_finding` replaces any earlier one, and
+  `MirrorEntry.finding` reads it.
+- A rescan never touches names, records, failures, quarantine records or findings; removing an entry from the
+  manifest deletes them all.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
   in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
@@ -101,15 +108,18 @@ yandex-disk-rescue/
 │   │                 #   the commands in `commands/`
 │   ├── commands/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
-│   │   └── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
-│   │                 #   destination, mirror run of every entry or of the retry set (`--retry-failed`), its
-│   │                 #   start line, summary, exit code
+│   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
+│   │   │             #   destination, mirror run of every entry or of the retry set (`--retry-failed`), its
+│   │   │             #   start line, summary, exit code
+│   │   └── verify.py # The `verify` command: the read-only destination, the recorded mirror, the check, its
+│   │                 #   start line, summary, exit code and Ctrl+C message; no token, no network
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
 │   │                 #   over the retry set (failed, quarantined or partial files, failed folders) and the folders
-│   │                 #   above it (skip, hold quarantined files, folders, things in the way, hard-link aliases) with
+│   │                 #   above it (skip, hold quarantined files, fetch again files with a verify finding without
+│   │                 #   reading their copy, folders, things in the way, hard-link aliases) with
 │   │                 #   up to `download_connections` files in progress at once
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
@@ -126,12 +136,18 @@ yandex-disk-rescue/
 │   │                 #   entries fail and dropped as they succeed, the summary lines; disk work
 │   │                 #   (hashing, writes, preallocation, fsync, placement) runs in the run's worker threads,
 │   │                 #   one bounded call at a time, while the manifest and local names stay on the event loop
+│   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
+│   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each
+│   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded);
+│   │                 #   stopping when the destination itself becomes unreadable; the summary lines
 │   ├── disk_threads.py # DiskThreads — the run's dedicated worker threads; a cancelled caller waits for its call
 │   │                 #   in flight, so no descriptor is closed under a running call
 │   ├── destination.py # The destination folder: argument checks, the run lock and work directory, the
 │   │                 #   RENAME_NOREPLACE probe, partial files, reading existing files, folder creation, moving
 │   │                 #   aside into the run's `replaced/` folder, moving a partial file into the run's
-│   │                 #   `quarantine/` folder, and placement, never through a link; which errors stop the run
+│   │                 #   `quarantine/` folder, and placement, never through a link; which errors stop the run;
+│   │                 #   the read-only destination `verify` opens (lookups, reading files, the run lock when a
+│   │                 #   lock file exists, whether the destination itself is still readable)
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
 │   │                 #   an open file and setting its times
@@ -140,7 +156,7 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories, the manifest path
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure and quarantine records per destination)
+│   │                 #   failure and quarantine records and verify findings per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry
@@ -164,7 +180,10 @@ yandex-disk-rescue/
     ├── data/manifest-v3.sql # A schema-v3 manifest dump with download records, the input of a migration test
     ├── data/manifest-v4.sql # A schema-v4 manifest dump with a verified and a partial record, the input of a
     │                        #   migration test
-    ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures
+    ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures; `disk`
+    │                       #   (the fake serving `mirror_tree.FILES`) and `dest`
+    ├── mirror_tree.py      # The tree the download and verify tests mirror; running `download`, the local path of
+    │                       #   a Disk file, the replaced and quarantine run folders, a corrupted copy of bytes
     ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
@@ -183,5 +202,6 @@ yandex-disk-rescue/
     ├── test_manifest.py
     ├── test_rate_limiter.py
     ├── test_scan.py
-    └── test_transfer.py
+    ├── test_transfer.py
+    └── test_verify.py
 ```
