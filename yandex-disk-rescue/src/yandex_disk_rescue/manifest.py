@@ -1,8 +1,14 @@
-"""The manifest: a SQLite database of the remote tree as of the last completed scan of each folder.
+"""The manifest: a SQLite database of the remote tree as of the last completed scan of each folder, and of the local
+mirrors made from it.
 
 A scan streams its rows into a staging table through a `ScanSession`; only `ScanSession.commit()` moves them into
 `entries`, in one transaction. A scan that stops in any other way (an exception, Ctrl+C, SIGKILL, a power cut)
-leaves `entries` as the previous completed scan wrote it.
+leaves `entries` as the previous completed scan wrote it. The commit also records when that scan completed.
+
+A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
+the local name of every entry (`local_names`) and each file's download state (`downloads`), keyed by `entries.id`.
+A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
+the manifest deletes its rows.
 
 The database runs in WAL mode with `synchronous=FULL`: a commit is atomic and durable across a crash or power cut,
 and each `ScanSession.add` costs one WAL append and fsync instead of the rollback journal's several. WAL needs a
@@ -15,11 +21,11 @@ Schema changes append a migration; released migrations are never edited.
 import fcntl
 import os
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import Literal, Self
 
@@ -67,6 +73,61 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    (
+        # `destination` is the resolved absolute DEST in its OS bytes (`os.fsencode`), so any Linux path fits.
+        """
+        CREATE TABLE mirrors (
+            id INTEGER PRIMARY KEY,
+            account_uid TEXT NOT NULL,
+            remote_root TEXT NOT NULL,
+            destination BLOB NOT NULL UNIQUE
+        )
+        """,
+        """
+        CREATE TABLE local_names (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            local_path TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id),
+            UNIQUE (mirror_id, local_path)
+        )
+        """,
+        # The identity columns are the remote file the record was made for; `local_*` is the `lstat` fingerprint of
+        # the verified file at its final path.
+        """
+        CREATE TABLE downloads (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            state TEXT NOT NULL CHECK (state IN ('partial', 'verified')),
+            size INTEGER NOT NULL CHECK (size >= 0),
+            md5 TEXT,
+            sha256 TEXT,
+            modified TEXT NOT NULL,
+            verified_by TEXT CHECK (verified_by IN ('md5+sha256', 'md5', 'sha256', 'size')),
+            local_size INTEGER,
+            local_mtime_ns INTEGER,
+            local_ino INTEGER,
+            PRIMARY KEY (mirror_id, entry_id),
+            CHECK (
+                (state = 'partial' AND verified_by IS NULL AND local_size IS NULL
+                    AND local_mtime_ns IS NULL AND local_ino IS NULL)
+                OR (state = 'verified' AND verified_by IS NOT NULL AND local_size IS NOT NULL
+                    AND local_mtime_ns IS NOT NULL AND local_ino IS NOT NULL)
+            )
+        )
+        """,
+        """
+        CREATE UNIQUE INDEX downloads_verified_ino ON downloads (mirror_id, local_ino) WHERE state = 'verified'
+        """,
+        """
+        CREATE TABLE scans (
+            account_uid TEXT NOT NULL,
+            root TEXT NOT NULL,
+            completed_at TEXT NOT NULL,
+            PRIMARY KEY (account_uid, root)
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -77,6 +138,68 @@ type _Row = tuple[str, Literal['file', 'dir'], int | None, str | None, str | Non
 
 class ManifestError(RescueError):
     """The manifest cannot be opened or updated; the message names the file and what to do."""
+
+
+class MirrorMismatchError(RescueError):
+    """The destination already mirrors another remote folder or another account."""
+
+    exit_code = 2
+
+
+type VerifiedBy = Literal['md5+sha256', 'md5', 'sha256', 'size']
+
+
+@dataclass(frozen=True)
+class RemoteIdentity:
+    """The remote content a download record refers to; a record whose identity differs from its entry's is stale."""
+
+    size: int
+    md5: str | None
+    sha256: str | None
+    modified: datetime
+
+    @classmethod
+    def of(cls, resource: Resource) -> Self:
+        if resource.kind != 'file' or resource.size is None:
+            raise ValueError(f'{resource.path!r} is not a file with a size')
+        return cls(size=resource.size, md5=resource.md5, sha256=resource.sha256, modified=resource.modified)
+
+
+@dataclass(frozen=True)
+class LocalFingerprint:
+    """The `lstat` fields that identify a placed file: equal fingerprints mean the file was not touched."""
+
+    size: int
+    mtime_ns: int
+    ino: int
+
+    @classmethod
+    def of(cls, local: os.stat_result) -> Self:
+        return cls(size=local.st_size, mtime_ns=local.st_mtime_ns, ino=local.st_ino)
+
+
+@dataclass(frozen=True)
+class DownloadRecord:
+    """A file's download state in one mirror: `verified_by` and `local` are set exactly when it is verified."""
+
+    state: Literal['partial', 'verified']
+    identity: RemoteIdentity
+    verified_by: VerifiedBy | None
+    local: LocalFingerprint | None
+
+
+@dataclass(frozen=True)
+class MirrorEntry:
+    entry_id: int
+    resource: Resource
+    local_path: PurePosixPath | None  # relative to the destination; `None` until a name is assigned
+    download: DownloadRecord | None
+
+
+@dataclass(frozen=True)
+class ScanTime:
+    root: str
+    completed_at: datetime
 
 
 @dataclass(frozen=True)
@@ -142,6 +265,50 @@ class Manifest:
             ).fetchone()
         self._active_session = ScanSession(self, session_id, account_uid, root)
         return self._active_session
+
+    def mirror(self, account_uid: str, remote_root: str, destination: Path) -> Mirror:
+        """Return the mirror of `remote_root` (as the API spells it) at `destination` (resolved, absolute), creating
+        it on first use.
+
+        Raises `MirrorMismatchError` when `destination` already mirrors another folder or another account.
+        """
+        _check_root(remote_root)
+        if not destination.is_absolute():
+            raise ValueError(f'mirror destination {destination} is not an absolute path')
+        with self._transaction('update'):
+            row = self._connection.execute(
+                'SELECT id, account_uid, remote_root FROM mirrors WHERE destination = ?', (os.fsencode(destination),)
+            ).fetchone()
+            if row is None:
+                (mirror_id,) = self._connection.execute(
+                    'INSERT INTO mirrors (account_uid, remote_root, destination) VALUES (?, ?, ?) RETURNING id',
+                    (account_uid, remote_root, os.fsencode(destination)),
+                ).fetchone()
+            else:
+                mirror_id, mirrored_uid, mirrored_root = row
+                if mirrored_uid != account_uid:
+                    raise MirrorMismatchError(
+                        f'{destination} already mirrors {mirrored_root} of another account; choose another destination.'
+                    )
+                if mirrored_root != remote_root:
+                    raise MirrorMismatchError(
+                        f'{destination} already mirrors {mirrored_root}; download {mirrored_root} there or choose '
+                        'another destination.'
+                    )
+        return Mirror(self, mirror_id, account_uid, remote_root, destination)
+
+    def last_scan(self, account_uid: str, root: str) -> ScanTime | None:
+        """The newest completed scan of `account_uid` covering `root`: a scan of `root` itself or of an ancestor."""
+        _check_root(root)
+        covering = _ancestors(root)
+        placeholders = ', '.join('?' * len(covering))
+        with self._errors('read'):
+            row = self._connection.execute(
+                f'SELECT root, completed_at FROM scans WHERE account_uid = ? AND root IN ({placeholders}) '
+                'ORDER BY completed_at DESC, length(root) DESC LIMIT 1',
+                (account_uid, *covering),
+            ).fetchone()
+        return None if row is None else ScanTime(root=row[0], completed_at=datetime.fromisoformat(row[1]))
 
     def entries(self, account_uid: str, root: str) -> Iterator[Resource]:
         """Yield the committed entries of `account_uid` at `root` and below ordered by path, reading as it goes.
@@ -230,6 +397,7 @@ class ScanSession:
             )
             connection.execute(_DELETE_REMOVED_SQL, self._params)
             connection.execute(_UPSERT_SQL, self._params)
+            connection.execute(_RECORD_SCAN_SQL, {**self._params, 'completed_at': _timestamp(datetime.now(UTC))})
             connection.execute('DELETE FROM staged_entries WHERE session_id = ?', (self._id,))
             connection.execute('DELETE FROM scan_sessions WHERE id = ?', (self._id,))
         self._committed = True
@@ -243,6 +411,178 @@ class ScanSession:
         if self._committed:
             raise RuntimeError('this scan session is already committed')
 
+
+class Mirror:
+    """One destination directory mirroring `remote_root` of one account; obtain it with `Manifest.mirror`.
+
+    Every write is one transaction. Local paths are relative to `destination` and '/'-separated.
+    """
+
+    def __init__(
+        self, manifest: Manifest, mirror_id: int, account_uid: str, remote_root: str, destination: Path
+    ) -> None:
+        self._manifest = manifest
+        self.id = mirror_id
+        self.account_uid = account_uid
+        self.remote_root = remote_root
+        self.destination = destination
+
+    def entries(self) -> list[MirrorEntry]:
+        """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names and
+        download records, read in full so no read stays open across later writes."""
+        params = {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
+        with self._manifest._errors('read'):
+            rows = self._manifest._connection.execute(_MIRROR_ENTRIES_SQL, params).fetchall()
+        return [_mirror_entry(row) for row in rows]
+
+    def assign_names(self, names: Mapping[int, PurePosixPath]) -> None:
+        """Set the local path of each entry id in `names`, replacing any it had; a path already taken by another
+        entry of this mirror raises `ManifestError` and leaves every name unchanged."""
+        rows = [(self.id, entry_id, _local_path_text(path)) for entry_id, path in names.items()]
+        connection = self._manifest._connection
+        with self._manifest._transaction('update'):
+            # Deleting first lets a batch swap names between its entries.
+            connection.executemany(
+                'DELETE FROM local_names WHERE mirror_id = ? AND entry_id = ?', [row[:2] for row in rows]
+            )
+            connection.executemany('INSERT INTO local_names (mirror_id, entry_id, local_path) VALUES (?, ?, ?)', rows)
+            outside = connection.execute(
+                _NAMED_OUTSIDE_SQL, {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
+            ).fetchone()
+            if outside is not None:
+                raise ValueError(
+                    f'entry {outside[0]} is not a committed entry below {self.remote_root} of this account'
+                )
+
+    def rename_local(self, entry_id: int, name: str) -> None:
+        """Replace the last component of the entry's local path with `name`, and move the local paths of everything
+        below it along; a resulting path already taken raises `ManifestError` and changes nothing."""
+        if name in {'', '.', '..'} or '/' in name:
+            raise ValueError(f'{name!r} is not a single path component')
+        connection = self._manifest._connection
+        with self._manifest._transaction('update'):
+            row = connection.execute(
+                'SELECT local_path FROM local_names WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f'entry {entry_id} has no local name in mirror {self.id}')
+            old = row[0]
+            new = str(PurePosixPath(old).with_name(name))
+            connection.execute(
+                'UPDATE local_names SET local_path = ? WHERE mirror_id = ? AND entry_id = ?', (new, self.id, entry_id)
+            )
+            connection.execute(_RENAME_DESCENDANTS_SQL, {'mirror': self.id, 'old': old, 'new': new, **_below(old)})
+
+    def record_partial(self, entry_id: int, identity: RemoteIdentity) -> None:
+        """Record that a download of `identity` into the entry's partial file has started, replacing any record."""
+        self._record(entry_id, identity, 'partial', None, None)
+
+    def record_verified(
+        self, entry_id: int, identity: RemoteIdentity, verified_by: VerifiedBy, local: os.stat_result
+    ) -> None:
+        """Record the entry's file as verified against `identity`, placed at its final path with `lstat` `local`.
+
+        Any other verified record of this mirror holding the same inode is deleted: the caller has just placed this
+        file there, so that record describes a file that is gone and whose inode number was reused.
+        """
+        self._record(entry_id, identity, 'verified', verified_by, LocalFingerprint.of(local))
+
+    def verified_owner(self, ino: int) -> MirrorEntry | None:
+        """The entry of this mirror whose verified record holds inode `ino`, if any."""
+        with self._manifest._errors('read'):
+            row = self._manifest._connection.execute(
+                _VERIFIED_OWNER_SQL, {'mirror': self.id, 'ino': _signed_ino(ino)}
+            ).fetchone()
+        return None if row is None else _mirror_entry(row)
+
+    def forget(self, entry_id: int) -> None:
+        """Delete the entry's download record, if any."""
+        with self._manifest._transaction('update'):
+            self._manifest._connection.execute(
+                'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            )
+
+    def _record(
+        self,
+        entry_id: int,
+        identity: RemoteIdentity,
+        state: Literal['partial', 'verified'],
+        verified_by: VerifiedBy | None,
+        local: LocalFingerprint | None,
+    ) -> None:
+        connection = self._manifest._connection
+        params = {
+            'mirror': self.id,
+            'entry': entry_id,
+            'state': state,
+            'size': identity.size,
+            'md5': identity.md5,
+            'sha256': identity.sha256,
+            'modified': _timestamp(identity.modified),
+            'verified_by': verified_by,
+            'local_size': None if local is None else local.size,
+            'local_mtime_ns': None if local is None else local.mtime_ns,
+            'local_ino': None if local is None else _signed_ino(local.ino),
+        }
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            if local is not None:
+                connection.execute(_RELEASE_INO_SQL, params)
+            connection.execute(_RECORD_DOWNLOAD_SQL, params)
+
+    def _check_entry(self, entry_id: int) -> None:
+        params = {'entry': entry_id, **_subtree_params(self.account_uid, self.remote_root)}
+        (found,) = self._manifest._connection.execute(_ENTRY_IN_MIRROR_SQL, params).fetchone()
+        if not found:
+            raise ValueError(f'entry {entry_id} is not a committed entry below {self.remote_root} of this account')
+
+
+_MIRROR_ENTRY_COLUMNS = """
+    e.id, e.path, e.kind, e.size, e.md5, e.sha256, e.modified, n.local_path,
+    d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino
+"""
+_MIRROR_JOINS = """
+    FROM entries e
+    LEFT JOIN local_names n ON n.mirror_id = :mirror AND n.entry_id = e.id
+    LEFT JOIN downloads d ON d.mirror_id = :mirror AND d.entry_id = e.id
+"""
+_MIRROR_ENTRIES_SQL = f"""
+    SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
+    WHERE e.account_uid = :account AND e.path >= :low AND e.path < :high
+    ORDER BY e.path
+"""
+_VERIFIED_OWNER_SQL = f"""
+    SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
+    WHERE d.state = 'verified' AND d.local_ino = :ino
+"""
+_ENTRY_IN_MIRROR_SQL = """
+    SELECT EXISTS (SELECT 1 FROM entries e WHERE e.id = :entry AND e.account_uid = :account
+                   AND e.path >= :low AND e.path < :high)
+"""
+_NAMED_OUTSIDE_SQL = """
+    SELECT n.entry_id FROM local_names n JOIN entries e ON e.id = n.entry_id
+    WHERE n.mirror_id = :mirror AND NOT (e.account_uid = :account AND e.path >= :low AND e.path < :high)
+    LIMIT 1
+"""
+_RELEASE_INO_SQL = """
+    DELETE FROM downloads
+    WHERE mirror_id = :mirror AND state = 'verified' AND local_ino = :local_ino AND entry_id != :entry
+"""
+_RECORD_DOWNLOAD_SQL = """
+    INSERT INTO downloads (
+        mirror_id, entry_id, state, size, md5, sha256, modified, verified_by, local_size, local_mtime_ns, local_ino
+    ) VALUES (
+        :mirror, :entry, :state, :size, :md5, :sha256, :modified, :verified_by, :local_size, :local_mtime_ns, :local_ino
+    )
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET
+        state = excluded.state, size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256,
+        modified = excluded.modified, verified_by = excluded.verified_by, local_size = excluded.local_size,
+        local_mtime_ns = excluded.local_mtime_ns, local_ino = excluded.local_ino
+"""
+_RENAME_DESCENDANTS_SQL = """
+    UPDATE local_names SET local_path = :new || substr(local_path, length(:old) + 1)
+    WHERE mirror_id = :mirror AND local_path >= :low AND local_path < :high
+"""
 
 # `e.path` is `root` itself, or sorts within [low, high): every path starting with `root/` under binary collation.
 _SUBTREE = '(e.path = :root OR (e.path >= :low AND e.path < :high))'
@@ -271,6 +611,10 @@ _DELETE_REMOVED_SQL = f"""
     DELETE FROM entries AS e
     WHERE e.account_uid = :account AND {_SUBTREE}
       AND NOT EXISTS (SELECT 1 FROM staged_entries s WHERE s.session_id = :session AND s.path = e.path)
+"""
+_RECORD_SCAN_SQL = """
+    INSERT INTO scans (account_uid, root, completed_at) VALUES (:account, :root, :completed_at)
+    ON CONFLICT (account_uid, root) DO UPDATE SET completed_at = excluded.completed_at
 """
 # The `WHERE true` resolves SQLite's parsing ambiguity between an upsert clause and a join after `INSERT ... SELECT`.
 _UPSERT_SQL = f"""
@@ -390,9 +734,19 @@ def _subtree_params(account_uid: str, root: str) -> dict[str, str]:
 
 
 def _subtree_bounds(root: str) -> dict[str, str]:
-    prefix = _prefix(root)
+    return {'root': root, **_below(root)}
+
+
+def _below(path: str) -> dict[str, str]:
+    prefix = _prefix(path)
     # '0' is the character right after '/', so [prefix, high) holds exactly the strings starting with prefix.
-    return {'root': root, 'low': prefix, 'high': prefix[:-1] + '0'}
+    return {'low': prefix, 'high': prefix[:-1] + '0'}
+
+
+def _ancestors(root: str) -> list[str]:
+    """`root` and every folder above it, up to `disk:/`."""
+    parts = root.removeprefix('disk:/').split('/') if root != 'disk:/' else []
+    return ['disk:/', *('disk:/' + '/'.join(parts[:depth]) for depth in range(1, len(parts) + 1))]
 
 
 def _prefix(root: str) -> str:
@@ -415,3 +769,38 @@ def _row(resource: Resource, root: str) -> _Row:
         raise ValueError(f'{resource.path!r} has a modification time without a UTC offset')
     modified = resource.modified.astimezone(UTC).isoformat()
     return resource.path, resource.kind, resource.size, resource.md5, resource.sha256, modified
+
+
+def _local_path_text(path: PurePosixPath) -> str:
+    if path.is_absolute() or path.parts in {(), ('.',)} or '..' in path.parts:
+        raise ValueError(f'local path {str(path)!r} is not a relative path inside the destination')
+    return str(path)
+
+
+def _signed_ino(ino: int) -> int:
+    # SQLite integers are signed 64-bit; inode numbers are unsigned 64-bit, so the top half is stored negative.
+    return ino - 2**64 if ino >= 2**63 else ino
+
+
+def _timestamp(moment: datetime) -> str:
+    # A fixed-width UTC form, so text order is time order.
+    return moment.astimezone(UTC).isoformat(timespec='microseconds')
+
+
+def _mirror_entry(row: tuple) -> MirrorEntry:
+    """Build a `MirrorEntry` from a row of `_MIRROR_ENTRY_COLUMNS`."""
+    entry_id, local_path = row[0], row[7]
+    state, size, md5, sha256, modified, verified_by, local_size, local_mtime_ns, local_ino = row[8:]
+    download = None
+    if state is not None:
+        identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
+        local = None
+        if state == 'verified':
+            local = LocalFingerprint(size=local_size, mtime_ns=local_mtime_ns, ino=local_ino % 2**64)
+        download = DownloadRecord(state=state, identity=identity, verified_by=verified_by, local=local)
+    return MirrorEntry(
+        entry_id=entry_id,
+        resource=_resource(row[1:7]),
+        local_path=None if local_path is None else PurePosixPath(local_path),
+        download=download,
+    )

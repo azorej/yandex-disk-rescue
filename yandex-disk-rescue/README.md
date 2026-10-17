@@ -32,6 +32,21 @@ The manifest is a SQLite database at `$XDG_STATE_HOME/yandex-disk-rescue/manifes
 directory). For each account (keyed by the Disk user uid) it stores every file and folder of each scanned remote
 folder: path, kind, size, MD5, SHA-256 and modification time. A scanned folder other than `disk:/` is a row too,
 as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `disk:/` wrote; `disk:/` has no row.
+It also records when the last scan of each folder completed (`Manifest.last_scan` finds the newest one covering a
+folder: a scan of the folder itself or of an ancestor).
+
+For each destination directory ("mirror") it records the local name of every entry and each file's download state.
+A destination mirrors exactly one remote folder of one account; `Manifest.mirror` refuses a destination already
+recorded for another folder or account (`MirrorMismatchError`, exit code 2).
+
+- Local names (`local_names`) are paths relative to the destination, unique within the mirror.
+  `Mirror.rename_local` renames one entry and moves everything below it along.
+- A download record (`downloads`) is `partial` or `verified`. It keeps the remote identity it was made for (size,
+  MD5, SHA-256, modification time); a record whose identity differs from the entry's current one is stale, and the
+  caller decides what to do with it. A verified record also stores how the file was verified and the `lstat`
+  fingerprint of the placed file (size, mtime in ns, inode number; no device number, which changes when a disk is
+  re-plugged). `Mirror.verified_owner` finds the entry whose verified copy is a given inode.
+- A rescan never touches names or records; removing an entry from the manifest deletes its name and record.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
   in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
@@ -39,7 +54,8 @@ as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `
   A scan can unstage a subtree before it commits (`ScanSession.discard`); `scan` does so for a folder deleted on
   the Disk or replaced by a file mid-scan, which the commit then records as removed.
 - `Manifest.entries` and `ScanSession.staged` stream rows as the caller iterates; finish the iteration before
-  writing to the same manifest.
+  writing to the same manifest. `Mirror.entries` returns a fully read list, so the caller can write records while
+  walking it.
 - One run at a time: opening the manifest takes an exclusive lock on `manifest.sqlite3.lock`, and a second run fails
   with `Another yandex-disk-rescue run is using ...`.
 - The database runs in WAL mode with `synchronous=FULL`, so it must live on a local filesystem.
@@ -62,7 +78,8 @@ yandex-disk-rescue/
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories
-│   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan
+│   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
+│   │                 #   completion time, mirrors (local names and download records per destination)
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
@@ -70,6 +87,7 @@ yandex-disk-rescue/
 │                     #   error mapping (401/403, other statuses, transport errors, malformed bodies), `disk:/` paths;
 │                     #   the shared AdaptiveLimiter (pacing, concurrency cap, Retry-After) and bounded retries
 └── tests/
+    ├── data/manifest-v1.sql # A schema-v1 manifest dump, the input of the migration test
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures
     ├── fake_disk_server.py # Real-socket fake Disk API: an in-memory tree (`add_dir`, `add_file`, `remove`) served by
     │                       #   built-in `GET /v1/disk/` and `GET /v1/disk/resources`; `page_cap`, `account`, `token`;
