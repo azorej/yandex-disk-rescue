@@ -194,11 +194,13 @@ class Failure:
 @dataclass(frozen=True)
 class _Streak:
     """An entry's silent streak (see `FailureRecord`): its last `turns` failed turns in a row were silent, the first
-    at `since`; `last` is the reason of the last of them, once this run saw one."""
+    at `since`; `last` is the reason of the last of them this run, or, with `throttled`, of the last turn this run
+    the host throttled while it saw no silent one."""
 
     turns: int = 0
     since: datetime | None = None
     last: str | None = None
+    throttled: bool = False
 
     def unavailable(self, now: datetime) -> bool:
         """Whether the streak makes its file unavailable on Yandex Disk at `now`."""
@@ -1079,12 +1081,15 @@ class MirrorRun:
 
     def _after_deferral(self, entry: MirrorEntry, deferred: FileDeferred) -> _Streak:
         """The silent streak of `entry` after a turn `deferred`: ended when the turn received a byte, the same when
-        the host was throttling, and one silent turn longer otherwise."""
+        the host was throttling (with the turn's reason as its last while this run saw no silent turn), and one
+        silent turn longer otherwise."""
         streak = self._streak(entry)
         if deferred.received:
             return _Streak()
         if deferred.throttled:
-            return streak
+            if streak.last is not None and not streak.throttled:
+                return streak
+            return replace(streak, last=deferred.reason, throttled=True)
         return _Streak(streak.turns + 1, streak.since or datetime.now(UTC), deferred.reason)
 
     def _streak(self, entry: MirrorEntry) -> _Streak:

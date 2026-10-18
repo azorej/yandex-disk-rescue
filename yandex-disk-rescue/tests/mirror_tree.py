@@ -68,16 +68,23 @@ def wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
         time.sleep(0.01)
 
 
-def failure_record(path: str) -> tuple[str, int, int, datetime | None]:
-    """The (reason, failed turns, silent turns, start of the silent streak) of the failure record of `path`, read with
-    a connection of its own."""
+def failure_records() -> dict[str, tuple[str, int, int, datetime | None]]:
+    """The (reason, failed turns, silent turns, start of the silent streak) of every failure record in the manifest, by
+    remote path in path order, read with a connection of its own."""
     with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
-        reason, turns, silent_turns, silent_since = connection.execute(
-            'SELECT f.reason, f.turns, f.silent_turns, f.silent_since FROM failures f JOIN entries e ON e.id = f.entry_id'
-            ' WHERE e.path = ?',
-            (path,),
-        ).fetchone()
-    return reason, turns, silent_turns, None if silent_since is None else datetime.fromisoformat(silent_since)
+        rows = connection.execute(
+            'SELECT e.path, f.reason, f.turns, f.silent_turns, f.silent_since FROM failures f'
+            ' JOIN entries e ON e.id = f.entry_id ORDER BY e.path'
+        ).fetchall()
+    return {
+        path: (reason, turns, silent_turns, None if since is None else datetime.fromisoformat(since))
+        for path, reason, turns, silent_turns, since in rows
+    }
+
+
+def failure_record(path: str) -> tuple[str, int, int, datetime | None]:
+    """The failure record of `path`, as `failure_records` gives it."""
+    return failure_records()[path]
 
 
 def age_silence(path: str, hours: float) -> datetime:

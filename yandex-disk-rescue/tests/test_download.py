@@ -32,6 +32,7 @@ from mirror_tree import (
     age_silence,
     corrupted_bytes,
     failure_record,
+    failure_records,
     local_file,
     log_messages,
     quarantine_runs,
@@ -280,12 +281,8 @@ def _journal() -> list[tuple[int, int, int, str | None]]:
 
 
 def _failure_records() -> list[tuple[str, str, int]]:
-    """The (remote path, reason, failed turns) of every failure record in the manifest, read with a connection of its
-    own."""
-    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
-        return connection.execute(
-            'SELECT e.path, f.reason, f.turns FROM failures f JOIN entries e ON e.id = f.entry_id ORDER BY e.path'
-        ).fetchall()
+    """The (remote path, reason, failed turns) of every failure record in the manifest."""
+    return [(path, reason, turns) for path, (reason, turns, *_) in failure_records().items()]
 
 
 def _confirmed() -> int:
@@ -2029,11 +2026,14 @@ def test_throttling_is_not_silence(dead, dest, answer, throttled):
     assert failure_record(DEAD_PATH) == (f'{throttled} (after 7 passes)', 21, 7, since)
     aged = age_silence(DEAD_PATH, 25)
 
-    late = throttled_run(1, '--retry-failed')
+    dead.inject('GET', '/download', 429, answer, where={'path': DEAD_PATH})
 
-    reason = f'{NEVER_STARTED} 7 attempts {_since(aged)}'
+    late = run_download('--download-passes', '2', '--retry-failed', str(dest))
+
+    assert late.exit_code == 1
+    reason = f'{NEVER_STARTED} 7 attempts {_since(aged)} (the last: {throttled})'
     assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n{UNAVAILABLE_HINT}\n' in late.stdout
-    assert failure_record(DEAD_PATH) == (reason, 22, 7, aged)
+    assert failure_record(DEAD_PATH) == (reason, 23, 7, aged)
 
 
 def test_a_file_that_stops_sending_midway_is_reported_as_stopped_after_its_confirmed_bytes(big, dest):
@@ -3189,6 +3189,28 @@ def test_a_file_waiting_for_room_is_deferred_when_the_last_running_file_is_defer
     assert _partials(dest, partial_root) == []
 
 
+def test_a_turn_waiting_for_room_leaves_the_silent_streak_as_it_was(big, dest, partial_root, monkeypatch):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    args = ('--download-retries', '0', *_partial_args(partial_root))
+    for path in (BIG_PATH, BIG2_PATH):
+        big.inject('GET', '/download', *[503] * 3, where={'path': path})
+    assert run_download(*args, '--download-passes', '3', 'disk:/Big', str(dest)).exit_code == 1
+    *_, since = failure_record(BIG2_PATH)
+    assert failure_record(BIG2_PATH) == (f'{SERVICE_UNAVAILABLE} (after 3 passes)', 3, 3, since)
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+    big.inject('GET', '/download', 503, where={'path': BIG2_PATH})
+    # One large file fits: big2.bin waits for room until big.bin, cut short in pass 1, is done in pass 2.
+    _free(monkeypatch, MiB + MiB // 8)
+    logged = len(log_messages())
+
+    result = run_download(*args, '--download-passes', '3', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    assert any(m.startswith(f'{BIG2_PATH} deferred to a later pass: no room yet ') for m in log_messages()[logged:])
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert failure_record(BIG2_PATH) == (f'{SERVICE_UNAVAILABLE} (after 3 passes)', 4, 4, since)
+
+
 def test_a_file_failed_once_and_then_only_waiting_for_room_counts_one_failed_turn_with_the_reason_it_is_reported_with(
     big, dest, partial_root, monkeypatch
 ):
@@ -3299,11 +3321,13 @@ def test_kept_partial_files_that_never_fit_next_to_each_other_fail_at_once_with_
     big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
     for path in (BIG_PATH, BIG2_PATH):
         big.inject('GET', '/download', Truncate(after_bytes=600_000), where={'path': path})
+        big.inject('GET', '/download', *[503] * 3, where={'path': path})
     args = ('--download-retries', '0', *_partial_args(partial_root))
-    assert run_download(*args, '--download-passes', '1', 'disk:/Big', str(dest)).exit_code == 1
+    assert run_download(*args, '--download-passes', '4', 'disk:/Big', str(dest)).exit_code == 1
     kept = _partials(dest, partial_root)
     allocated = sum(p.stat().st_blocks * 512 for p in kept)
     assert len(kept) == 2
+    assert [failure_record(path)[1:3] for path in (BIG_PATH, BIG2_PATH)] == [(4, 3), (4, 3)]
     _free(monkeypatch, 0)
     earlier = len(big.requests)
 
@@ -3311,17 +3335,20 @@ def test_kept_partial_files_that_never_fit_next_to_each_other_fail_at_once_with_
 
     assert result.exit_code == 1
     folder = _separate_folder(dest, partial_root)
-    lines = []
-    for path, partial in zip((BIG_PATH, BIG2_PATH), sorted(kept, key=lambda p: int(p.name)), strict=True):
+    reasons = []
+    for partial in sorted(kept, key=lambda p: int(p.name)):
         needed = format_size(MiB - partial.stat().st_blocks * 512)
-        lines.append(
-            f'{path}: no room in the partial folder {folder} next to the partial files kept there ({needed} needed, '
+        reasons.append(
+            f'no room in the partial folder {folder} next to the partial files kept there ({needed} needed, '
             '0 B available); free space there, then run again or with --retry-failed'
         )
     assert _room_line(dest, partial_root, allocated) in result.stdout
     assert 'Passes: 1 of unlimited\n' in result.stdout
-    assert ''.join(f'  {line}\n' for line in lines) in result.stdout
+    assert ''.join(f'  {path}: {reason}\n' for path, reason in zip((BIG_PATH, BIG2_PATH), reasons, strict=True)) in (
+        result.stdout
+    )
     assert _transfers(big, earlier) == []
+    assert [failure_record(path) for path in (BIG_PATH, BIG2_PATH)] == [(reason, 5, 0, None) for reason in reasons]
     assert sorted(_partials(dest, partial_root)) == sorted(kept)
 
 
