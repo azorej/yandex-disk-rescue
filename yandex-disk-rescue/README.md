@@ -30,7 +30,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_API_RETRIES` | Retries after a transport error or a throttling status, 0 to 20 (default 5). Same as `--api-retries`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | Stall timeout: a download with no data from the download host for this long fails as stalled, 1 to 600 s (default 15). Same as `--download-timeout`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | Immediate resumes of a download that failed after receiving new data, 0 to 20 (default 5). Same as `--download-retries`. |
-| `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | Passes over the files still to download, resuming those that failed transiently, 0 to 1000 (default 7; 0 until every file is done). Same as `--download-passes`. |
+| `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | Passes over the files still to download, resuming those that failed transiently, 0 to 1000 (default 7; 0 until every file is done or unavailable on Yandex Disk). Same as `--download-passes`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | Requests to the download host in flight, and so files downloading at once, 1 to 64 (default 20). Same as `--download-connections`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | MiB a segment of a download receives between two checkpoints, 1 to 1024 (default 32). Same as `--download-checkpoint-mib`. |
 | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | Segments a file above the segment threshold is downloaded as, in parallel, 1 to 8 (default 4; 1 never splits). Same as `--download-segments`. |

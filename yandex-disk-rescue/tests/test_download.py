@@ -2070,6 +2070,89 @@ def test_a_local_error_ends_the_silent_streak(dead, dest, monkeypatch):
     assert failure_record(DEAD_PATH) == (denied, 8, 0, None)
 
 
+def test_a_plain_rerun_tries_an_unavailable_file_once_and_fails_it_at_once(dead, dest):
+    assert _unavailable_run(dead, dest)[0].exit_code == 1
+    *_, aged = failure_record(DEAD_PATH)
+    dead.inject('GET', '/download', *[503] * 7, where={'path': DEAD_PATH})
+    earlier, logged = len(dead.requests), len(log_messages())
+
+    result = run_download('--download-passes', '7', str(dest))
+
+    assert result.exit_code == 1
+    assert len(_fetches(dead, DEAD_PATH, earlier)) == 1
+    assert 'Passes:' not in result.stdout
+    reason = f'{NEVER_STARTED} 9 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n{UNAVAILABLE_HINT}\n' in result.stdout
+    assert failure_record(DEAD_PATH) == (reason, 9, 9, aged)
+    [pass_one] = [message for message in log_messages()[logged:] if message.startswith('Pass 1 of 7 ')]
+    assert pass_one.endswith('; 1 that failed before; 1 unavailable on Yandex Disk get one try')
+
+
+@pytest.mark.parametrize(
+    ('passes', 'shown'),
+    [('10', 'Passes: 6 of 10'), ('0', 'Passes: 6 of unlimited')],
+    ids=['ten_passes', 'unlimited_passes'],
+)
+def test_a_file_becoming_unavailable_mid_run_gets_no_more_passes(dead, dest, passes, shown):
+    assert _silent_run(dead, dest, DEAD_PATH, 1).exit_code == 1
+    aged = age_silence(DEAD_PATH, 25)
+    dead.inject('GET', '/download', *[503] * 20, where={'path': DEAD_PATH})
+    earlier = len(dead.requests)
+
+    result = run_download('--download-passes', passes, str(dest))
+
+    assert result.exit_code == 1
+    assert len(_fetches(dead, DEAD_PATH, earlier)) == 6
+    assert f'{shown}\n' in result.stdout
+    reason = f'{NEVER_STARTED} 7 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n{UNAVAILABLE_HINT}\n' in result.stdout
+    assert failure_record(DEAD_PATH) == (reason, 7, 7, aged)
+    assert _others_verified(dest, DEAD_PATH)
+
+
+def test_a_throttled_turn_of_an_unavailable_file_defers_it_to_the_next_pass(dead, dest):
+    assert _unavailable_run(dead, dest)[0].exit_code == 1
+    *_, aged = failure_record(DEAD_PATH)
+    dead.inject('GET', '/download', 429, 503, 503, where={'path': DEAD_PATH})
+    earlier = len(dead.requests)
+
+    result = run_download('--download-passes', '7', str(dest))
+
+    assert result.exit_code == 1
+    assert len(_fetches(dead, DEAD_PATH, earlier)) == 2
+    assert 'Passes: 2 of 7\n' in result.stdout
+    reason = f'{NEVER_STARTED} 9 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n' in result.stdout
+    assert failure_record(DEAD_PATH) == (reason, 10, 9, aged)
+
+
+def test_retry_failed_still_gives_an_unavailable_file_every_pass(dead, dest):
+    assert _unavailable_run(dead, dest)[0].exit_code == 1
+    *_, aged = failure_record(DEAD_PATH)
+    dead.inject('GET', '/download', *[503] * 3, where={'path': DEAD_PATH})
+    earlier = len(dead.requests)
+
+    result = run_download('--retry-failed', '--download-passes', '3', str(dest))
+
+    assert result.exit_code == 1
+    assert len(_fetches(dead, DEAD_PATH, earlier)) == 3
+    assert 'Passes: 3 of 3\n' in result.stdout
+    reason = f'{NEVER_STARTED} 11 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n' in result.stdout
+    assert failure_record(DEAD_PATH) == (reason, 11, 11, aged)
+
+
+def test_a_file_yandex_restores_is_fetched_by_the_next_plain_run(dead, dest):
+    assert _unavailable_run(dead, dest)[0].exit_code == 1
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert local_file(dest, DEAD_PATH).read_bytes() == DEAD
+    assert _others_verified(dest, DEAD_PATH)
+    assert _failure_records() == []
+
+
 def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_others(disk, dest):
     failed = 'disk:/Docs/readme.txt'
     disk.inject('GET', '/download', 503, where={'path': failed})

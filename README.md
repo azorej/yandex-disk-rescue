@@ -250,9 +250,11 @@ it stalls and delays no other file.
 
 **Order.** Files with no failure record start first, in path order. Files that
 failed before start after all of them, fewest failed turns first, ties in path
-order, so a restart reaches new and healthy data at once. Each later pass
-follows the same rule over the files still to download. A partial download
-keeps its confirmed bytes whenever its turn comes, and folders are still made
+order, so a restart reaches new and healthy data at once. A file
+[unavailable on Yandex Disk](#downloading) has failed more turns than most, so
+it comes near the end of pass 1, and a plain run gives it no later pass. Each
+later pass follows the same rule over the files still to download. A partial
+download keeps its confirmed bytes whenever its turn comes, and folders are still made
 before anything inside them. With `--partial-dir`, a file that fits only once
 the kept partial file of an earlier failed download is gone may meet `no room
 yet` in pass 1 and get the room in the next pass; with `--download-passes 1`
@@ -473,9 +475,10 @@ stream, never appended to the bytes kept.
   pause (longer when the host sent `Retry-After`, up to 300 s). The other
   segments of such a file finish first, and the next pass fetches only the
   segments still missing. A run makes at most `download_passes` passes
-  (`0`: until every file is done or Ctrl+C); a file still failing after the
-  last one is reported with its last reason and `(after N passes)`, or as
-  unavailable on Yandex Disk (below). Once a file needed another pass, the summary shows `Passes: <used> of <limit>`. A
+  (`0`: until every file is done or unavailable on Yandex Disk, or Ctrl+C); a
+  file still failing after the last one is reported with its last reason and
+  `(after N passes)`, or as unavailable on Yandex Disk (below). Once a file
+  needed another pass, the summary shows `Passes: <used> of <limit>`. A
   checksum mismatch quarantines the file at once, and a refused download, a
   file changed in the cloud and a local write error fail it at once, stopping
   its other segments; no later pass retries it.
@@ -491,7 +494,12 @@ stream, never appended to the bytes kept.
   error), starts the count over. The summary then adds, after the `Failed`
   list, `N of them never got data from Yandex Disk for a day or more: open
   them in the Yandex Disk web interface, and ask Yandex support about those
-  that do not open there either.`
+  that do not open there either.` A plain `download` gives such a file one
+  attempt per run, in pass 1, and fails it at once when the host sends
+  nothing again, without `(after N passes)`; an attempt the host throttles
+  waits for the next pass as usual. A byte received makes it an ordinary file
+  again, so a file Yandex restores is fetched by the next run.
+  `--retry-failed` gives it every pass.
 - **Expired links.** The segments of a file share one download link per pass,
   requested only once a segment has a free connection, so no link ages while
   it waits for one. A link the host rejects (`401`, `403` or `410`) is
@@ -1394,7 +1402,7 @@ first one that sets it wins:
 | `api_url` | `--api-url` (hidden) | `YANDEX_DISK_RESCUE_API_URL` | `https://cloud-api.yandex.net` | an `http://` or `https://` URL |
 | `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `15` | 1 to 600 (s); a download with no data from the host for this long has stalled |
 | `download_retries` | `--download-retries` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | `5` | 0 to 20; immediate resumes of a download that failed after new data |
-| `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until all are done |
+| `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until every file is done or unavailable on Yandex Disk |
 | `download_connections` | `--download-connections` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | `20` | 1 to 64; requests to the download host in flight, and so files downloading at once |
 | `download_checkpoint_mib` | `--download-checkpoint-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | `32` | 1 to 1024 (MiB); bytes a segment receives between two checkpoints of a download |
 | `download_segments` | `--download-segments` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | `4` | 1 to 8; segments of a file above the segment threshold, fetched in parallel; `1` never splits |

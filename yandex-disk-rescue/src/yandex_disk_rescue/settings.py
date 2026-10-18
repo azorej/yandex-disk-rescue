@@ -116,7 +116,8 @@ DOWNLOAD_PASSES = Setting(
     'download_passes',
     7,
     'Passes over the files to download: each pass after the first resumes the files whose download failed '
-    'transiently (a stall, a connection error, a 5xx); 0 passes until every file is done.',
+    'transiently (a stall, a connection error, a 5xx); 0 passes until every file is done or unavailable on Yandex '
+    'Disk.',
     _in_range(0, 1000),
 )
 DOWNLOAD_CONNECTIONS = Setting(
