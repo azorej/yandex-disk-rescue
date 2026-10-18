@@ -43,8 +43,8 @@ folder: nothing is moved, and the new path is recorded.
 
 With separate partials, the partial files take no more than the room of their folder, measured once the move is
 done (`PartialRoom`): a file fetched takes a turn of the room for its full size, in the order files start, and waits,
-is deferred to the next pass or fails when it does not fit. A pass that changed nothing in the room fails the files it deferred
-for room at once, since no later pass could fit them. An error writing the folder all the same stops the run.
+is deferred to the next pass or fails when it does not fit. A pass that changed nothing in the room fails the files it
+deferred for room at once, since no later pass could fit them. An error writing the folder all the same stops the run.
 
 A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
 conversion, which is then recorded as its local name.
@@ -787,9 +787,9 @@ class MirrorRun:
         In every pass up to `content.connections` files are in progress at once, started as slots free up by their
         failed turns so far in this mirror, fewest first, then in path order: the first pass starts each file with no
         failed turn as the walk reaches it, and the others once the walk is done. The segments of a segmented file
-        queue for the same connections; a folder is made before any entry below it starts. Each final path is checked, cleared, placed and recorded under one placement lock, so files
-        in progress never race for a path or an inode. The report lists everything in path order, whatever the
-        order the files ended in.
+        queue for the same connections; a folder is made before any entry below it starts. Each final path is
+        checked, cleared, placed and recorded under one placement lock, so files in progress never race for a path or
+        an inode. The report lists everything in path order, whatever the order the files ended in.
 
         The first error that stops the run (`DestinationError`, `TokenRejectedError`, `DiskApiError`) cancels the
         files in progress and is raised as itself once they have ended.
@@ -806,7 +806,7 @@ class MirrorRun:
                 room_measured(room)
             tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), room, report, policy)
             changes = _changes(room)
-            _log_pass(1, passes, self.pending_files, self.pending_size, pause=None, last=self._failed_before)
+            _log_pass(1, passes, self.pending_files, self.pending_size, pause=None, failed_before=self._failed_before)
             deferred = await self._first_pass(tools)
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes, changes=changes)
@@ -2135,12 +2135,11 @@ def _note_moved_aside(report: MirrorReport, destination: Destination, local: Pur
     report.moved_aside.append(local)
 
 
-def _log_pass(number: int, passes: int, files: int, size: int, *, pause: float | None, last: int = 0) -> None:
-    """Log the start of a pass over `files` files of `size` bytes, `last` of which start last as they failed
-    before."""
+def _log_pass(number: int, passes: int, files: int, size: int, *, pause: float | None, failed_before: int = 0) -> None:
+    """Log the start of a pass over `files` files of `size` bytes, `failed_before` of which have a failure record."""
     start = 'starts' if pause is None else f'starts in {pause:g} s'
-    if last:
-        start += f'; {last} that failed before start last'
+    if failed_before:
+        start += f'; {failed_before} that failed before'
     limit = passes or 'unlimited'
     noun = 'file' if files == 1 else 'files'
     _log.info('Pass %d of %s over %d %s (%s) %s', number, limit, files, noun, format_size(size), start)

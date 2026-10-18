@@ -156,9 +156,9 @@ RUN2 exit 1  /download order:
     journal whenever its turn comes. Room turns (`PartialRoom`) are taken in the order files start, not in path order.
   - `--download-passes`, `MirrorReport.passes`, the summary, the JSON object, the status line and the exit codes are
     unchanged. The tail of pass 1 is still pass 1, so each file still gets at most `passes` turns in a run.
-  - `_log_pass` for pass 1 also logs how many files start last because they failed before, for example
-    `Pass 1 of 7 over 120 files (3.1 GiB) starts; 12 that failed before start last`. Omit the clause when there are
-    none. Log file only; stdout is unchanged.
+  - `_log_pass` for pass 1 also logs how many of its files have a failure record, for example
+    `Pass 1 of 7 over 120 files (3.1 GiB) starts; 12 that failed before`. Omit the clause when there are none. Log
+    file only; stdout is unchanged.
 - **Behaviour to lock (`tests/test_download.py`, next to `test_dead_files_do_not_hold_up_the_healthy_ones`):**
   - `test_files_failing_in_a_pass_are_tried_again_only_after_every_healthy_file_finished`: 3 failing (503 on every
     `/download`) and 8 healthy files, `--download-connections 4 --download-passes 2`. Every healthy file's `/download`
@@ -169,8 +169,8 @@ RUN2 exit 1  /download order:
     `c-y` (fails), and `a-x` fails again. Run 3: add `d-z` (healthy). The `/download` order of run 3 is
     `[d-z, c-y, a-x]`. The `turns` of `_failure_records()` are `a-x: 3`, `c-y: 2`. This fails on `main`, where the
     order is `[a-x, c-y, d-z]`. The log file of run 3 (`log_messages`) contains
-    `Pass 1 of 1 over 3 files (…) starts; 2 that failed before start last`. Runs without earlier failures, such as
-    run 1, have no such clause.
+    `Pass 1 of 1 over 3 files (…) starts; 2 that failed before`. Runs without earlier failures, such as run 1, have no
+    such clause.
   - `test_with_a_partial_folder_an_untried_file_waits_for_the_room_a_failed_files_kept_partial_frees`
     (with `partial_root`, next to the room tests). Known-failed `F` (path first) has an idle kept partial. Untried
     `U` fits only once `F`'s partial is gone. In pass 1, `U` starts first and is deferred with `no room yet …`,

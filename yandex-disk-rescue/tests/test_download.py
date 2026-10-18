@@ -1766,10 +1766,7 @@ def test_a_rerun_starts_files_never_failed_first_then_the_failed_ones_fewest_fai
     assert _content_order(disk, earlier) == ['disk:/M/d-z.bin', 'disk:/M/c-y.bin', 'disk:/M/a-x.bin']
     assert [(path, turns) for path, _, turns in _failure_records()] == [('disk:/M/a-x.bin', 3), ('disk:/M/c-y.bin', 2)]
     assert (dest / 'd-z.bin').read_bytes() == b'z' * 1000
-    assert (
-        f'Pass 1 of 1 over 3 files ({format_size(3000)}) starts; 2 that failed before start last'
-        in (log_messages()[logged:])
-    )
+    assert f'Pass 1 of 1 over 3 files ({format_size(3000)}) starts; 2 that failed before' in (log_messages()[logged:])
     assert f'Pass 1 of 1 over 1 file ({format_size(1000)}) starts' in first_log
 
 

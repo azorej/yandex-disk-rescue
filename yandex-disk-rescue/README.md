@@ -142,18 +142,16 @@ yandex-disk-rescue/
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines and `scan_document`, the scan's JSON object
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
-│   │                 #   over the retry set (failed, quarantined or partial files, files with a finding,
-│   │                 #   failed folders) and the folders
-│   │                 #   above it (skip, hold quarantined files, fetch again files with a finding without
-│   │                 #   reading their copy, folders, things in the way, hard-link aliases) with
-│   │                 #   up to `download_connections` files in progress at once (files with failure records
-│   │                 #   started last, fewest failed turns first), after moving the confirmed
-│   │                 #   bytes of the downloads in progress when the partial folder changed since the last run
-│   │                 #   and, with separate partial files, admission to the partial folder's room (measured
-│   │                 #   once, idle partial files counting what they allocate, each fetched file its full size,
-│   │                 #   in the order files start: wait, defer to the next pass, or fail a file larger than
-│   │                 #   the room, and
-│   │                 #   every file deferred for room at once when a pass changed nothing in it),
+│   │                 #   over the retry set (failed, quarantined or partial files, files with a finding, failed
+│   │                 #   folders) and the folders above it (skip, hold quarantined files, fetch again files with a
+│   │                 #   finding without reading their copy, folders, things in the way, hard-link aliases) with up
+│   │                 #   to `download_connections` files in progress at once (files with failure records started
+│   │                 #   last, fewest failed turns first), after moving the confirmed bytes of the downloads in
+│   │                 #   progress when the partial folder changed since the last run and, with separate partial
+│   │                 #   files, admission to the partial folder's room (measured once, idle partial files counting
+│   │                 #   what they allocate, each fetched file its full size, in the order files start: wait, defer
+│   │                 #   to the next pass, or fail a file larger than the room, and every file deferred for room at
+│   │                 #   once when a pass changed nothing in it),
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
 │   │                 #   pipeline (adopt a matching local copy, record one that cannot be read as a `corrupt`

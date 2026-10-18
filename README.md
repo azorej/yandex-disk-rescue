@@ -308,27 +308,26 @@ resume — happens on that disk, not on DEST:
   network, fetching slows down instead of filling `PATH`.
 - The partial files never take more than the room `PATH` had when the run
   started: the free space of its filesystem, plus what the partial files
-  already there take, minus a reserve of 1 GiB left for everything else.
-  Once any move (below) is done, the run prints `Partial files in PATH/<key>
-  (<size> available)`. A file being downloaded counts its full size; a
-  partial file kept for a later pass or run counts the disk space it
-  actually takes, which for a segmented file is only what was written so
-  far, until it is deleted (also when its file is found already in DEST
-  and adopted). Files take their room in the order they start, a file that does not
-  fit yet waits for one in progress to end, and when none is left in
-  progress it is deferred to the next pass with `no room yet in the partial
-  folder <folder> (<size> needed, <size> available)`. When a pass starts no
-  download and frees no room, and every file it defers waits for room, the
-  partial files kept there can never make room for each other: those files
-  fail at once, whatever `--download-passes` says, with `no room in the
-  partial folder <folder> next to the partial files kept there (<size>
-  needed, <size> available); free space there, then run again or with
-  --retry-failed`. A file larger than the whole room fails with `larger than
-  the room in the partial folder <folder> (<size> needed, <size>
-  available)`; `--retry-failed` fetches it once there is room.
-  When another program fills that disk anyway, the run stops with `Error:
-  Could not write <path>: No space left on device.` (below) and a rerun
-  resumes from the journals.
+  already there take, minus a reserve of 1 GiB left for everything else. Once
+  any move (below) is done, the run prints `Partial files in PATH/<key>
+  (<size> available)`. A file being downloaded counts its full size; a partial
+  file kept for a later pass or run counts the disk space it actually takes,
+  which for a segmented file is only what was written so far, until it is
+  deleted (also when its file is found already in DEST and adopted). Files
+  take their room in the order they start, a file that does not fit yet waits
+  for one in progress to end, and when none is left in progress it is deferred
+  to the next pass with `no room yet in the partial folder <folder> (<size>
+  needed, <size> available)`. When a pass starts no download and frees no
+  room, and every file it defers waits for room, the partial files kept there
+  can never make room for each other: those files fail at once, whatever
+  `--download-passes` says, with `no room in the partial folder <folder> next
+  to the partial files kept there (<size> needed, <size> available); free
+  space there, then run again or with --retry-failed`. A file larger than the
+  whole room fails with `larger than the room in the partial folder <folder>
+  (<size> needed, <size> available)`; `--retry-failed` fetches it once there
+  is room. When another program fills that disk anyway, the run stops with
+  `Error: Could not write <path>: No space left on device.` (below) and a
+  rerun resumes from the journals.
 - Use a persistent folder on a fast local disk: not a tmpfs, and not a
   container layer that a rebuild discards. When the folder is lost, the
   downloads in progress start again from their first byte. Do not share one
