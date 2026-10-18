@@ -763,13 +763,14 @@ one file (its download link, or the check of an unfinished download against
 the Disk) that keeps failing is told apart from an outage first: the
 tool asks the API for the download link of another file of the mirror that got
 one, the last one in this run, or else a verified one (of this mirror, or else
-of another mirror of the same account). When nothing in the mirror ever got a
-link, the tool asks for the account (`GET /v1/disk/`) instead. When that
+of another mirror of the same account). When there is no such file (no other
+file got a link in this run, and no file of the account is verified), the tool
+asks for the account (`GET /v1/disk/`) instead. When that
 answers, only the file's turn fails: it waits for the next pass with the API's
 status as its reason, an unfinished download keeping the bytes it has, and the
 run goes on. When it does not answer, the run
 stops as an outage, with the file's error. The run also stops at the 11th such
-file of a run in a mirror where nothing ever got a link, its error ending with
+file of a run with no such file to ask about, its error ending with
 `(no file of this mirror got a download link: 10 failed the same way)`.
 Ctrl+C or SIGTERM
 (`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; rerun to

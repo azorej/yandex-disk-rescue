@@ -1297,6 +1297,26 @@ def test_a_link_request_failing_for_one_file_defers_only_that_file_and_retry_fai
     assert local_file(dest, readme).read_bytes() == FILES[readme]
 
 
+@pytest.mark.parametrize('status', [404, 403])
+def test_a_reference_file_the_disk_refuses_still_shows_the_api_answers(disk, dest, status):
+    readme = 'disk:/Docs/readme.txt'
+    assert run_download(str(dest)).exit_code == 0
+    local_file(dest, readme).unlink()
+    earlier, accounts = len(disk.requests), _account_checks(disk)
+    disk.inject('GET', '/v1/disk/resources/download', 500, 500, status)
+
+    result = run_download('--api-retries', '1', '--download-passes', '1', str(dest))
+
+    assert result.exit_code == 1, result.output
+    assert f'Failed: 1\n  {readme}: {LINK_500}\n' in result.stdout
+    assert stderr_lines(result.stderr)[-1] == 'Error: 1 failed; see the list above.'
+    [reference] = {r.params['path'] for r in disk.requests[earlier:] if r.path == '/v1/disk/resources/download'} - {
+        readme
+    }
+    assert reference in FILES
+    assert _account_checks(disk) == accounts + 1
+
+
 def _assert_stopped_by_an_outage(result) -> None:
     assert result.exit_code == 1, result.output
     error = stderr_lines(result.stderr)[-1]
@@ -1334,7 +1354,7 @@ def test_a_fresh_mirror_whose_links_all_fail_stops_after_ten_files(disk, dest):
         disk.add_file(f'disk:/Many/{index:02}.txt', b'many', modified=MODIFIED)
     disk.inject('GET', '/v1/disk/resources/download', *[500] * 50)
 
-    result = run_download('--api-retries', '0', 'disk:/Many', str(dest))
+    result = run_download('--api-retries', '0', '--download-connections', '1', 'disk:/Many', str(dest))
 
     assert result.exit_code == 1, result.output
     error = stderr_lines(result.stderr)[-1]
@@ -1344,13 +1364,43 @@ def test_a_fresh_mirror_whose_links_all_fail_stops_after_ten_files(disk, dest):
         '(no file of this mirror got a download link: 10 failed the same way)'
     ), error
     assert 'Mirrored' not in result.stdout
-    assert _account_checks(disk) <= 1 + mirroring.UNREFERENCED_FAILURES
+    assert _account_checks(disk) == 1 + mirroring.UNREFERENCED_FAILURES
 
 
-def test_a_token_rejected_on_a_link_request_stops_the_run(disk, dest):
+SOLO = 'disk:/Solo/a.txt'
+
+
+def _reject_the_token_on_the_link(disk, dest) -> None:
     disk.inject('GET', '/v1/disk/resources/download', 401)
 
-    result = run_download(str(dest))
+
+def _reject_the_token_on_the_account_probe(disk, dest) -> None:
+    disk.inject('GET', '/v1/disk/resources/download', 500, where={'path': SOLO})
+    disk.inject('GET', '/v1/disk/', Delay(0), 401)
+
+
+def _reject_the_token_on_the_reference_link_probe(disk, dest) -> None:
+    reference = 'disk:/Solo/b.txt'
+    disk.add_file(reference, b'reference')
+    assert run_download('disk:/Solo', str(dest)).exit_code == 0
+    (dest / 'a.txt').unlink()
+    disk.inject('GET', '/v1/disk/resources/download', 500, where={'path': SOLO})
+    disk.inject('GET', '/v1/disk/resources/download', 401, where={'path': reference})
+
+
+@pytest.mark.parametrize(
+    'reject',
+    [
+        _reject_the_token_on_the_link,
+        _reject_the_token_on_the_account_probe,
+        _reject_the_token_on_the_reference_link_probe,
+    ],
+)
+def test_a_token_rejected_on_a_link_request_stops_the_run(disk, dest, reject):
+    disk.add_file(SOLO, b'solo')
+    reject(disk, dest)
+
+    result = run_download('--api-retries', '0', 'disk:/Solo', str(dest))
 
     assert result.exit_code == 1
     [error] = stderr_lines(result.stderr)

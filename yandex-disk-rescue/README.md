@@ -185,7 +185,8 @@ yandex-disk-rescue/
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
 │   │                 #   a per-file Disk API request failing past the retries deferring only its file while
 │   │                 #   the API still gives another file's link (`ApiProbe`; or answers the account
-│   │                 #   request, at most `UNREFERENCED_FAILURES` files, when nothing in the mirror got one),
+│   │                 #   request, at most `UNREFERENCED_FAILURES` files, when no other file got a link in
+│   │                 #   this run and no file of the account is verified),
 │   │                 #   failure records written and counted as each turn fails (also one deferred to a
 │   │                 #   later pass) and dropped as entries succeed, with the silent streak of turns that got
 │   │                 #   no byte (throttling and turns deferred for a failed Disk API request neither count

@@ -329,6 +329,9 @@ The plan is written for the recommendation of each decision.
   - With a reference file: the file's retries plus the probe's retries, at a pace already throttled to 2 s. That is
     about 30–45 s at the defaults, against about 15 s today.
   - Under the bound: up to 10 files' retries plus probes, on the shared 2 s pace, about 2–3 minutes.
+- **The probe holds a download connection.** It runs inside the file's link request, while the file holds one of
+  the `download_connections` slots (`ContentClient.fetch` in `api/transfer.py`), roughly doubling the slot time per
+  broken file, to about 12–15 s at the defaults.
 - **The resources endpoint alone failing.** A resume check probe goes to the link endpoint, so an outage of
   `GET /v1/disk/resources` alone defers the resumed files instead of stopping. The cost is bounded by the number of
   unfinished downloads, and their bytes are kept.
