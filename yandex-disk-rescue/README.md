@@ -113,6 +113,9 @@ mirror up by its destination without creating one.
 
 ```
 yandex-disk-rescue/
+├── pyproject.toml    # Package metadata, dependencies, the `yandex-disk-rescue` console script, the uv_build backend
+├── PYPI.md           # The PyPI page (the long description): absolute https:// links only
+├── LICENSE           # A byte-identical copy of the repository LICENSE, shipped in the sdist and the wheel
 ├── src/yandex_disk_rescue/
 │   ├── __init__.py   # Package version (read from installed metadata)
 │   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the global `--config`
@@ -269,6 +272,9 @@ yandex-disk-rescue/
     ├── test_local_names.py
     ├── test_manifest.py
     ├── test_output.py
+    ├── test_packaging.py   # A real `uv build`: the sdist and the wheel, their metadata, the PyPI page and its links,
+    │                       #   the license (byte-identical to the repository LICENSE), the console script, the
+    │                       #   wheel's contents
     ├── test_rate_limiter.py
     ├── test_scan.py
     ├── test_transfer.py

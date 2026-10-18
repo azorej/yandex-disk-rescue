@@ -1315,6 +1315,7 @@ Dependencies: `uv add <pkg> --package <member>` (runtime) or
 ├── docs/                 # Guides (GitHub setup) and implementation plans
 ├── scripts/              # Standalone helper scripts
 ├── AGENTS.md             # Rules for humans and agents — start here
+├── CHANGELOG.md          # Release notes, one section per version
 ├── mise.toml             # Tool versions, env, tasks
 └── pyproject.toml        # Workspace root: members, dev deps, ruff, pytest
 ```

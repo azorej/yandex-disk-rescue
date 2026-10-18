@@ -35,7 +35,7 @@ from mirror_tree import (
     wait_until,
 )
 from rich.cells import cell_len
-from yandex_disk_rescue import destination, localfs, logs, mirroring, progress, view
+from yandex_disk_rescue import __version__, destination, localfs, logs, mirroring, progress, view
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.commands.download import INTERRUPTED
@@ -59,7 +59,7 @@ def test_every_run_logs_its_start_and_end_to_a_private_log_file(disk, dest):
     assert [LOG_LINE.match(line)['command'] for line in (lines[0], lines[-1])] == ['download', 'scan']
     messages = log_messages()
     assert messages[0].startswith(
-        f'download started: version 0.1.0, pid {os.getpid()}; remote_path=disk:/, dest={dest}'
+        f'download started: version {__version__}, pid {os.getpid()}; remote_path=disk:/, dest={dest}'
     )
     assert 'download_connections=20' in messages[0]
     assert messages.index('download completed (exit 0)') > messages.index('Summary:')
@@ -302,9 +302,9 @@ def test_the_log_names_every_failed_file_and_a_rerun_appends_to_it(disk, dest):
     assert all(f'  {path}: {reason}' in messages for path in refused)
     runs = [m for m in messages if m.startswith('download ') and ('started:' in m or '(exit ' in m)]
     assert [m.partition(';')[0] if 'started:' in m else m for m in runs] == [
-        f'download started: version 0.1.0, pid {os.getpid()}',
+        f'download started: version {__version__}, pid {os.getpid()}',
         'download failed (exit 1): 25 failed; see the list above.',
-        f'download started: version 0.1.0, pid {os.getpid()}',
+        f'download started: version {__version__}, pid {os.getpid()}',
         'download completed (exit 0)',
     ]
 
@@ -933,7 +933,7 @@ def test_json_of_a_clean_quiet_run_is_the_only_output(disk, dest):
     assert {key: document[key] for key in ('schema_version', 'command', 'version', 'exit_code')} == {
         'schema_version': 1,
         'command': 'download',
-        'version': '0.1.0',
+        'version': __version__,
         'exit_code': 0,
     }
     assert re.fullmatch(ISO_TIME, document['started_at'])

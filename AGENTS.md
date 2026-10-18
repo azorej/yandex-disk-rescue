@@ -80,6 +80,7 @@ commands — never a raw `python`, `pip`, or `.venv/bin/...`.
 ├── .claude/              # Claude Code: shared settings, hooks, subagents
 ├── docs/                 # Guides; docs/plans/ holds implementation plans
 ├── scripts/              # Standalone helper scripts (not dev tasks — those are mise tasks)
+├── CHANGELOG.md          # Release notes (Keep a Changelog): `[Unreleased]`, then one section per version
 ├── mise.toml             # Tool versions, env, tasks
 ├── pyproject.toml        # Workspace root: members, dev deps, ruff/pytest config
 └── uv.lock               # Lock file — generated, never edited by hand
@@ -136,6 +137,7 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
 | uv/Python image for CI | `UV_IMAGE` in `.dagger/src/repo_ci/main.py` |
 | ruff, pytest, pre-commit, libraries | `uv.lock` |
 | zizmor, actionlint, shellcheck | `uv.lock` |
+| uv_build (build backend) | range in `yandex-disk-rescue/pyproject.toml` and `.dagger/pyproject.toml`, moved together with uv in `mise.toml` |
 | pre-commit hook repos | `.pre-commit-config.yaml` |
 | GitHub Actions | full commit SHA in `.github/workflows/*.yml` (updated by Dependabot) |
 | mise, base OS | `.devcontainer/Dockerfile` |

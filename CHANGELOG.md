@@ -1,0 +1,31 @@
+# Changelog
+
+All notable changes to yandex-disk-rescue are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project adheres to
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- `auth login`, `auth status` and `auth logout`: an OAuth token that can only read the Disk, checked with Yandex
+  before it is saved to a `0600` file, or taken from `YANDEX_DISK_RESCUE_TOKEN`.
+- `scan`: the remote tree of `disk:/` or one folder into a local manifest, with the changes since the last scan.
+- `download [REMOTE_PATH] DEST`: a verified mirror of a Disk folder, keeping the folder structure, empty folders and
+  modification times.
+  - Resumable and crash-safe: an interrupted transfer continues from its last confirmed byte, and a rerun fetches
+    only what is missing or changed.
+  - Every file is checked against its cloud size, MD5 and SHA-256 before it is placed.
+  - Parallel downloads, and segmented downloads of large files with checkpoints.
+  - `--partial-dir` keeps partial files on a separate, faster folder.
+  - A copy that fails the check is kept in quarantine, never deleted.
+  - `--retry-failed` retries only the failed, quarantined, unfinished or broken files.
+- `verify DEST`: an offline, resumable re-hash of a mirror against the manifest; the next `download` repairs what it
+  finds.
+- Progress: a live view on a terminal and status lines elsewhere.
+- A rotating log file in the XDG state directory.
+- `--json` reports of `scan`, `download` and `verify`.
+- Adaptive pacing and back-off that honour the API's `429` and `Retry-After`.
+- A config file (`config.toml`) and environment variables for every option.
+- Documented exit codes: `0`, `1`, `2` and `130`.
