@@ -2308,13 +2308,99 @@ def test_once_the_original_downloads_its_preview_is_deleted(photo, dest, retry_f
     assert f'{DEAD_PATH}: its preview {PREVIEW_FILE} deleted' in log_messages()
 
 
-def test_a_preview_that_cannot_be_fetched_is_reported_and_the_run_is_unchanged(photo, dest, tmp_path):
-    photo.inject('GET', '/preview', *[500] * 10)
+def test_no_previews_still_deletes_the_preview_of_a_file_now_downloaded(photo, dest, tmp_path, monkeypatch):
+    assert _failing_run(photo, dest).exit_code == 1
+    second = 'disk:/Dead/second.jpg'
+    photo.add_file(second, b'second', modified=MODIFIED, preview=PHOTO_PREVIEW)
+    photo.inject('GET', '/download', 503, where={'path': second})
+    earlier = len(photo.requests)
+
+    kept = _failing_run(photo, dest, '--no-previews', '--scan-max-age', '0', '--json')
+
+    assert kept.exit_code == 1
+    document = json.loads(kept.stdout)
+    assert document['previews'] is False
+    assert document['preview_only'] == [{'path': DEAD_PATH, 'preview': PREVIEW_FILE, 'bytes': len(PHOTO_PREVIEW)}]
+    assert (document['counts']['failed'], document['preview_errors']) == (2, [])
+    assert _preview_requests(photo, earlier) == []
+    assert 'Saving the previews' not in kept.stderr
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+
+    result = run_download('--no-previews', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert local_file(dest, DEAD_PATH).read_bytes() == DEAD
+    assert not _mentions_previews(result.stdout)
+    assert list(_previews_folder(dest).iterdir()) == []
+    assert _preview_records() == []
+    assert _preview_requests(photo, earlier) == []
+    assert f'{DEAD_PATH}: its preview {PREVIEW_FILE} deleted' in log_messages()
+    assert json.loads(_failing_run(photo, tmp_path / 'twin', '--json').stdout)['previews'] is True
+
+
+def test_a_preview_left_unfinished_by_a_crash_is_deleted_by_the_next_run(photo, dest, tmp_path, monkeypatch):
+    assert _failing_run(photo, dest).exit_code == 1
+    preview = dest / PREVIEW_FILE
+    unfinished = [preview.parent / '0123456789abcdef.preview-saving', _previews_folder(dest) / 'f.preview-saving']
+    for path in unfinished:
+        path.write_bytes(b'half a preview')
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'kept.preview-saving').write_bytes(b'not ours')
+    (preview.parent / 'linked').symlink_to(outside)
+    (preview.parent / 'link.preview-saving').symlink_to(outside / 'kept.preview-saving')
+    (preview.parent / 'folder.preview-saving').mkdir()
+
+    result = _failing_run(photo, dest, '--no-previews')
+
+    assert result.exit_code == 1
+    assert not any(path.exists() for path in unfinished)
+    assert (outside / 'kept.preview-saving').read_bytes() == b'not ours'
+    assert (preview.parent / 'link.preview-saving').is_symlink()
+    assert (preview.parent / 'folder.preview-saving').is_dir()
+    assert preview.read_bytes() == PHOTO_PREVIEW
+    assert '2 unfinished previews deleted' in log_messages()
+    unfinished[0].write_bytes(b'half a preview')
+    unlink = os.unlink
+
+    def refused(name, *args, **kwargs):
+        if str(name).endswith('.preview-saving'):
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+        unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'unlink', refused)
+
+    unreadable = _failing_run(photo, dest, '--no-previews')
+
+    assert unreadable.exit_code == 1
+    assert unfinished[0].exists()
+    assert f'{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n' in unreadable.stdout
+    denied = os.strerror(errno.EACCES)
+    assert f'Could not delete the unfinished previews in {_previews_folder(dest)}: {denied}' in stderr_lines(
+        unreadable.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ('route', 'where', 'reason'),
+    [
+        (
+            '/v1/disk/resources',
+            {'preview_size': 'XXXL'},
+            'Could not read the preview: Yandex Disk API returned HTTP 500: Injected HTTP 500 (after 2 attempts)',
+        ),
+        ('/preview', None, 'Could not fetch the preview: the preview host returned HTTP 500 (after 2 attempts)'),
+    ],
+    ids=['metadata', 'image'],
+)
+def test_a_preview_that_cannot_be_fetched_is_reported_and_the_run_is_unchanged(
+    photo, dest, tmp_path, route, where, reason
+):
+    photo.inject('GET', route, *[500] * 10, where=where)
 
     result = _failing_run(photo, dest, '--api-retries', '1')
 
     assert result.exit_code == 1
-    reason = 'Could not fetch the preview: the preview host returned HTTP 500 (after 2 attempts)'
     assert f'Failed: 1\n  {DEAD_PATH}: {SERVICE_UNAVAILABLE}\nPreviews not saved: 1\n  {DEAD_PATH}: {reason}\n' in (
         result.stdout
     )

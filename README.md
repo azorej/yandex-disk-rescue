@@ -243,9 +243,9 @@ is created before anything inside it, empty folders are created, and every
 file gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
 `--download-connections`, `--download-checkpoint-mib`, `--download-segments`,
-`--download-segment-threshold-mib`, `--partial-dir` and `--scan-max-age` (see
-[Configuration](#configuration)), `--no-scan` and `--retry-failed`
-(below). A file whose download host never answers holds one connection until
+`--download-segment-threshold-mib`, `--partial-dir`, `--scan-max-age` and
+`--previews/--no-previews` (see [Configuration](#configuration)), `--no-scan`
+and `--retry-failed` (below). A file whose download host never answers holds one connection until
 it stalls and delays no other file.
 
 **Order.** Files with no failure record start first, in path order. Files that
@@ -564,7 +564,10 @@ made and everything below it, no room in the partial folder, a hard link to
 another file, a file changed or removed on the Disk) and quarantined files,
 which have a full-size copy in `quarantine/`, get none. The run prints
 `Saving the previews of N failed files to DEST/.yandex-disk-rescue/previews`
-first.
+first. `--no-previews` (`previews = false`, `YANDEX_DISK_RESCUE_PREVIEWS=false`)
+turns fetching off: no preview request is made and the headline is not
+printed, while the previews already saved for a file's current version are
+still listed, and those of files now verified are still deleted.
 
 - The preview is saved at the file's local path below
   `DEST/.yandex-disk-rescue/previews/`, named `<local name>.preview<ext>`
@@ -582,7 +585,8 @@ first.
   file fails too, its preview replaces the older version's.
 - Once the original is downloaded and verified, its preview and its record
   are deleted, so `previews/` holds exactly the files you have only as a
-  preview. A preview of a file later removed from the Disk stays in
+  preview. A preview a crash left half-written (`*.preview-saving`) is
+  deleted at the start of the next run's preview step. A preview of a file later removed from the Disk stays in
   `previews/`, untracked, until you delete it.
 - A preview that cannot be fetched or saved is listed under `Previews not
   saved` with the reason. A token Yandex rejects, or a full disk, an I/O
@@ -856,7 +860,9 @@ Each file of the mirror, as of the last scan, is one of:
   downloaded, failed (with the reason its last failed turn was reported with,
   such as `Yandex Disk never started sending this file: …`), unfinished,
   changed on the Disk since it was downloaded, or a name that is not valid
-  Unicode.
+  Unicode. When a [preview](#downloading) of the current version is saved,
+  the line ends with `; a preview is saved at <path>`, the path the manifest
+  records.
 
 A file with a finding (missing, modified or corrupt) is listed under its
 finding even when a later download of it was quarantined: the finding
@@ -872,7 +878,9 @@ records a copy it could not read [the same way](#downloading), so `verify`
 lists it under `Corrupt` until it is repaired. A file `verify` finds intact
 again drops its finding. Paths of DEST with no Disk
 counterpart (local-only files, `.DS_Store`, …) are never opened, listed or
-reported, and folders are not checked.
+reported, and folders are not checked. Nothing below
+`.yandex-disk-rescue/previews/` is opened, checked or reported either: a
+preview is named from the manifest alone.
 
 A read error usually means that one file is damaged, and the file is reported
 as corrupt. When DEST itself cannot be read any more, such as a disk unplugged
@@ -886,7 +894,7 @@ continues from it.
 
 ```
 Verifying 1120 files (1.2 GiB) in /mnt/backup/Photos
-Verified /mnt/backup/Photos (disk:/Photos): 1115 intact, 1 missing, 1 modified, 1 corrupt, 1 quarantined, 1 not downloaded
+Verified /mnt/backup/Photos (disk:/Photos): 1115 intact, 1 missing, 1 modified, 1 corrupt, 1 quarantined, 2 not downloaded
 Checked by size only (no cloud checksum): 1
   disk:/Photos/old.bmp
 Missing: 1
@@ -897,7 +905,8 @@ Corrupt: 1
   disk:/Photos/2024/beach.jpg: MD5 mismatch (expected …, got …)
 Quarantined: 1
   disk:/Photos/bad.jpg: MD5 mismatch (expected …, got …); kept at .yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg
-Not downloaded: 1
+Not downloaded: 2
+  disk:/Photos/napkin.jpg: the download host s123klg.storage.yandex.net returned HTTP 500; a preview is saved at .yandex-disk-rescue/previews/napkin.jpg.preview.jpg
   disk:/Photos/new.jpg: not downloaded yet
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
@@ -1200,8 +1209,9 @@ scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
 there is none, `partial_room` the room measured in a separate partial
-folder, and `sparse_partials` whether the partial folder's filesystem keeps
-sparse files, without which new downloads are not segmented):
+folder, `sparse_partials` whether the partial folder's filesystem keeps
+sparse files, without which new downloads are not segmented, and `previews`
+the `--previews/--no-previews` value):
 
 ```json
 {
@@ -1222,6 +1232,7 @@ sparse files, without which new downloads are not segmented):
   "preview_only": [], "preview_errors": [],
   "partials_left": [],
   "partial_dir": "/mnt/fast",
+  "previews": true,
   "partial_move": {"source": "/mnt/old/0a1b2c3d4e5f6a7b", "target": "/mnt/fast/0a1b2c3d4e5f6a7b",
                    "downloads": 2, "size": 750000, "missing": false},
   "partial_room": {"folder": "/mnt/fast/0a1b2c3d4e5f6a7b", "available": 53687091200},
@@ -1241,7 +1252,7 @@ read; `counts` cover the whole pass):
   "schema_version": 1, "command": "verify", "…": "…",
   "destination": "/mnt/backup", "remote_root": "disk:/Photos",
   "counts": {"intact": 1199, "size_only": 2, "missing": 1, "modified": 0, "corrupt": 1, "quarantined": 1,
-             "not_downloaded": 0, "problems": 3},
+             "not_downloaded": 1, "problems": 4},
   "size_only": ["disk:/Photos/a.heic", "disk:/Photos/b.heic"],
   "missing": [{"path": "disk:/Photos/x.jpg", "reason": "x.jpg is missing", "repair_quarantined": null}],
   "modified": [],
@@ -1250,13 +1261,16 @@ read; `counts` cover the whole pass):
                                       "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/y.jpg"}}],
   "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
                    "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
-  "not_downloaded": [],
+  "not_downloaded": [{"path": "disk:/Photos/napkin.jpg", "reason": "the download host … returned HTTP 500",
+                      "preview": ".yandex-disk-rescue/previews/napkin.jpg.preview.jpg"}],
   "pass": {"started_at": "2026-10-24T09:00:00.512Z", "continued": true, "files_read": 400, "size_read": 2147483648}
 }
 ```
 
 `repair_quarantined` is set when the download meant to repair a finding was
-quarantined (the summary's `; repair quarantined: …; kept at …`).
+quarantined (the summary's `; repair quarantined: …; kept at …`). Each
+`not_downloaded` item has `path`, `reason` and `preview`, the path of the
+preview saved for the file's current version (relative to DEST), or `null`.
 
 ## Running unattended
 
@@ -1485,11 +1499,12 @@ first one that sets it wins:
 | `partial_dir` | `--partial-dir` (`download`) | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | empty (partial files in DEST) | an absolute path of an existing folder outside DEST, or empty; see [Partial files](#downloading) |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `progress_interval` | `--progress-interval` (`scan`, `download`, `verify`) | `YANDEX_DISK_RESCUE_PROGRESS_INTERVAL` | `60` | 1 to 3600 (s); seconds between two status lines on stderr and in the log file |
+| `previews` | `--previews/--no-previews` (`download`) | `YANDEX_DISK_RESCUE_PREVIEWS` | `true` | `true` or `false` (the environment variable also takes `1`/`0`, `yes`/`no`); fetch the preview of each file that failed on Yandex's side, see [Previews](#downloading) |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
 (`auth login`, `auth status`, `scan`, `download`); the `download_*` options,
-`partial_dir` and `scan_max_age` apply to `download`, `progress_interval` to
+`partial_dir`, `scan_max_age` and `previews` apply to `download`, `progress_interval` to
 `scan`, `download` and `verify`, and `client_id` to `auth login`. `verify`
 never talks to the Disk API and takes no `api_*` option, and `auth logout`
 takes no option.

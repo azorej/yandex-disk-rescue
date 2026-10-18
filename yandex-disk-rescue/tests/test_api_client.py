@@ -404,7 +404,7 @@ async def test_a_preview_link_that_is_not_an_http_url_is_an_unexpected_response(
             await client.preview('disk:/a.jpg')
 
     assert str(excinfo.value) == (
-        'Could not read the preview of disk:/a.jpg: Yandex Disk API returned an unexpected response to '
+        'Could not read the preview: Yandex Disk API returned an unexpected response to '
         'GET /v1/disk/resources: preview is not an http(s) URL.'
     )
 

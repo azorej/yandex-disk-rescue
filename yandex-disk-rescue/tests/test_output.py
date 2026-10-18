@@ -815,7 +815,11 @@ def test_a_reason_quoting_a_local_name_with_a_newline_stays_one_line_in_the_repo
     assert f'  {missing}' in messages
     assert [problem['path'] for problem in document['missing']] == ['disk:/Two\nlines.txt']
     assert document['not_downloaded'] == [
-        {'path': 'disk:/Blocked\nhere/x.txt', 'reason': f'could not write Blocked\nhere: {os.strerror(errno.EACCES)}'}
+        {
+            'path': 'disk:/Blocked\nhere/x.txt',
+            'reason': f'could not write Blocked\nhere: {os.strerror(errno.EACCES)}',
+            'preview': None,
+        }
     ]
 
 

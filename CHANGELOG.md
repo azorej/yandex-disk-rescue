@@ -20,6 +20,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   deletes it once the file is downloaded. The summary lists the files saved only as a preview and the previews not
   saved, as does `--json` (`preview_only`, `preview_errors`, `counts.previews_pending`); Ctrl+C or SIGTERM during the
   preview step stops only that step. The manifest records each saved preview (schema version 12).
+- `--no-previews` (`previews = false`, `YANDEX_DISK_RESCUE_PREVIEWS=false`) turns preview fetching off; previews of
+  files now downloaded are still deleted. `verify` names the saved preview of a file not downloaded (`; a preview is
+  saved at <path>`, and `preview` in `--json`), and never reads anything in `previews/`.
 
 ### Changed
 

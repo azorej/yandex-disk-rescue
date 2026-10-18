@@ -1,6 +1,6 @@
-"""The preview step at the end of a `download` run: the preview images of verified files are deleted, and each file
-that failed on Yandex's side gets Yandex's largest preview of it, saved below `.yandex-disk-rescue/previews/` and
-recorded in the manifest.
+"""The preview step at the end of a `download` run: the unfinished previews a crashed save left and the preview images
+of verified files are deleted, and, unless previews are turned off, each file that failed on Yandex's side gets
+Yandex's largest preview of it, saved below `.yandex-disk-rescue/previews/` and recorded in the manifest.
 
 The step never fails the run. A preview that cannot be fetched or saved is reported in `MirrorReport.preview_errors`,
 and the step goes on; a token Yandex rejects, or an error in the previews folder that no other preview would escape
@@ -35,17 +35,25 @@ def preview_candidates(report: MirrorReport) -> list[Failure]:
 
 
 async def save_previews(
-    report: MirrorReport, mirror: Mirror, destination: Destination, client: api.DiskClient, progress: PreviewProgress
+    report: MirrorReport,
+    mirror: Mirror,
+    destination: Destination,
+    client: api.DiskClient,
+    progress: PreviewProgress,
+    *,
+    fetch: bool,
 ) -> None:
     """Run the preview step of the run `report` describes, reporting it to `progress` and in `report`.
 
-    First every preview whose file is verified for its current identity is deleted with its record; one that cannot
-    be deleted keeps its record. Then each of `preview_candidates(report)`, up to the client's concurrency at once: a
-    file whose preview of its current identity is saved, a regular file at the recorded path, is listed as it is; any
-    other asks the API for its preview, fetches it at once, saves it in a worker thread, records it, and deletes the
-    file of an earlier record at another path. A file Yandex offers no preview of, or no longer has, is listed
-    nowhere, so the next run asks again; one that changed on the Disk since the scan is a preview error, and nothing
-    is fetched for it. The lists of `report` end in path order.
+    First the unfinished previews a crashed save left below `previews/` are deleted, and every preview whose file is
+    verified for its current identity is deleted with its record; one that cannot be deleted keeps its record. Then
+    each of `preview_candidates(report)`, up to the client's concurrency at once: a file whose preview of its current
+    identity is saved, a regular file at the recorded path, is listed as it is; with `fetch`, any other asks the API
+    for its preview, fetches it at once, saves it in a worker thread, records it, and deletes the file of an earlier
+    record at another path. A file Yandex offers no preview of, or no longer has, is listed nowhere, so the next run
+    asks again; one that changed on the Disk since the scan is a preview error, and nothing is fetched for it. Without
+    `fetch` no request is made, and a file with no preview saved is listed nowhere. The lists of `report` end in path
+    order.
 
     Returns normally when Ctrl+C or SIGTERM cancels it, with the cancellation taken back (`Task.uncancel`). Raises
     `ManifestError` when the manifest cannot be updated.
@@ -54,10 +62,11 @@ async def save_previews(
     entries = {entry.resource.path: entry for entry in mirror.entries()}
     workers = client.limits.concurrency
     with DiskThreads(workers) as threads:
-        step = _PreviewStep(report, mirror, destination, client, progress, threads)
+        step = _PreviewStep(report, mirror, destination, client, progress, threads, fetch=fetch)
         if candidates:
             progress.start(len(candidates))
         try:
+            await step.remove_unfinished()
             await step.clean_up(entries.values())
             queue = iter(candidates)
             await _concurrently([step.work(queue, entries) for _ in range(workers)])
@@ -84,6 +93,8 @@ class _PreviewStep:
         client: api.DiskClient,
         progress: PreviewProgress,
         threads: DiskThreads,
+        *,
+        fetch: bool,
     ) -> None:
         self._report = report
         self._mirror = mirror
@@ -91,8 +102,20 @@ class _PreviewStep:
         self._client = client
         self._progress = progress
         self._threads = threads
+        self._fetch = fetch
         self._stopped: str | None = None
         self.handled = 0
+
+    async def remove_unfinished(self) -> None:
+        """Delete the unfinished previews below `previews/`; an error is logged as a warning, and the step goes on."""
+        try:
+            removed = await self._threads.run(self._destination.remove_unfinished_previews)
+        except OSError as exc:
+            folder = self._destination.path / WORK_DIR_NAME / PREVIEWS_DIR_NAME
+            _log.warning('Could not delete the unfinished previews in %s: %s', folder, exc.strerror)
+            return
+        if removed:
+            _log.info('%d unfinished previews deleted', removed)
 
     async def clean_up(self, entries: Iterable[MirrorEntry]) -> None:
         """Delete the preview and the record of each of `entries` verified for its current identity."""
@@ -123,6 +146,9 @@ class _PreviewStep:
                 _log.debug('%s: its preview is saved at %s already', entry.resource.path, earlier.path)
                 self._listed(entry, earlier.path, earlier.bytes)
                 return
+        if not self._fetch:
+            self._settled(saved=False)
+            return
         try:
             found = await self._client.preview(entry.resource.path)
         except api.RemotePathNotFoundError:

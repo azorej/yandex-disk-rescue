@@ -368,6 +368,56 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
     assert _findings() == []
 
 
+def _paths_touched(monkeypatch) -> list[str]:
+    """Record the full path of every name opened, looked up or listed through a folder descriptor."""
+    touched: list[str] = []
+    calls = {'open': os.open, 'stat': os.stat, 'scandir': os.scandir}
+
+    def where(name, dir_fd) -> str:
+        if isinstance(name, int):
+            return os.readlink(f'/proc/self/fd/{name}')
+        base = os.getcwd() if dir_fd is None else os.readlink(f'/proc/self/fd/{dir_fd}')
+        return os.path.join(base, name)
+
+    def recording(call):
+        def recorded(path='.', *args, dir_fd=None, **kwargs):
+            touched.append(where(path, dir_fd))
+            return calls[call](path, *args, dir_fd=dir_fd, **kwargs) if call != 'scandir' else calls[call](path)
+
+        return recorded
+
+    for call in calls:
+        monkeypatch.setattr(os, call, recording(call))
+    return touched
+
+
+def test_verify_names_a_saved_preview_and_never_reads_the_previews_folder(disk, dest, monkeypatch):
+    napkin = 'disk:/Dead/napkin.jpg'
+    disk.add_file(napkin, b'napkin', modified=MODIFIED, preview=b'\xff\xd8 reduced')
+    disk.inject('GET', '/download', 503, where={'path': napkin})
+    assert run_download('--download-passes', '1', str(dest)).exit_code == 1
+    preview = PurePosixPath('.yandex-disk-rescue', 'previews', 'Dead', 'napkin.jpg.preview.jpg')
+    reason = 'the download host 127.0.0.1 returned HTTP 503'
+    listed = f'Not downloaded: 1\n  {napkin}: {reason}; a preview is saved at {preview}\n'
+
+    result = _verify(str(dest))
+
+    assert result.exit_code == 1
+    assert _intact_lines(dest, 6, not_downloaded=1) + listed in result.stdout
+    as_json = _verify('--json', str(dest))
+    assert json.loads(as_json.stdout)['not_downloaded'] == [{'path': napkin, 'reason': reason, 'preview': str(preview)}]
+    (dest / preview).chmod(0)
+    (dest / preview).parent.parent.joinpath('extra.jpg').write_bytes(b'stray')
+    touched = _paths_touched(monkeypatch)
+
+    again = _verify(str(dest))
+
+    assert (again.exit_code, again.stdout) == (result.exit_code, result.stdout)
+    assert 'extra.jpg' not in again.output
+    assert any(path.startswith(f'{dest}/') for path in touched)
+    assert [path for path in touched if '/previews' in path] == []
+
+
 def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_finding_with_the_repair(disk, dest):
     assert run_download(str(dest)).exit_code == 0
     local = _flip_keeping_mtime(local_file(dest, CORRUPT), 10)

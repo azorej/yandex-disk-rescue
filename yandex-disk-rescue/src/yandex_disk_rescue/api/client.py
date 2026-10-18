@@ -213,12 +213,13 @@ class DiskClient:
         offers no preview of it (an archive, for example).
 
         Fetch the link with `fetch_preview` right away: how long it stays valid is unknown.
-        Raises `RemotePathNotFoundError` when the path does not exist.
+        Raises `RemotePathNotFoundError` when the path does not exist. The message of a `DiskApiError` does not name
+        the path, which its caller reports the error next to.
         """
         target = normalize_remote_path(path)
         if target == ROOT:
             raise ValueError('the root disk:/ has no preview')
-        context = f'Could not read the preview of {target}'
+        context = 'Could not read the preview'
         params = {'path': target, 'fields': _PREVIEW_FIELDS, 'preview_size': PREVIEW_SIZE}
         response = await self._get(RESOURCES_PATH, params, context=context)
         if response.status_code == httpx.codes.NOT_FOUND:

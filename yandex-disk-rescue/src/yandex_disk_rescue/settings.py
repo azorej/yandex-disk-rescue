@@ -1,7 +1,8 @@
 """The registry of options: every option's name, flag, env var, default and validation.
 
 A command takes an option by annotating a parameter with the entry's `Annotated` type and defaulting it to
-the entry's `default`. A value comes from the flag, else the env var, else the config file, else the default.
+the entry's `default`. A value comes from the flag, else the env var, else the config file, else the default. A bool
+option is the flag pair `--<name>/--no-<name>`; its env var takes `true`/`false`, `1`/`0` or `yes`/`no`.
 Validation runs on the value from every source; a violation is a usage error (exit 2) naming the option and the
 values it accepts.
 """
@@ -49,8 +50,12 @@ class Setting[T]:
         return self.check(value)
 
     def typer_option(self) -> Any:
+        """The Typer option of this setting; a bool setting is the flag pair `--<name>/--no-<name>`."""
+        declaration = self.flag
+        if isinstance(self.default, bool):
+            declaration += f'/--no-{self.flag.removeprefix("--")}'
         return typer.Option(
-            self.flag, envvar=self.env_var, callback=self._validated, help=self.help, hidden=self.hidden
+            declaration, envvar=self.env_var, callback=self._validated, help=self.help, hidden=self.hidden
         )
 
     def _validated(self, value: T) -> T:
@@ -59,7 +64,7 @@ class Setting[T]:
         return value
 
 
-_TYPE_NAMES = {int: 'an integer', str: 'a string'}
+_TYPE_NAMES = {bool: 'true or false', int: 'an integer', str: 'a string'}
 
 
 def _in_range(low: int, high: int) -> Callable[[int], str | None]:
@@ -80,6 +85,10 @@ def _absolute_or_empty(value: str) -> str | None:
     if value == '' or os.path.isabs(value):
         return None
     return 'must be an absolute path, or empty to keep partial files in DEST.'
+
+
+def _always_valid(_: object) -> None:
+    return None
 
 
 def _client_id(value: str) -> str | None:
@@ -168,6 +177,13 @@ PROGRESS_INTERVAL = Setting(
     'log file.',
     _in_range(1, 3600),
 )
+PREVIEWS = Setting(
+    'previews',
+    True,
+    "Save Yandex's preview of each file that failed on Yandex's side in DEST/.yandex-disk-rescue/previews/; "
+    '--no-previews requests none, and still deletes the previews of files now downloaded.',
+    _always_valid,
+)
 CLIENT_ID = Setting(
     'client_id',
     '9e2a0382c430429c9d57913b61d7d48f',
@@ -193,6 +209,7 @@ SETTINGS: dict[str, Setting[Any]] = {
         PARTIAL_DIR,
         SCAN_MAX_AGE,
         PROGRESS_INTERVAL,
+        PREVIEWS,
         CLIENT_ID,
     )
 }
@@ -212,6 +229,7 @@ DownloadSegmentThresholdMib = Annotated[int, DOWNLOAD_SEGMENT_THRESHOLD_MIB.type
 PartialDir = Annotated[str, PARTIAL_DIR.typer_option()]
 ScanMaxAge = Annotated[int, SCAN_MAX_AGE.typer_option()]
 ProgressInterval = Annotated[int, PROGRESS_INTERVAL.typer_option()]
+Previews = Annotated[bool, PREVIEWS.typer_option()]
 ClientId = Annotated[str, CLIENT_ID.typer_option()]
 
 

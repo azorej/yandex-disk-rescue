@@ -594,6 +594,32 @@ class Destination(_Tree):
                 raise
             os.fsync(folder_fd)
 
+    def remove_unfinished_previews(self) -> int:
+        """Delete every regular file below `previews/` with the temporary name of a preview being saved, which a save
+        stopped by a crash leaves behind, never descending through a link; the number deleted. Nothing when `previews/`
+        is missing. Any error is the `OSError` of the call."""
+        try:
+            previews_fd = localfs.open_dir(PREVIEWS_DIR_NAME, dir_fd=self._work_fd)
+        except FileNotFoundError:
+            return 0
+        removed = 0
+        try:
+            for _, _, names, folder_fd in os.fwalk(dir_fd=previews_fd, onerror=_raise):
+                unfinished = [
+                    name
+                    for name in names
+                    if name.endswith(_PREVIEW_TEMP_SUFFIX)
+                    and stat.S_ISREG(localfs.lstat(name, dir_fd=folder_fd).st_mode)
+                ]
+                for name in unfinished:
+                    os.unlink(name, dir_fd=folder_fd)
+                if unfinished:
+                    os.fsync(folder_fd)
+                removed += len(unfinished)
+        finally:
+            os.close(previews_fd)
+        return removed
+
     def remove_preview(self, path: PurePosixPath) -> None:
         """Delete the regular file at `path`, a `preview_path`, and then each folder below `previews/` this left empty;
         nothing when `path` or a folder on the way is gone. Raises `FileExistsError` when something other than a
@@ -874,6 +900,10 @@ def _preview_folder(path: PurePosixPath) -> PurePosixPath:
     if len(parts) < 3 or parts[:2] != (WORK_DIR_NAME, PREVIEWS_DIR_NAME) or {'', '.', '..'} & set(parts):
         raise ValueError(f'{str(path)!r} is not a path below {WORK_DIR_NAME}/{PREVIEWS_DIR_NAME}/')
     return PurePosixPath(*parts[1:-1])
+
+
+def _raise(exc: OSError) -> None:
+    raise exc
 
 
 def _write_all(fd: int, content: bytes) -> None:
