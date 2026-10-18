@@ -25,7 +25,7 @@ from contextlib import ExitStack, contextmanager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
-from typing import Self
+from typing import Literal, Self
 
 from yandex_disk_rescue import localfs
 from yandex_disk_rescue.errors import RescueError
@@ -47,7 +47,12 @@ FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS})
 _WORK_FATAL_ERRNOS = FATAL_ERRNOS | {errno.EACCES, errno.EPERM}
 # How a filesystem refuses a name it cannot hold, as exFAT refuses `?`.
 NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
-_MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+# A path, or a folder on the way to it, that is missing or not a real folder.
+MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+# A read failing with one of these means the device is gone, whatever the destination's path still answers.
+DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
+# The process ran out of descriptors or memory: the error says nothing about the path it was opening or reading.
+PROCESS_LIMIT_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOMEM})
 
 
 class DestinationUsageError(RescueError):
@@ -57,12 +62,19 @@ class DestinationUsageError(RescueError):
     exit_code = 2
 
 
+type DiskAction = Literal['read', 'write', 'inspect']
+
+
 class DestinationError(RescueError):
-    """Writing to the destination failed in a way that stops the run."""
+    """Reading, writing or inspecting the destination failed in a way that stops the run; the message names the
+    action and the path."""
+
+    def __init__(self, action: DiskAction, path: Path | str, reason: str) -> None:
+        super().__init__(f'Could not {action} {path}: {reason}.')
 
     @classmethod
-    def of(cls, path: Path | str, exc: OSError) -> Self:
-        return cls(f'Could not write {path}: {exc.strerror}.')
+    def of(cls, action: DiskAction, path: Path | str, exc: OSError) -> Self:
+        return cls(action, path, exc.strerror)
 
 
 def check_destination(raw: str) -> Path:
@@ -126,7 +138,7 @@ class _Tree:
             with self._folder(local.parent) as parent_fd:
                 return _lstat_name(local.name, parent_fd)
         except OSError as exc:
-            if exc.errno in _MISSING_ERRNOS:
+            if exc.errno in MISSING_ERRNOS:
                 return None
             raise
 
@@ -139,6 +151,21 @@ class _Tree:
             yield ExistingFile(fd)
         finally:
             os.close(fd)
+
+    def reachable(self) -> bool:
+        """Whether the destination itself can still be read: its path `lstat`ed afresh and its folder listed through a
+        new descriptor, so a disk that is gone fails even where open descriptors still answer."""
+        try:
+            os.lstat(self.path)
+            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                with os.scandir(fd) as found:
+                    next(found, None)
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return True
 
     @contextmanager
     def _folder(self, local: PurePosixPath) -> Iterator[int]:
@@ -184,26 +211,11 @@ class ReadOnlyDestination(_Tree):
             lock_fd = _read_lock(fds[0], resolved)
         except OSError as exc:
             _close_all(fds)
-            raise DestinationError(f'Could not read {path}: {exc.strerror}.') from None
+            raise DestinationError.of('read', path, exc) from None
         except BaseException:
             _close_all(fds)
             raise
         return cls(resolved, fds[0], lock_fd)
-
-    def reachable(self) -> bool:
-        """Whether the destination itself can still be read: its path `lstat`ed afresh and its folder listed through a
-        new descriptor, so a disk that is gone fails even where open descriptors still answer."""
-        try:
-            os.lstat(self.path)
-            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-            try:
-                with os.scandir(fd) as found:
-                    next(found, None)
-            finally:
-                os.close(fd)
-        except OSError:
-            return False
-        return True
 
     def close(self) -> None:
         _close_all([self._root_fd] if self._lock_fd is None else [self._root_fd, self._lock_fd])
@@ -230,7 +242,8 @@ class Destination(_Tree):
     they exist.
 
     An error in the work directory or the partial folder that every file would meet (a full disk, an I/O error, a
-    read-only filesystem, a permission error) raises `DestinationError`; other errors are the `OSError` of the call.
+    read-only filesystem, a permission error) raises `DestinationError` with the action that failed: `read`, `write`
+    or `inspect` (an `lstat`, `fstat` or `fstatvfs`); other errors are the `OSError` of the call.
 
     Every method blocks on the disk and may run in a worker thread. Moving aside and quarantining create this run's
     folders on first use, so no two of them may run at once.
@@ -279,7 +292,7 @@ class Destination(_Tree):
                 separate = _separate_folder(partial_dir, partial_folder_key(resolved))
         except OSError as exc:
             _close_all(fds)
-            raise DestinationError.of(path, exc) from None
+            raise DestinationError.of('write', path, exc) from None
         except BaseException:
             _close_all(fds)
             raise
@@ -366,7 +379,7 @@ class Destination(_Tree):
             names.append((_copy_name(entry_id), self._partial_fd, self._own_partials))
         for name, dir_fd, folder in names:
             path = folder / name
-            with _work_errors(path):
+            with _work_errors('write', path):
                 try:
                     os.unlink(name, dir_fd=dir_fd)
                 except FileNotFoundError:
@@ -376,7 +389,7 @@ class Destination(_Tree):
 
     def sync_partial_folder(self) -> None:
         """Make the files created in and deleted from the partial folder durable."""
-        with _work_errors(self.partial_folder):
+        with _work_errors('write', self.partial_folder):
             os.fsync(self._files_fd)
 
     def partial_free_bytes(self) -> int:
@@ -385,7 +398,7 @@ class Destination(_Tree):
         try:
             return localfs.free_bytes(self._files_fd)
         except OSError as exc:
-            raise DestinationError.of(self.partial_folder, exc) from None
+            raise DestinationError.of('inspect', self.partial_folder, exc) from None
 
     def partial_allocated(self, entry_id: int) -> int:
         """The bytes the partial file of `entry_id` allocates on its filesystem, which a sparse file keeps below its
@@ -396,7 +409,7 @@ class Destination(_Tree):
         except FileNotFoundError:
             return 0
         except OSError as exc:
-            raise DestinationError.of(self.partial_folder / name, exc) from None
+            raise DestinationError.of('inspect', self.partial_folder / name, exc) from None
         return found.st_blocks * 512 if stat.S_ISREG(found.st_mode) else 0
 
     def previous_partials(self, folder: Path) -> PreviousPartials | None:
@@ -407,9 +420,9 @@ class Destination(_Tree):
         try:
             fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError as exc:
-            if exc.errno in _MISSING_ERRNOS:
+            if exc.errno in MISSING_ERRNOS:
                 return None
-            raise DestinationError.of(folder, exc) from None
+            raise DestinationError.of('read', folder, exc) from None
         self._previous_fds.append(fd)
         return PreviousPartials(fd, folder, own=False)
 
@@ -426,7 +439,7 @@ class Destination(_Tree):
         try:
             here, there = os.fstat(self._files_fd), previous.stat()
         except OSError as exc:
-            raise DestinationError.of(previous.path, exc) from None
+            raise DestinationError.of('inspect', previous.path, exc) from None
         return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
 
     def remove_staged_copies(self) -> None:
@@ -440,7 +453,7 @@ class Destination(_Tree):
                 os.unlink(name, dir_fd=self._partial_fd)
             os.fsync(self._partial_fd)
         except OSError as exc:
-            raise DestinationError.of(self._own_partials, exc) from None
+            raise DestinationError.of('write', self._own_partials, exc) from None
 
     def keep_partials(self, entry_ids: Collection[int]) -> None:
         """Delete every regular file in the partial folder that is not the partial file of one of `entry_ids`; anything
@@ -452,7 +465,7 @@ class Destination(_Tree):
             for name in stray:
                 os.unlink(name, dir_fd=self._files_fd)
         except OSError as exc:
-            raise DestinationError.of(self.partial_folder, exc) from None
+            raise DestinationError.of('write', self.partial_folder, exc) from None
 
     def place(self, entry_id: int, local: PurePosixPath) -> os.stat_result:
         """Move the finished partial file of `entry_id`, or with separate partials its staged copy, to `local` without
@@ -472,7 +485,7 @@ class Destination(_Tree):
         durable."""
         with ExitStack() as stack:
             source_fd = stack.enter_context(self._folder(local.parent))
-            with _work_errors(self.path / WORK_DIR_NAME / REPLACED_DIR_NAME):
+            with _work_errors('write', self.path / WORK_DIR_NAME / REPLACED_DIR_NAME):
                 target_fd = stack.enter_context(_made_folder(self._run_folder_fd(REPLACED_DIR_NAME), local.parent))
             localfs.rename_noreplace(local.name, local.name, src_dir_fd=source_fd, dst_dir_fd=target_fd)
             os.fsync(target_fd)
@@ -486,7 +499,7 @@ class Destination(_Tree):
         When the filesystem refuses the file's name (`NAME_ERRNOS`), the copy gets its `rejected_name_conversion`.
         """
         with (
-            _work_errors(self.path / WORK_DIR_NAME / QUARANTINE_DIR_NAME),
+            _work_errors('write', self.path / WORK_DIR_NAME / QUARANTINE_DIR_NAME),
             _made_folder(self._run_folder_fd(QUARANTINE_DIR_NAME), local.parent) as target_fd,
         ):
             source, name = self._placed_name(entry_id), local.name
@@ -517,7 +530,7 @@ class Destination(_Tree):
     @contextmanager
     def _open_in_work_dir(self, name: str, dir_fd: int, folder: Path, flags: int) -> Iterator[PartialFile]:
         path = folder / name
-        with _work_errors(path):
+        with _work_errors('write', path):
             fd = os.open(name, flags | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o666, dir_fd=dir_fd)
         try:
             yield PartialFile(fd, path)
@@ -581,14 +594,14 @@ class PartialFile:
         self._path = path
 
     def size(self) -> int:
-        with _work_errors(self._path):
+        with _work_errors('inspect', self._path):
             return os.fstat(self._fd).st_size
 
     def chunks(self, start: int, end: int) -> Iterator[bytes]:
         """The bytes `[start, end)` in order, in chunks of at most 1 MiB; the file must hold at least `end` bytes."""
         offset = start
         while offset < end:
-            with _work_errors(self._path):
+            with _work_errors('read', self._path):
                 chunk = localfs.read(self._fd, min(_READ_SIZE, end - offset), offset)
             if not chunk:
                 raise ValueError(f'the partial file ends at {offset} bytes, before {end}')
@@ -596,12 +609,12 @@ class PartialFile:
             offset += len(chunk)
 
     def truncate(self, length: int) -> None:
-        with _work_errors(self._path):
+        with _work_errors('write', self._path):
             os.ftruncate(self._fd, length)
 
     def write(self, offset: int, chunk: bytes) -> None:
         view = memoryview(chunk)
-        with _work_errors(self._path):
+        with _work_errors('write', self._path):
             while view:
                 written = os.pwrite(self._fd, view, offset)
                 view = view[written:]
@@ -609,12 +622,12 @@ class PartialFile:
 
     def sync(self) -> None:
         """Flush the content written so far to the disk."""
-        with _work_errors(self._path):
+        with _work_errors('write', self._path):
             os.fsync(self._fd)
 
     def finish(self, mtime_ns: int) -> None:
         """Set the modification time and flush the content and metadata to the disk."""
-        with _work_errors(self._path):
+        with _work_errors('write', self._path):
             localfs.set_times(self._fd, atime_ns=mtime_ns, mtime_ns=mtime_ns)
             os.fsync(self._fd)
 
@@ -643,7 +656,7 @@ class PreviousPartials:
         except FileNotFoundError:
             return None
         except OSError as exc:
-            raise DestinationError.of(self.path / name, exc) from None
+            raise DestinationError.of('inspect', self.path / name, exc) from None
         return found.st_size if stat.S_ISREG(found.st_mode) else None
 
     @contextmanager
@@ -653,7 +666,7 @@ class PreviousPartials:
         try:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=self._fd)
         except OSError as exc:
-            raise DestinationError.of(path, exc) from None
+            raise DestinationError.of('read', path, exc) from None
         try:
             yield PartialFile(fd, path)
         finally:
@@ -669,7 +682,7 @@ class PreviousPartials:
                 pass
             os.fsync(self._fd)
         except OSError as exc:
-            raise DestinationError.of(self.path / name, exc) from None
+            raise DestinationError.of('write', self.path / name, exc) from None
 
     def remove_leftovers(self) -> None:
         """Delete every regular file in the folder, and then the folder itself, which is left in place when something
@@ -685,7 +698,7 @@ class PreviousPartials:
             if not self._own:
                 _remove_empty_folder(self.path)
         except OSError as exc:
-            raise DestinationError.of(self.path, exc) from None
+            raise DestinationError.of('write', self.path, exc) from None
 
 
 def _remove_empty_folder(path: Path) -> None:
@@ -704,13 +717,13 @@ def _remove_empty_folder(path: Path) -> None:
 
 
 @contextmanager
-def _work_errors(path: Path) -> Iterator[None]:
+def _work_errors(action: DiskAction, path: Path) -> Iterator[None]:
     """Raise `DestinationError` for an error at `path` in the work directory that every other file would meet."""
     try:
         yield
     except OSError as exc:
         if exc.errno in _WORK_FATAL_ERRNOS:
-            raise DestinationError.of(path, exc) from None
+            raise DestinationError.of(action, path, exc) from None
         raise
 
 
@@ -760,7 +773,7 @@ def _separate_folder(partial_dir: Path, key: str) -> tuple[int, Path]:
         finally:
             os.close(parent_fd)
     except OSError as exc:
-        raise DestinationError.of(folder, exc) from None
+        raise DestinationError.of('write', folder, exc) from None
 
 
 def _create_last_component(path: Path) -> Path:
@@ -781,9 +794,7 @@ def _work_dir(name: str, parent_fd: int, shown: Path) -> int:
         return localfs.open_dir(name, dir_fd=parent_fd)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
-            raise DestinationError(
-                f'Could not write {shown}: it is not a folder; move it away and run again.'
-            ) from None
+            raise DestinationError('write', shown, 'it is not a folder; move it away and run again') from None
         raise
 
 
@@ -799,13 +810,13 @@ def _read_lock(root_fd: int, destination: Path) -> int | None:
     try:
         work_fd = localfs.open_dir(WORK_DIR_NAME, dir_fd=root_fd)
     except OSError as exc:
-        if exc.errno in _MISSING_ERRNOS:
+        if exc.errno in MISSING_ERRNOS:
             return None
         raise
     try:
         fd = os.open(LOCK_FILE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=work_fd)
     except OSError as exc:
-        if exc.errno in _MISSING_ERRNOS:
+        if exc.errno in MISSING_ERRNOS:
             return None
         raise
     finally:
@@ -834,8 +845,10 @@ def _probe_noreplace(partial_fd: int, destination: Path) -> None:
         except FileNotFoundError:
             pass
     unsupported = DestinationError(
-        f'Could not write {destination}: its filesystem does not support renaming without replacing '
-        '(RENAME_NOREPLACE), which download needs so it never overwrites a file.'
+        'write',
+        destination,
+        'its filesystem does not support renaming without replacing (RENAME_NOREPLACE), which download needs so it '
+        'never overwrites a file',
     )
     _touch(first, partial_fd)
     try:

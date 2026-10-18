@@ -81,10 +81,11 @@ mirror up by its destination without creating one.
   `Mirror.record_quarantined` replaces any earlier record and deletes the entry's download record (with its journal)
   and its failure; verifying the file (`record_verified`) deletes it, while `forget` keeps it.
   `MirrorEntry.quarantine` reads it.
-- A finding (`verify_findings`) is what `verify` found wrong with the file at the entry's final path: `missing`,
-  `modified` or `corrupt`, with the reason. It belongs to the entry, not to its download record, so `record_partial`,
-  `checkpoint`, `forget` and `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there),
-  `Mirror.clear_finding` and removing the entry drop it. `Mirror.record_finding` replaces any earlier one, and
+- A finding (`verify_findings`) is what was found wrong with the file at the entry's final path, with the reason:
+  by `verify` (`missing`, `modified` or `corrupt`), or by `download` (`corrupt`, a copy it could not read). It
+  belongs to the entry, not to its download record, so `record_partial`, `checkpoint`, `forget` and
+  `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there), `Mirror.clear_finding` and
+  removing the entry drop it. `Mirror.record_finding` replaces any earlier one, and
   `MirrorEntry.finding` reads it.
 - A rescan never touches names, records, failures, quarantine records or findings; removing an entry from the
   manifest deletes them all.
@@ -138,9 +139,9 @@ yandex-disk-rescue/
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines and `scan_document`, the scan's JSON object
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
-│   │                 #   over the retry set (failed, quarantined or partial files, files with a verify finding,
+│   │                 #   over the retry set (failed, quarantined or partial files, files with a finding,
 │   │                 #   failed folders) and the folders
-│   │                 #   above it (skip, hold quarantined files, fetch again files with a verify finding without
+│   │                 #   above it (skip, hold quarantined files, fetch again files with a finding without
 │   │                 #   reading their copy, folders, things in the way, hard-link aliases) with
 │   │                 #   up to `download_connections` files in progress at once, after moving the confirmed
 │   │                 #   bytes of the downloads in progress when the partial folder changed since the last run
@@ -150,7 +151,8 @@ yandex-disk-rescue/
 │   │                 #   every file deferred for room at once when a pass changed nothing in it),
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
-│   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
+│   │                 #   pipeline (adopt a matching local copy, record one that cannot be read as a `corrupt`
+│   │                 #   finding and fetch the file again, or resume a partial file segment by segment
 │   │                 #   from its checkpoint journal once the cloud file is confirmed unchanged and each
 │   │                 #   segment's confirmed bytes re-hashed; the segment plan of a new download; one link per
 │   │                 #   file shared by its segments and taken once one holds a connection, preallocation of
@@ -184,7 +186,8 @@ yandex-disk-rescue/
 │   │                 #   deleted at the start of the next), the partial folder an earlier run used (reading,
 │   │                 #   deleting its partial files and its leftovers, whether it is this run's folder under
 │   │                 #   another path), the free space of the partial folder and
-│   │                 #   the bytes each partial file allocates there, reading existing files,
+│   │                 #   the bytes each partial file allocates there, reading existing files, whether the
+│   │                 #   destination itself is still readable (`reachable`),
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
 │   │                 #   link; which errors stop the run;
@@ -228,7 +231,7 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure and quarantine records, verify findings, the verify pass and the folder of the
+│   │                 #   failure and quarantine records, findings, the verify pass and the folder of the
 │   │                 #   partial files per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option

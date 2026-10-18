@@ -8,10 +8,10 @@ file with the recorded fingerprint whose content does not match, or that cannot 
 its size, then every checksum the record has; a match is *intact*. Each finding is committed to the manifest as soon
 as it is made, an intact file drops its earlier finding, and `download` fetches again every file with a finding.
 
-Any other file is reported without being read: under its finding when it has one (the copy `verify` found is still at
-its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. A file
-listed under its finding whose quarantine record is for its current identity has its repair quarantined, and its line
-says so with the quarantine reason and the copy's path.
+Any other file is reported without being read: under its finding when it has one (the copy found broken, by `verify`
+or by `download` as unreadable, is still at its path), else as quarantined when its quarantine record is for its
+current identity, else as not downloaded. A file listed under its finding whose quarantine record is for its current
+identity has its repair quarantined, and its line says so with the quarantine reason and the copy's path.
 Paths with no manifest entry are never opened, listed or reported.
 
 A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C,
@@ -19,10 +19,10 @@ SIGTERM, SIGKILL or an unreadable destination continues where its committed curs
 whole pass.
 
 A read error stops the check instead of being recorded when the destination itself has become unreadable, as a
-disconnected disk makes every file unreadable.
+disconnected disk makes every file unreadable, and when the process is out of descriptors or memory, which says nothing
+about the file.
 """
 
-import errno
 import logging
 import stat
 import time
@@ -30,7 +30,12 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from yandex_disk_rescue.destination import ReadOnlyDestination
+from yandex_disk_rescue.destination import (
+    DEVICE_GONE_ERRNOS,
+    PROCESS_LIMIT_ERRNOS,
+    DestinationError,
+    ReadOnlyDestination,
+)
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import (
     DownloadRecord,
@@ -59,8 +64,6 @@ from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 # the files checked in this time, and the one in flight.
 CURSOR_SECONDS = 5.0
 
-# A read failing with one of these means the device is gone, whatever the destination's path still answers.
-_DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
 _log = logging.getLogger(__name__)
 
 
@@ -145,7 +148,8 @@ class VerifyRun:
         """Check every file still to read in path order, recording each finding as it is made, and end the pass.
 
         Raises `DestinationUnreadableError` when a read fails and the destination itself cannot be read, or the error
-        says the device is gone; nothing is recorded for that file, and the cursor stays before it.
+        says the device is gone, and `DestinationError` when it fails because the process is out of descriptors or
+        memory; nothing is recorded for that file, and the cursor stays before it.
         """
         report = VerifyReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         self._progress.start(self.files, self.size)
@@ -153,7 +157,7 @@ class VerifyRun:
             for entry in self._entries:
                 self._report(entry, report)
                 self._progress.problems(report.problems)
-        except KeyboardInterrupt, DestinationUnreadableError:
+        except KeyboardInterrupt, DestinationUnreadableError, DestinationError:
             self._commit_cursor()
             raise
         self._mirror.end_verify_pass()
@@ -284,7 +288,9 @@ def _finding(entry: MirrorEntry, destination: ReadOnlyDestination, read: Callabl
             else:
                 mismatch = _content_mismatch(file.chunks(), record.identity, read)
     except OSError as exc:
-        if exc.errno in _DEVICE_GONE_ERRNOS or not destination.reachable():
+        if exc.errno in PROCESS_LIMIT_ERRNOS:
+            raise DestinationError.of('read', destination.path / local, exc) from None
+        if exc.errno in DEVICE_GONE_ERRNOS or not destination.reachable():
             raise DestinationUnreadableError(destination.path, exc.strerror or str(exc)) from None
         return Finding('corrupt', f'could not read {local}: {exc.strerror}')
     if mismatch is None:

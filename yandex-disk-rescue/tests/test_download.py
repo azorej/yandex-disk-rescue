@@ -567,6 +567,7 @@ def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and
         'adopted': 0,
         'size_only': 1,
         'renamed': 0,
+        'unreadable': 0,
         'moved_aside': 0,
         'quarantined': 1,
         'failed': 1,
@@ -867,6 +868,138 @@ def test_an_untracked_different_file_is_moved_aside_and_the_cloud_file_placed(di
     assert (run / 'Docs' / 'readme.txt').stat().st_mtime_ns == 10**18
     assert readme.read_bytes() == FILES['disk:/Docs/readme.txt']
     assert '6 downloaded' in result.stdout
+
+
+README = 'disk:/Docs/readme.txt'
+
+
+def _untracked_readme(dest) -> tuple[Path, int]:
+    """An untracked copy of `README` with the Disk content and an mtime of its own; its path and inode."""
+    readme = dest / 'Docs' / 'readme.txt'
+    readme.parent.mkdir(parents=True)
+    readme.write_bytes(FILES[README])
+    os.utime(readme, ns=(10**18, 10**18))
+    return readme, readme.stat().st_ino
+
+
+def _refuse_reads(patch, inode: int, code: int, before: Callable[[], None] = lambda: None) -> list[int]:
+    """Make every read of the file with `inode` call `before`, then fail with `code`; the inodes of the reads
+    refused."""
+    read = localfs.read
+    refused: list[int] = []
+
+    def failing(fd, size, offset):
+        if os.fstat(fd).st_ino == inode:
+            refused.append(inode)
+            before()
+            raise OSError(code, os.strerror(code))
+        return read(fd, size, offset)
+
+    patch.setattr(localfs, 'read', failing)
+    return refused
+
+
+def _findings() -> list[tuple[str, str, str]]:
+    """The (remote path, finding, reason) of every finding in the manifest, read with a connection of its own."""
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        return connection.execute(
+            'SELECT e.path, v.finding, v.reason FROM verify_findings v JOIN entries e ON e.id = v.entry_id ORDER BY 1'
+        ).fetchall()
+
+
+@pytest.mark.parametrize(
+    ('code', 'output'), [(errno.EIO, 'human'), (errno.EBADMSG, 'json')], ids=['EIO-human', 'EBADMSG-json']
+)
+def test_an_unreadable_local_copy_is_moved_aside_and_downloaded_again(disk, dest, monkeypatch, code, output):
+    readme, inode = _untracked_readme(dest)
+    reason = f'could not read Docs/readme.txt: {os.strerror(code)}'
+    args = ('--json',) if output == 'json' else ()
+
+    with monkeypatch.context() as patch:
+        refused = _refuse_reads(patch, inode, code)
+        result = run_download(*args, str(dest))
+
+    assert result.exit_code == 0, result.output
+    summary = result.stderr if output == 'json' else result.stdout
+    assert f'Mirrored disk:/ to {dest}: 6 downloaded ' in summary
+    assert ', 0 skipped, 0 quarantined, 0 failed\n' in summary
+    [run] = replaced_runs(dest)
+    assert (
+        f'Unreadable in DEST, downloaded again: 1\n  {README}: {reason}\n'
+        f'Moved aside to .yandex-disk-rescue/replaced/{run.name}/: 1\n  Docs/readme.txt\n'
+    ) in summary
+    assert f'{README} corrupt: {reason}' in stderr_lines(result.stderr)
+    if output == 'json':
+        document = json.loads(result.stdout)
+        assert (document['exit_code'], document['counts']['unreadable']) == (0, 1)
+        assert document['unreadable'] == [{'path': README, 'reason': reason}]
+    assert refused == [inode]
+    moved = run / 'Docs' / 'readme.txt'
+    assert (moved.stat().st_ino, moved.read_bytes()) == (inode, FILES[README])
+    assert readme.read_bytes() == FILES[README]
+    assert readme.stat().st_ino != inode
+    assert _findings() == []
+
+
+def test_an_unreadable_local_copy_whose_repair_fails_is_not_read_again(disk, dest, monkeypatch):
+    readme, inode = _untracked_readme(dest)
+    reason = f'could not read Docs/readme.txt: {os.strerror(errno.EIO)}'
+    attempts = 2  # one per pass: a 503 before any byte is not retried within the pass
+    disk.inject('GET', '/download', *[503] * attempts, where={'path': README})
+    args = ('--download-passes', '2', str(dest))
+
+    with monkeypatch.context() as patch:
+        refused = _refuse_reads(patch, inode, errno.EIO)
+        first = run_download(*args)
+
+        assert first.exit_code == 1
+        assert len(_fetches(disk, README)) == attempts
+        assert ', 0 quarantined, 1 failed\n' in first.stdout
+        assert f'Unreadable in DEST, downloaded again: 1\n  {README}: {reason}\n' in first.stdout
+        assert f'Failed: 1\n  {README}: ' in first.stdout
+        assert readme.stat().st_ino == inode
+        assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+
+        checked = runner.invoke(app, ['verify', str(dest)])
+
+        assert checked.exit_code == 1
+        assert f'Corrupt: 1\n  {README}: {reason}\n' in checked.stdout
+
+        earlier = len(disk.requests)
+        second = run_download(*args)
+
+    assert second.exit_code == 0, second.output
+    assert _fetches(disk, README, earlier) == [None]
+    assert 'Unreadable in DEST' not in second.stdout
+    [run] = replaced_runs(dest)
+    assert f'Moved aside to .yandex-disk-rescue/replaced/{run.name}/: 1\n  Docs/readme.txt\n' in second.stdout
+    moved = run / 'Docs' / 'readme.txt'
+    assert (moved.stat().st_ino, moved.read_bytes()) == (inode, FILES[README])
+    assert readme.read_bytes() == FILES[README]
+    assert refused == [inode]
+    assert _findings() == []
+
+
+@pytest.mark.parametrize('code', [errno.EIO, errno.ENODEV], ids=errno.errorcode.get)
+def test_an_unreadable_local_copy_on_a_disk_that_is_gone_stops_the_run(disk, dest, monkeypatch, code):
+    _, inode = _untracked_readme(dest)
+    gone = dest.with_name('gone')
+
+    def unplug() -> None:
+        if code == errno.EIO:
+            dest.rename(gone)
+
+    with monkeypatch.context() as patch:
+        _refuse_reads(patch, inode, code, unplug)
+        result = run_download(str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not read {dest}/Docs/readme.txt: {os.strerror(code)}.']
+    assert 'Mirrored' not in result.stdout
+    assert _findings() == []
+    found = gone if code == errno.EIO else dest
+    assert not (found / '.yandex-disk-rescue' / 'replaced').exists()
+    assert (found / 'Docs' / 'readme.txt').stat().st_ino == inode
 
 
 def test_a_run_never_reuses_the_replaced_folder_of_an_earlier_run(disk, dest):
@@ -1490,22 +1623,26 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
     assert 'Mirrored' not in result.stdout
 
 
-@pytest.mark.parametrize('obstacle', ['mtime-not-permitted', 'unreadable', 'untraversable'])
-def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, dest, monkeypatch, obstacle):
+@pytest.mark.parametrize(
+    'obstacle', ['mtime-not-permitted', 'unreadable', 'untraversable', 'EMFILE', 'ENFILE', 'ENOMEM']
+)
+def test_a_copy_out_of_reach_fails_that_file_only(disk, dest, monkeypatch, obstacle):
     readme, local = 'disk:/Docs/readme.txt', dest / 'Docs' / 'readme.txt'
     if obstacle == 'untraversable':
         assert run_download(str(dest)).exit_code == 0
         _refuse(monkeypatch, 'lstat', errno.EACCES, lambda name: name in {'a.jpg', 'b.jpg'})
         denied = os.strerror(errno.EACCES)
         failed = [
-            (f'disk:/Photos/2024/{name}', f'could not read Photos/2024/{name}: {denied}') for name in ('a.jpg', 'b.jpg')
+            (f'disk:/Photos/2024/{name}', f'could not inspect Photos/2024/{name}: {denied}')
+            for name in ('a.jpg', 'b.jpg')
         ]
     else:
         local.parent.mkdir(parents=True)
         local.write_bytes(FILES[readme])
-        if obstacle == 'unreadable':
-            _refuse(monkeypatch, 'open_file', errno.EACCES, lambda name: name == 'readme.txt')
-            failed = [(readme, f'could not read Docs/readme.txt: {os.strerror(errno.EACCES)}')]
+        if obstacle != 'mtime-not-permitted':
+            code = errno.EACCES if obstacle == 'unreadable' else getattr(errno, obstacle)
+            _refuse(monkeypatch, 'open_file', code, lambda name: name == 'readme.txt')
+            failed = [(readme, f'could not read Docs/readme.txt: {os.strerror(code)}')]
         else:
             inode = local.stat().st_ino
             _refuse(monkeypatch, 'set_times', errno.EPERM, lambda fd: os.fstat(fd).st_ino == inode)
@@ -1522,8 +1659,28 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
     assert result_line == f'Error: {len(failed)} failed; see the list above.'
     assert _others_verified(dest, failed='')
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+    assert _findings() == []
     if obstacle != 'untraversable':
         assert local.stat().st_mtime_ns != _mtime_ns(MODIFIED)
+
+
+@pytest.mark.parametrize('copy', ['untracked', 'verified'])
+def test_an_io_error_inspecting_a_path_of_the_mirror_stops_the_run_naming_it(disk, dest, monkeypatch, copy):
+    local = dest / 'Docs' / 'readme.txt'
+    if copy == 'verified':
+        assert run_download(str(dest)).exit_code == 0
+    else:
+        local.parent.mkdir(parents=True)
+        local.write_bytes(FILES['disk:/Docs/readme.txt'])
+    _refuse(monkeypatch, 'lstat', errno.EIO, lambda name: name == 'readme.txt')
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not inspect {local}: {os.strerror(errno.EIO)}.']
+    assert 'Mirrored' not in result.stdout
+    assert local.read_bytes() == FILES['disk:/Docs/readme.txt']
+    assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
 def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(disk, dest):
@@ -2290,7 +2447,7 @@ def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_f
     result = run_download(*_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 1
-    assert stderr_lines(result.stderr) == [f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.']
+    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(errno.EBADMSG)}.']
     assert big.read_bytes()[:300_000] == BIG[:300_000]
     assert segmented.exists()
 

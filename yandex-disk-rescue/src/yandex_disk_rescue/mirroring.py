@@ -11,10 +11,12 @@ run copies it again without fetching; one stopped after the placing and before t
 adopts. A partial file that cannot be deleted once its file's outcome is recorded is reported, and the outcome stands.
 A downloaded file that fails the check is moved, never deleted, to the run's quarantine folder and recorded; while
 the cloud file keeps that identity, only `--retry-failed` downloads it again. A verified file whose record and `lstat`
-fingerprint still match is skipped without being read, unless `verify` found the file at its path broken: such a file
-is downloaded again without its copy there being read, and that copy is moved aside once the new one is verified. Any
-other file already at a final path is hashed: one matching the cloud is adopted as it is, and anything else there is
-moved aside once the new version is verified. Paths with no cloud counterpart are never looked at.
+fingerprint still match is skipped without being read, unless the entry has a finding (the copy at its path found
+broken): such a file is downloaded again without its copy there being read, and that copy is moved aside once the new
+one is verified. Any other file already at a final path is hashed: one matching the cloud is adopted as it is, and
+anything else there is moved aside once the new version is verified. A copy that cannot be read while the destination
+itself can is recorded as a `corrupt` finding and handled as such, so it is read at most once: no later pass or run
+reads it again. Paths with no cloud counterpart are never looked at.
 
 A file larger than the policy's segment threshold is downloaded as several segments, ranged fetches running in
 parallel into one partial file, which is preallocated to the file's size first and, with partial files in the
@@ -58,6 +60,7 @@ and the local names stay on the event loop thread.
 """
 
 import asyncio
+import errno
 import hashlib
 import itertools
 import logging
@@ -66,7 +69,7 @@ import stat
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Iterator, Sequence
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -75,16 +78,22 @@ from typing import Self
 
 from yandex_disk_rescue import api
 from yandex_disk_rescue.destination import (
+    DEVICE_GONE_ERRNOS,
     FATAL_ERRNOS,
+    MISSING_ERRNOS,
     NAME_ERRNOS,
+    PROCESS_LIMIT_ERRNOS,
     Destination,
     DestinationError,
+    DiskAction,
+    ExistingFile,
     PartialFile,
     PreviousPartials,
 )
 from yandex_disk_rescue.disk_threads import DiskThreads
 from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
+    Finding,
     LocalFingerprint,
     Mirror,
     MirrorEntry,
@@ -108,6 +117,10 @@ _SPARE_THREADS = 4
 _PREALLOCATION_STEP = 64 * 2**20
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
+# A copy in DEST whose open or read fails with one of these fails only its entry: the error says the copy is out of
+# reach (a permission, a path changed under the run) or the process is out of descriptors or memory, not that the copy
+# is unreadable.
+_COPY_OUT_OF_REACH_ERRNOS = MISSING_ERRNOS | PROCESS_LIMIT_ERRNOS | {errno.EACCES, errno.EPERM}
 _QUARANTINE_HINT = (
     'Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).'
 )
@@ -203,6 +216,7 @@ class MirrorReport:
     adopted: list[str] = field(default_factory=list)
     size_only: list[str] = field(default_factory=list)
     renamed: list[tuple[str, PurePosixPath]] = field(default_factory=list)
+    unreadable: list[Failure] = field(default_factory=list)  # copies in DEST found unreadable, downloaded again
     moved_aside: list[PurePosixPath] = field(default_factory=list)
     replaced_folder: PurePosixPath | None = None
     quarantined: list[QuarantinedFile] = field(default_factory=list)
@@ -593,7 +607,7 @@ class MirrorRun:
     once (deferred files settle in a later pass).
 
     With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record, a
-    `verify` finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
+    finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
     the folders above them, and no other path of the mirror is looked at. Otherwise the run covers every entry, and
     holds every file whose quarantine record is for its current identity: such a file is reported as quarantined
     without being looked at.
@@ -602,6 +616,10 @@ class MirrorRun:
     or made in place loses it. A failed entry is reported as failed, or as quarantined when its quarantine record is
     for its current identity, the failure then shown as its last retry. Each entry the manifest records as left out of
     its scan, because its name is not valid Unicode, is a failure of the run, and has no record.
+
+    A copy found unreadable gets its `corrupt` finding recorded and a notice when it is found, and is listed under
+    `unreadable` whatever then happens to the file; a later pass of the run gives the file that finding, so the copy
+    is not read again.
     """
 
     def __init__(
@@ -617,10 +635,10 @@ class MirrorRun:
         self._held = set() if retry_failed else {e.entry_id for e in self._entries if is_held(e)}
         in_progress = [e for e in entries if e.download is not None and e.download.state == 'partial']
         destination.remove_staged_copies()
-        with _fatal_errors(destination.path):
-            self._in_progress = [e.entry_id for e in in_progress]
-            destination.keep_partials(self._in_progress)
-            self._current = self._check(destination)
+        self._in_progress = [e.entry_id for e in in_progress]
+        destination.keep_partials(self._in_progress)
+        self._current = self._check(destination)
+        self._unreadable: dict[int, Finding] = {}
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
         self._moved: list[tuple[MirrorEntry, tuple[Segment, ...], int]] = []
@@ -669,7 +687,7 @@ class MirrorRun:
                 progress.start(move.downloads, move.size)
             with DiskThreads(1) as threads:
                 for entry, segments, held in self._moved:
-                    with _fatal_errors(self._destination.partial_folder):
+                    with _fatal_errors('write', self._destination.partial_folder):
                         await self._move_partial(entry, segments, held, self._source, threads, progress)
                     progress.moved()
                 await threads.run(self._source.remove_leftovers)
@@ -914,6 +932,12 @@ class MirrorRun:
         if entry.failure is not None:
             self._mirror.clear_failure(entry.entry_id)
 
+    def _found_unreadable(self, report: MirrorReport, entry: MirrorEntry, finding: Finding) -> None:
+        _log.warning('%s %s: %s', entry.resource.path, finding.kind, finding.reason)
+        self._mirror.record_finding(entry.entry_id, finding)
+        self._unreadable[entry.entry_id] = finding
+        report.unreadable.append(Failure(entry.resource.path, finding.reason))
+
     def _sorted(self, deferred: list[tuple[MirrorEntry, FileDeferred]]) -> list[tuple[MirrorEntry, FileDeferred]]:
         return sorted(deferred, key=lambda item: self._positions[item[0].entry_id])
 
@@ -925,14 +949,18 @@ class MirrorRun:
         report.moved_aside.sort(key=by_local.__getitem__)
         report.quarantined.sort(key=lambda quarantined: quarantined.path)
         report.failed.sort(key=lambda failure: failure.path)
+        report.unreadable.sort(key=lambda unreadable: unreadable.path)
         report.partials_left.sort(key=lambda left: left.path)
         report.renamed.sort()
 
     async def _download(self, entry: MirrorEntry, tools: _RunTools) -> FileDeferred | None:
-        """Mirror one file into the report; the failure when it is deferred to a later pass instead."""
+        """Mirror one file into the report; the failure when it is deferred to a later pass instead. A file whose copy
+        an earlier pass found unreadable takes that finding, so the copy is not read again."""
         report = tools.report
         path = entry.resource.path
         size = entry.resource.size or 0
+        if (finding := self._unreadable.get(entry.entry_id)) is not None:
+            entry = replace(entry, finding=finding)
         started = time.monotonic()
         try:
             outcome = await download_file(
@@ -948,6 +976,7 @@ class MirrorRun:
                 policy=tools.policy,
                 room=tools.room,
                 progress=self._progress.begin(entry.entry_id, path, size),
+                unreadable=lambda found: self._found_unreadable(report, entry, found),
             )
         except FileDeferred as deferred:
             return deferred
@@ -1004,6 +1033,7 @@ async def download_file(
     policy: TransferPolicy,
     room: PartialRoom | None,
     progress: ActiveFile,
+    unreadable: Callable[[Finding], None],
 ) -> FileOutcome:
     """Make the file `entry` verified at its local path and record it, reporting what it does to `progress`; the only
     state it touches is the mirror's records, the destination and `names`. Its disk work runs in `threads`.
@@ -1016,7 +1046,9 @@ async def download_file(
     first look at the path, hashing a local copy and fetching run outside it.
 
     A file already at the local path is adopted when its content matches the cloud, unless the entry has a finding:
-    that copy is never read. Otherwise the file is downloaded and verified first, and only then is whatever stands at
+    that copy is never read. A copy that cannot be read, while the destination itself can, is passed to `unreadable`
+    as a `corrupt` finding (the caller records it) and handled as a file with that finding; a permission error on it
+    fails the file instead. Otherwise the file is downloaded and verified first, and only then is whatever stands at
     the local path moved aside and the new file placed; placing it drops the finding. A path that is the same file as
     another entry's verified copy is never adopted, moved or replaced. A name the destination refuses is converted,
     and the file placed under the converted name.
@@ -1029,20 +1061,21 @@ async def download_file(
 
     Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
     when the downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError`
-    when the destination cannot be written at all, and the API errors that stop the run (`TokenRejectedError`,
-    `DiskApiError`).
+    when the destination cannot be read, written or inspected at all (a local copy that cannot be read while the
+    device is gone or the destination itself unreadable included), and the API errors that stop the run
+    (`TokenRejectedError`, `DiskApiError`).
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
     with _local_errors(destination, local, 'write'):
-        with _local_errors(destination, local, 'read'):
+        with _local_errors(destination, local, 'inspect'):
             existing = destination.lstat(local)
         if existing is not None:
             if reason := _alias(entry, local, existing, mirror, destination):
                 raise FileFailed(reason)
             if entry.finding is None:
                 verified_by = await _adopt(
-                    entry, local, identity, existing, mirror, destination, threads, placement, progress
+                    entry, local, identity, existing, mirror, destination, threads, placement, progress, unreadable
                 )
                 if verified_by is not None:
                     left = await _remove_recorded_partial(entry, destination, threads)
@@ -1144,37 +1177,82 @@ async def _adopt(
     threads: DiskThreads,
     placement: asyncio.Lock,
     progress: ActiveFile,
+    unreadable: Callable[[Finding], None],
 ) -> VerifiedBy | None:
     """Hash the regular file `existing` at `local` and, when it matches `identity`, give it the cloud mtime and
-    record it as verified; `None` when it is not such a file or does not match.
+    record it as verified; `None` when it is not such a file, does not match, or cannot be read.
 
     The hash runs outside `placement`. Under it, the file at `local` must still be the one hashed (same inode, size
     and mtime) and must not have become another entry's verified copy meanwhile; otherwise it is not adopted, or the
     entry fails as an alias. Only then is its mtime set and the record written.
+
+    A copy that cannot be opened or read is passed to `unreadable` as a `corrupt` finding, as `_unreadable_copy`
+    classifies the error; it is never written to.
     """
     if not stat.S_ISREG(existing.st_mode) or existing.st_size != identity.size:
         return None
     digest = Digest()
-    with _local_errors(destination, local, 'read'), destination.existing_file(local) as file:
-        opened = file.stat()
-        if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
+    with ExitStack() as stack:
+        try:
+            file = stack.enter_context(destination.existing_file(local))
+            opened = file.stat()
+            if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
+                return None
+            progress.state('hashing')
+            await _feed(digest.update, file.chunks(), threads, 0)
+        except OSError as exc:
+            unreadable(await _unreadable_copy(local, exc, destination, threads))
             return None
-        progress.state('hashing')
-        await _feed(digest.update, file.chunks(), threads, 0)
         progress.state('waiting for a connection')
         if digest.mismatch(identity) is not None:
             return None
-        async with placement:
+        return await _record_adopted(entry, local, identity, file, opened, mirror, destination, threads, placement)
+
+
+async def _record_adopted(
+    entry: MirrorEntry,
+    local: PurePosixPath,
+    identity: RemoteIdentity,
+    file: ExistingFile,
+    opened: os.stat_result,
+    mirror: Mirror,
+    destination: Destination,
+    threads: DiskThreads,
+    placement: asyncio.Lock,
+) -> VerifiedBy | None:
+    """Under `placement`, give the hashed copy `file` at `local` the cloud mtime and record it as verified, unless the
+    file at `local` is no longer the one hashed (`opened`); an alias of another entry's verified copy fails."""
+    async with placement:
+        with _local_errors(destination, local, 'inspect'):
             now = destination.lstat(local)
-            if now is None or LocalFingerprint.of(now) != LocalFingerprint.of(opened):
-                return None
-            if reason := _alias(entry, local, now, mirror, destination):
-                raise FileFailed(reason)
-            with _local_errors(destination, local, 'set the modification time of'):
-                await threads.run(file.set_mtime, _mtime_ns(identity.modified))
-            verified_by = _method(identity)
-            mirror.record_verified(entry.entry_id, identity, verified_by, file.stat())
+        if now is None or LocalFingerprint.of(now) != LocalFingerprint.of(opened):
+            return None
+        if reason := _alias(entry, local, now, mirror, destination):
+            raise FileFailed(reason)
+        with _local_errors(destination, local, 'write', failing='set the modification time of'):
+            await threads.run(file.set_mtime, _mtime_ns(identity.modified))
+        with _local_errors(destination, local, 'inspect'):
+            adopted = file.stat()
+        verified_by = _method(identity)
+        mirror.record_verified(entry.entry_id, identity, verified_by, adopted)
     return verified_by
+
+
+async def _unreadable_copy(
+    local: PurePosixPath, exc: OSError, destination: Destination, threads: DiskThreads
+) -> Finding:
+    """The finding about the copy at `local` whose read failed with `exc`: corrupt, as it cannot be read.
+
+    Raises `FileFailed` when the copy is out of reach rather than unreadable (a permission error, a path changed under
+    the run, the process out of descriptors or memory), and `DestinationError` when the device is gone or the
+    destination itself can no longer be read.
+    """
+    reason = f'could not read {local}: {exc.strerror}'
+    if exc.errno in _COPY_OUT_OF_REACH_ERRNOS:
+        raise FileFailed(reason) from None
+    if exc.errno in DEVICE_GONE_ERRNOS or not await threads.run(destination.reachable):
+        raise DestinationError.of('read', destination.path / local, exc) from None
+    return Finding('corrupt', reason)
 
 
 async def _clear_the_way(
@@ -1182,7 +1260,8 @@ async def _clear_the_way(
 ) -> bool:
     """Move whatever stands at `local` aside so the verified partial file can be placed; `True` when something was
     moved."""
-    existing = destination.lstat(local)
+    with _local_errors(destination, local, 'inspect'):
+        existing = destination.lstat(local)
     if existing is None:
         return False
     if reason := _alias(entry, local, existing, mirror, destination):
@@ -1757,8 +1836,8 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
 
 def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
-    files, renamed entries, what was moved aside, quarantined files with their reasons and copies, and failures with
-    their reasons; each list shows its first `limit` members (`None`: all)."""
+    files, renamed entries, the copies found unreadable, what was moved aside, quarantined files with their reasons and
+    copies, and failures with their reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
@@ -1776,6 +1855,10 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
     if report.renamed:
         lines.append(f'Renamed for the destination: {len(report.renamed)}')
         shown = [f'{remote} -> {local}' for remote, local in report.renamed]
+        lines += listed('', shown, len(shown), '', limit=limit)
+    if report.unreadable:
+        lines.append(f'Unreadable in DEST, downloaded again: {len(report.unreadable)}')
+        shown = [f'{unreadable.path}: {unreadable.reason}' for unreadable in report.unreadable]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.moved_aside:
         lines.append(f'Moved aside to {report.replaced_folder}/: {len(report.moved_aside)}')
@@ -1811,6 +1894,7 @@ def mirror_document(report: MirrorReport) -> dict[str, object]:
             'adopted': len(report.adopted),
             'size_only': len(report.size_only),
             'renamed': len(report.renamed),
+            'unreadable': len(report.unreadable),
             'moved_aside': len(report.moved_aside),
             'quarantined': len(report.quarantined),
             'failed': len(report.failed),
@@ -1819,6 +1903,7 @@ def mirror_document(report: MirrorReport) -> dict[str, object]:
         'adopted': report.adopted,
         'size_only': report.size_only,
         'renamed': [{'path': remote, 'local': str(local)} for remote, local in report.renamed],
+        'unreadable': [{'path': unreadable.path, 'reason': unreadable.reason} for unreadable in report.unreadable],
         'moved_aside': [str(local) for local in report.moved_aside],
         'replaced_folder': None if report.replaced_folder is None else str(report.replaced_folder),
         'quarantined': [quarantined_document(held) for held in report.quarantined],
@@ -1890,16 +1975,18 @@ def _verified_now(entry: MirrorEntry) -> bool:
 def _in_place(entry: MirrorEntry, destination: Destination) -> bool:
     """Whether the placed copy of the verified file `entry` has the recorded `lstat`.
 
-    A placed copy that cannot be looked at is not in place: the file's own turn meets the error and reports it.
+    A placed copy that cannot be looked at is not in place: the file's own turn meets the error and reports it. An
+    error no file would escape (`FATAL_ERRNOS`) raises `DestinationError` naming the copy.
     """
     record = entry.download
     if record is None:
         raise ValueError(f'{entry.resource.path} has no download record')
+    local = _local_path(entry)
     try:
-        placed = destination.lstat(_local_path(entry))
+        placed = destination.lstat(local)
     except OSError as exc:
         if exc.errno in FATAL_ERRNOS:
-            raise
+            raise DestinationError.of('inspect', destination.path / local, exc) from None
         return False
     return placed is not None and stat.S_ISREG(placed.st_mode) and LocalFingerprint.of(placed) == record.local
 
@@ -1912,7 +1999,8 @@ def _alias(
     owner = mirror.verified_owner(existing.st_ino)
     if owner is None or owner.entry_id == entry.entry_id or owner.local_path is None:
         return None
-    owner_copy = destination.lstat(owner.local_path)
+    with _local_errors(destination, owner.local_path, 'inspect'):
+        owner_copy = destination.lstat(owner.local_path)
     if owner_copy is None or owner_copy.st_ino != existing.st_ino:
         return None
     return f'{local} is the same file as {owner.resource.path} on this filesystem; it was left untouched'
@@ -1953,23 +2041,25 @@ def _discard(entry: MirrorEntry, mirror: Mirror, destination: Destination) -> No
 
 
 @contextmanager
-def _local_errors(destination: Destination, local: PurePosixPath, action: str) -> Iterator[None]:
-    """Turn an `OSError` about `local` into a failure of that entry, `could not <action> <local>: <reason>`, or of the
-    run when no entry could escape it."""
+def _local_errors(
+    destination: Destination, local: PurePosixPath, action: DiskAction, *, failing: str | None = None
+) -> Iterator[None]:
+    """Turn an `OSError` about `local` into a failure of that entry, `could not <failing or action> <local>:
+    <reason>`, or of the run, `DestinationError` with `action`, when no entry could escape it."""
     try:
         yield
     except OSError as exc:
         if exc.errno in FATAL_ERRNOS:
-            raise DestinationError.of(destination.path / local, exc) from None
-        raise FileFailed(f'could not {action} {local}: {exc.strerror}') from None
+            raise DestinationError.of(action, destination.path / local, exc) from None
+        raise FileFailed(f'could not {failing or action} {local}: {exc.strerror}') from None
 
 
 @contextmanager
-def _fatal_errors(path: Path) -> Iterator[None]:
+def _fatal_errors(action: DiskAction, path: Path) -> Iterator[None]:
     try:
         yield
     except OSError as exc:
-        raise DestinationError.of(path, exc) from None
+        raise DestinationError.of(action, path, exc) from None
 
 
 def _read_errors(chunks: Iterator[bytes], path: Path) -> Iterator[bytes]:
@@ -1977,7 +2067,7 @@ def _read_errors(chunks: Iterator[bytes], path: Path) -> Iterator[bytes]:
     try:
         yield from chunks
     except OSError as exc:
-        raise DestinationError.of(path, exc) from None
+        raise DestinationError.of('read', path, exc) from None
 
 
 def _changes(room: PartialRoom | None) -> int:

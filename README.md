@@ -399,9 +399,10 @@ another copy under that run's folder.
 again when its Disk metadata is unchanged and the local file still has the
 recorded size, modification time and inode. A file changed on the Disk, or
 edited or touched locally, is handled like any file already in DEST (below).
-A file [`verify`](#verifying-a-mirror) found missing, modified or corrupt is
-downloaded again whatever its record says, and its copy in DEST is never read
-(it may be unreadable): once the new file is verified, that copy is moved
+A file [`verify`](#verifying-a-mirror) found missing, modified or corrupt, or
+whose copy `download` could not read (below), is downloaded again whatever
+its record says, and its copy in DEST is never read again (it may be
+unreadable): once the new file is verified, that copy is moved
 aside to `replaced/` (below) and the finding is dropped. A repair that fails,
 is interrupted or is quarantined keeps the finding, so every later run treats
 the file the same way until it is verified. `download --retry-failed`
@@ -479,9 +480,10 @@ ending with `; last retry: <reason>`.
 
 `download --retry-failed [REMOTE_PATH] DEST` covers only the *retry set*: the
 files with a failure record, a quarantine record, a download that started
-and never finished (for example one stopped by Ctrl+C) or a
-[`verify`](#verifying-a-mirror) finding (missing, modified or corrupt), and
-the folders with a failure record. Files never started are not in it; a
+and never finished (for example one stopped by Ctrl+C) or a finding — one
+[`verify`](#verifying-a-mirror) made (missing, modified or corrupt), or a
+copy in DEST that `download` could not read — and the folders with a failure
+record. Files never started are not in it; a
 plain `download` gets them. The scan step runs as usual; the retry set is
 fixed once it is done. The run then visits only the retry set and the
 folders above its members, in path order, with the usual passes and rules,
@@ -511,8 +513,11 @@ Verified by size only (no cloud checksum): 1
   disk:/Photos/old.bmp
 Renamed for the destination: 1
   disk:/Photos/a.txt -> a~1a2b3c4d.txt
-Moved aside to .yandex-disk-rescue/replaced/2026-10-17T09-30-00Z/: 1
+Unreadable in DEST, downloaded again: 1
+  disk:/Photos/old.jpg: could not read old.jpg: Input/output error
+Moved aside to .yandex-disk-rescue/replaced/2026-10-17T09-30-00Z/: 2
   notes.txt
+  old.jpg
 Quarantined: 1
   disk:/Photos/bad.jpg: MD5 mismatch (expected …, got …); kept at .yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg
 Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).
@@ -523,7 +528,9 @@ Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 Every list is in path order, whatever the order the files finished in, and
-shows at most 20 entries, then `… and N more`. When anything
+shows at most 20 entries, then `… and N more`. `Unreadable in DEST,
+downloaded again` lists each copy already in DEST that could not be read
+(see "Files already in DEST"); it does not change the exit code. When anything
 failed or is quarantined, the run ends with exit code `1` and
 `Error: F failed; see the list above.`, `Error: Q quarantined; see the list
 above.` or `Error: F failed and Q quarantined; see the lists above.` A plain
@@ -536,7 +543,23 @@ earlier copy made by hand. A regular file at the path of a Disk file is read
 and hashed; when its size and every Disk checksum match, it is *adopted*: it
 is not downloaded, it gets the Disk modification time and it counts as
 skipped, listed under `Already on disk and verified`. (A file the Disk has no
-checksum for is adopted when its size matches.) Anything else at a path the
+checksum for is adopted when its size matches.) A file that cannot be read
+(an I/O error, a bad sector) is treated like a file `verify` found corrupt:
+it is recorded `corrupt` in the manifest with the read error, shown as a
+notice (`<path> corrupt: could not read <local>: <reason>`), never read again
+— not by a later pass, a later run or `--retry-failed` — and moved aside once
+the Disk file is downloaded and verified; nothing in it is written. The
+summary lists it under `Unreadable in DEST, downloaded again`, as a sign that
+the disk may be failing, and the run still exits `0` when everything is
+mirrored. A repair that fails keeps the finding, so `verify` lists the copy
+under `Corrupt` until a later run repairs it. A permission error on the file
+fails only that file (see "The destination"), and so does the tool running
+out of file descriptors or memory while opening or reading it (`could not
+read <local>: <reason>`, such as `Too many open files`): neither says anything
+about the copy, so nothing is recorded and the next run reads it again. A DEST
+that can no longer be read at all (a disk unplugged, a device gone) stops the
+run with
+`Error: Could not read <path>: <reason>.` Anything else at a path the
 mirror needs — a file with other content, a folder where a file must go, a
 file where a folder must go, or a symbolic link — is *moved aside*. Where a
 file must go, that happens only after the new file is downloaded and
@@ -587,15 +610,19 @@ folders and a lock, so only one run at a time can use a destination
 manifests. The destination's filesystem must support
 renaming without replacing (`RENAME_NOREPLACE`; ext4, xfs, btrfs, tmpfs and
 HFS+ do); the run stops at the start otherwise. A full disk or quota, an I/O
-error or a read-only filesystem stops the run with
+error or a read-only filesystem while writing stops the run with
 `Error: Could not write <path>: <reason>.`, and so does a permission error
-inside `DEST/.yandex-disk-rescue/` or the partial folder below
-`--partial-dir`. A permission error on a path of the
-mirror — a file or folder there owned by another user, or without the needed
-read, write or search permission — fails only the entries it affects, with
-`could not read <path>: <reason>`, `could not write <path>: <reason>` or
-`could not set the modification time of <path>: <reason>`, and leaves the path
-as it was.
+while writing inside `DEST/.yandex-disk-rescue/` or the partial folder below
+`--partial-dir`. An I/O error while reading the work directory or the partial
+folder stops it with `Error: Could not read <path>: <reason>.`, and one while
+looking up a path there or in DEST (its size, type or free space) with
+`Error: Could not inspect <path>: <reason>.` An I/O error while reading a file
+already in DEST does not stop the run; see "Files already in DEST". A permission error on
+a path of the mirror — a file or folder there owned by another user, or
+without the needed read, write or search permission — fails only the entries
+it affects, with `could not read <path>: <reason>`, `could not inspect <path>:
+<reason>`, `could not write <path>: <reason>` or `could not set the
+modification time of <path>: <reason>`, and leaves the path as it was.
 
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run: the files still
@@ -700,7 +727,9 @@ Each file of the mirror, as of the last scan, is one of:
   content no longer matches.
 - **Corrupt:** the file has the recorded size, modification time and inode,
   but its content does not match (silent damage such as bit rot), or it cannot
-  be read (`could not read <path>: <reason>`).
+  be read (`could not read <path>: <reason>`); or a copy `download` found at
+  its path could not be read (verified or not), and no repair has replaced it
+  yet.
 - **Quarantined:** its last download [failed the check](#downloading) and is
   kept in `quarantine/`; listed with the reason and the copy's path.
 - **Not downloaded:** no verified copy of the current Disk version: never
@@ -716,8 +745,10 @@ Only files with a verified copy of their current Disk version are read; the
 others are listed from the manifest. A file found missing, modified or
 corrupt is recorded in the manifest at once, and the next `download` (a
 plain one, `--no-scan` or `--retry-failed`) downloads it again without
-reading the bad copy and moves that copy aside to `replaced/`. A file
-`verify` finds intact again drops its finding. Paths of DEST with no Disk
+reading the bad copy and moves that copy aside to `replaced/`. `download`
+records a copy it could not read [the same way](#downloading), so `verify`
+lists it under `Corrupt` until it is repaired. A file `verify` finds intact
+again drops its finding. Paths of DEST with no Disk
 counterpart (local-only files, `.DS_Store`, …) are never opened, listed or
 reported, and folders are not checked.
 
@@ -725,7 +756,11 @@ A read error usually means that one file is damaged, and the file is reported
 as corrupt. When DEST itself cannot be read any more, such as a disk unplugged
 mid-check, `verify` stops instead of reporting every remaining file:
 `Error: Could not read DEST: <reason>; verify stopped. Rerun it once the disk
-is back.` (exit `1`); what it found before then stays recorded.
+is back.` (exit `1`); what it found before then stays recorded. When the tool
+runs out of file descriptors or memory while opening or reading a file, which
+says nothing about the file, `verify` stops with `Error: Could not read
+<path>: <reason>.` (exit `1`) and records nothing for that file; a rerun
+continues from it.
 
 ```
 Verifying 1120 files (1.2 GiB) in /mnt/backup/Photos
@@ -899,7 +934,9 @@ alone):
 
 By default stderr shows a notice for each file or folder that fails or is
 quarantined in this run, each `verify` finding made in this run (`missing`,
-`modified` or `corrupt`), each folder that disappeared during a scan, each
+`modified` or `corrupt`), each copy in DEST that `download` found unreadable
+(`<path> corrupt: could not read <local>: <reason>`), each folder that
+disappeared during a scan, each
 entry left out because its name is not valid Unicode, and each partial file
 that could not be deleted once its file's outcome was recorded (`<path>:
 partial file <file> not deleted: <reason>; the outcome stands`). Files `verify` lists
@@ -1021,7 +1058,9 @@ is `scan`'s `without_checksum.sample`, the 20 smallest paths, with the full
 ```
 
 `download` (`skipped` includes `adopted`, as in the summary's first line;
-`passes` is `null` until a transient failure defers a file; `scan` is the
+`passes` is `null` until a transient failure defers a file; `unreadable`
+lists the copies in DEST found unreadable and downloaded again, each with
+`path` and `reason`, also when that download then failed; `scan` is the
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
@@ -1036,10 +1075,10 @@ folder):
   "scan": {"reused": true, "root": "disk:/Photos", "completed_at": "2026-10-17T09:20:11.004Z"},
   "to_download": {"files": 12, "size": 104857600},
   "counts": {"downloaded": 10, "downloaded_size": 94371840, "skipped": 1191, "adopted": 0, "size_only": 0,
-             "renamed": 0, "moved_aside": 0, "quarantined": 1, "failed": 1},
+             "renamed": 0, "unreadable": 0, "moved_aside": 0, "quarantined": 1, "failed": 1},
   "passes": {"used": 2, "limit": 7},
   "adopted": [], "size_only": [], "renamed": [{"path": "disk:/Photos/a?b.jpg", "local": "a_b~1f2e3d4c.jpg"}],
-  "moved_aside": [], "replaced_folder": null,
+  "unreadable": [], "moved_aside": [], "replaced_folder": null,
   "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
                    "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
   "failed": [{"path": "disk:/Photos/gone.jpg", "reason": "removed from the Disk after the scan"}],
@@ -1227,7 +1266,8 @@ systemctl --user stop yandex-disk-rescue.service
 - **The summary.** The log file holds every run's full summary, every list
   complete, and the end of each run, `completed (exit 0)` or `failed (exit N):
   <error>`. `grep -E ' (WARNING|ERROR) ' <log>` lists every notice (each
-  file that failed or was quarantined, each `verify` finding) and the end of
+  file that failed or was quarantined, each `verify` finding, each copy in
+  DEST found unreadable) and the end of
   every run that failed or was interrupted. Under `nohup`, the summary is
   also in `download.out`.
 - **The JSON documents.** `jq` reads a file of appended documents as a stream:
@@ -1246,7 +1286,7 @@ systemctl --user stop yandex-disk-rescue.service
 | Code | Meaning |
 |---|---|
 | `0` | Success; for `download`, every file of the folder is verified at its final path; for `verify`, every file of the mirror is verified and intact |
-| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be read or written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
 | `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers; for `verify` a DEST that is not an existing folder or is not a mirror recorded in the manifest |
 | `130` | Interrupted with Ctrl+C |
 | `143` | Stopped with SIGTERM (`kill`, `systemctl stop`, `docker stop`): the same clean stop as Ctrl+C |
