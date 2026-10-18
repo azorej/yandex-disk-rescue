@@ -2,8 +2,8 @@
 of verified files are deleted, and, unless previews are turned off, each file that failed on Yandex's side gets
 Yandex's largest preview of it, saved below `.yandex-disk-rescue/previews/` and recorded in the manifest.
 
-The step never fails the run. A preview that cannot be fetched, saved or deleted is reported in
-`MirrorReport.preview_errors`, and the step goes on; a token Yandex rejects, or an error in the previews folder that no
+The step never fails the run, except that a `ManifestError` propagates. A preview that cannot be fetched, saved or
+deleted is reported in `MirrorReport.preview_errors`, and the step goes on; a token Yandex rejects, or an error in the previews folder that no
 other preview would escape (`WORK_FATAL_ERRNOS`: a full disk or quota, an I/O error, a read-only filesystem, a
 permission error), ends the step, and every file not handled yet is reported with that reason. Ctrl+C or SIGTERM ends
 the step only: the fetches in flight are dropped, a save already running in its worker thread is waited for and
