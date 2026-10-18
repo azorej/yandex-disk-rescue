@@ -18,11 +18,14 @@ anything else there is moved aside once the new version is verified. A copy that
 itself can is recorded as a `corrupt` finding and handled as such, so it is read at most once: no later pass or run
 reads it again. Paths with no cloud counterpart are never looked at.
 
-A file larger than the policy's segment threshold is downloaded as several segments, ranged fetches running in
-parallel into one partial file, which is preallocated to the file's size first and, with partial files in the
-destination, read back in full to be verified once every segment is in; any other file is one stream, there verified
-by the digest computed as it arrives. The segments are fixed when the download starts and kept by every later turn of
-it.
+A file larger than the policy's segment threshold, in a partial folder whose filesystem keeps sparse files, is
+downloaded as several segments, ranged fetches running in parallel into one partial file, which is preallocated to the
+file's size first and, with partial files in the destination, read back in full to be verified once every segment is
+in; any other file is one stream, there verified by the digest computed as it arrives. In a partial folder without
+sparse files (HFS+, exFAT, FAT), where extending a file writes its zeros first, a new download is always one stream,
+so its partial file is only appended to. A later turn of a download keeps its segments while any of them keeps
+confirmed bytes; a download that kept none is planned again, as a new one is, with the current policy and partial
+folder.
 
 Every download keeps a checkpoint journal in the manifest: for each segment, the offset up to which its bytes were
 fsynced and the SHA-256 of those bytes. A checkpoint is taken every `checkpoint_bytes` a segment receives,
@@ -51,7 +54,11 @@ conversion, which is then recorded as its local name.
 
 Files are in progress concurrently, as many as the content client has connections. Everything that looks at a
 final path and changes or records it runs under one placement lock, so two files never act on the same path or
-inode at once.
+inode at once. Reading bytes already on disk to hash them runs for one file of the run at a time per folder
+(`HashHolds`): re-hashing the confirmed bytes of a resumed download and reading back a segmented file in the partial
+folder, hashing a local copy in the destination; with partial files in the destination, one hold covers all three.
+A file waiting for its turn keeps its place among the files in progress and holds nothing another file needs, as one
+waiting for the copy does; no other lock is taken under a hash hold.
 
 Disk work that scales with a file's size or waits for the disk (hashing, reading back, writing with the digest
 updates, preallocating, fsync, moving aside and placing, creating folders, setting an mtime) runs in the run's worker
@@ -102,7 +109,7 @@ from yandex_disk_rescue.manifest import (
     UnencodableEntry,
     VerifiedBy,
 )
-from yandex_disk_rescue.progress import ActiveFile, MirrorProgress, MoveProgress, Outcome
+from yandex_disk_rescue.progress import ActiveFile, MirrorProgress, MoveProgress, Outcome, TransferState
 from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 from yandex_disk_rescue.units import format_size
 
@@ -327,7 +334,7 @@ def size_mismatch(identity: RemoteIdentity, size: int) -> str:
 class TransferPolicy:
     """How files are fetched: up to `retries` immediate retries of each segment after new data in each pass, a
     checkpoint after every `checkpoint_bytes` a segment receives, and a new download of a file larger than
-    `segment_threshold` bytes split into `segments` segments."""
+    `segment_threshold` bytes split into `segments` segments in a partial folder with sparse files."""
 
     retries: int
     checkpoint_bytes: int
@@ -504,15 +511,44 @@ class PartialRoom:
 
 
 @dataclass(frozen=True)
+class HashHolds:
+    """The holds under which a run reads bytes already on disk to hash them, one file at a time per folder:
+    `partials` for the partial folder (re-hashing a resumed download's confirmed bytes, reading back a segmented
+    file), `destination` for DEST (hashing a local copy before it is adopted). With partial files in DEST, one disk,
+    both are the same hold."""
+
+    partials: asyncio.Lock
+    destination: asyncio.Lock
+
+    @classmethod
+    def of(cls, destination: Destination) -> Self:
+        hold = asyncio.Lock()
+        return cls(asyncio.Lock() if destination.separate_partials else hold, hold)
+
+
+@asynccontextmanager
+async def _hash_turn(hold: asyncio.Lock, path: str, progress: ActiveFile, state: TransferState) -> AsyncIterator[None]:
+    """Hold `hold` while the file at `path` reads its bytes on disk, shown in `progress` as `state`; while another
+    file holds it, the file shows `waiting to hash`; an uncontended turn starts at once, so that state never shows."""
+    if hold.locked():
+        _log.debug("%s waits for another file's hash", path)
+    progress.state('waiting to hash')
+    async with hold:
+        progress.state(state)
+        yield
+
+
+@dataclass(frozen=True)
 class _RunTools:
-    """What every turn of a run shares: the clients, the worker threads, the placement lock, the copy lock, the room
-    of a separate partial folder, the report and the transfer policy."""
+    """What every turn of a run shares: the clients, the worker threads, the placement lock, the copy lock, the hash
+    holds, the room of a separate partial folder, the report and the transfer policy."""
 
     client: api.DiskClient
     content: api.ContentClient
     threads: DiskThreads
     placement: asyncio.Lock
     copying: asyncio.Lock
+    hashing: HashHolds
     room: PartialRoom | None
     report: MirrorReport
     policy: TransferPolicy
@@ -804,7 +840,8 @@ class MirrorRun:
             if self._destination.separate_partials:
                 room = await threads.run(PartialRoom.measure, self._destination, self._in_progress)
                 room_measured(room)
-            tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), room, report, policy)
+            holds = HashHolds.of(self._destination)
+            tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), holds, room, report, policy)
             changes = _changes(room)
             _log_pass(1, passes, self.pending_files, self.pending_size, pause=None, failed_before=self._failed_before)
             deferred = await self._first_pass(tools)
@@ -1004,6 +1041,7 @@ class MirrorRun:
                 threads=tools.threads,
                 placement=tools.placement,
                 copying=tools.copying,
+                hashing=tools.hashing,
                 mirror=self._mirror,
                 destination=self._destination,
                 names=self._names,
@@ -1061,6 +1099,7 @@ async def download_file(
     threads: DiskThreads,
     placement: asyncio.Lock,
     copying: asyncio.Lock,
+    hashing: HashHolds,
     mirror: Mirror,
     destination: Destination,
     names: LocalNames,
@@ -1079,6 +1118,11 @@ async def download_file(
     hold `placement` in one acquisition, so no other file of the run sees the path or the inode in between. The
     first look at the path, hashing a local copy and fetching run outside it.
 
+    Bytes already on disk are hashed under the hash holds of `hashing`, one file of the run at a time per folder: a
+    local copy under `hashing.destination`, released before `placement` is taken; the confirmed bytes of a resumed
+    download, and a segmented file read back, under `hashing.partials`. No other lock of the run is taken while
+    either is held.
+
     A file already at the local path is adopted when its content matches the cloud, unless the entry has a finding:
     that copy is never read. A copy that cannot be read, while the destination itself can, is passed to `unreadable`
     as a `corrupt` finding (the caller records it) and handled as a file with that finding; a permission error on it
@@ -1090,8 +1134,10 @@ async def download_file(
     The entry's download record is read from `mirror` when the turn starts. A partial file whose `partial` record
     is for the entry's identity is resumed, segment by segment, from its journal's confirmed offsets after
     `client.resource` confirms the cloud file still has it and each segment's confirmed bytes hash to the recorded
-    digest; any other partial file is started again from byte 0 with the segments of `policy`. Checkpoints and
-    immediate retries follow `policy`, as described in the module.
+    digest, keeping the segments it was started with; a partial file none of whose segments keeps bytes, and any
+    other partial file, is started again from byte 0 with the segments of `policy` (one segment in a partial folder
+    without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
+    module.
 
     Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
     when the downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError`
@@ -1109,7 +1155,17 @@ async def download_file(
                 raise FileFailed(reason)
             if entry.finding is None:
                 verified_by = await _adopt(
-                    entry, local, identity, existing, mirror, destination, threads, placement, progress, unreadable
+                    entry,
+                    local,
+                    identity,
+                    existing,
+                    mirror,
+                    destination,
+                    threads,
+                    placement,
+                    hashing.destination,
+                    progress,
+                    unreadable,
                 )
                 if verified_by is not None:
                     left = await _remove_recorded_partial(entry, destination, threads)
@@ -1126,6 +1182,7 @@ async def download_file(
                 threads=threads,
                 placement=placement,
                 copying=copying,
+                hashing=hashing.partials,
                 mirror=mirror,
                 destination=destination,
                 policy=policy,
@@ -1210,15 +1267,17 @@ async def _adopt(
     destination: Destination,
     threads: DiskThreads,
     placement: asyncio.Lock,
+    hold: asyncio.Lock,
     progress: ActiveFile,
     unreadable: Callable[[Finding], None],
 ) -> VerifiedBy | None:
     """Hash the regular file `existing` at `local` and, when it matches `identity`, give it the cloud mtime and
     record it as verified; `None` when it is not such a file, does not match, or cannot be read.
 
-    The hash runs outside `placement`. Under it, the file at `local` must still be the one hashed (same inode, size
-    and mtime) and must not have become another entry's verified copy meanwhile; otherwise it is not adopted, or the
-    entry fails as an alias. Only then is its mtime set and the record written.
+    The hash runs under `hold`, the destination's hash hold, released before `placement` is taken. Under
+    `placement`, the file at `local` must still be the one hashed (same inode, size and mtime) and must not have
+    become another entry's verified copy meanwhile; otherwise it is not adopted, or the entry fails as an alias. Only
+    then is its mtime set and the record written.
 
     A copy that cannot be opened or read is passed to `unreadable` as a `corrupt` finding, as `_unreadable_copy`
     classifies the error; it is never written to.
@@ -1232,8 +1291,8 @@ async def _adopt(
             opened = file.stat()
             if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
                 return None
-            progress.state('hashing')
-            await _feed(digest.update, file.chunks(), threads, 0)
+            async with _hash_turn(hold, entry.resource.path, progress, 'hashing'):
+                await _feed(digest.update, file.chunks(), threads, 0)
         except OSError as exc:
             unreadable(await _unreadable_copy(local, exc, destination, threads))
             return None
@@ -1351,6 +1410,7 @@ async def _fetch_verified(
     threads: DiskThreads,
     placement: asyncio.Lock,
     copying: asyncio.Lock,
+    hashing: asyncio.Lock,
     mirror: Mirror,
     destination: Destination,
     policy: TransferPolicy,
@@ -1363,7 +1423,9 @@ async def _fetch_verified(
     partial files in the destination, a file fetched as one stream is verified by the digest computed as it arrives,
     and a segmented file is read back in full once every segment is in. With separate partials, a checkpoint then
     confirms every byte, and the file is copied to its staged copy in the destination under `copying`, one copy of the
-    run at a time, and verified by the digest of the bytes copied; the cloud mtime goes to the copy.
+    run at a time, and verified by the digest of the bytes copied; the cloud mtime goes to the copy. Re-hashing the
+    confirmed bytes of a resumed download and reading back a segmented file run under `hashing`, the partial folder's
+    hash hold.
 
     A file that fails verification is moved to the run's quarantine folder under `placement`, then recorded as
     quarantined, which drops its download record, and `FileQuarantined` is raised; a separate partial file is deleted
@@ -1379,6 +1441,7 @@ async def _fetch_verified(
             mirror=mirror,
             destination=destination,
             threads=threads,
+            hashing=hashing,
             policy=policy,
             progress=progress,
         )
@@ -1414,7 +1477,9 @@ async def _fetch_verified(
             await journal.take()
             digest = await _copy_to_destination(entry, identity, partial, destination, threads, copying, progress)
         else:
-            digest = await _file_digest(journal, partial, threads, identity.size, progress)
+            digest = await _file_digest(
+                journal, partial, threads, hashing, entry.resource.path, identity.size, progress
+            )
             await threads.run(partial.finish, _mtime_ns(identity.modified))
     if (reason := digest.mismatch(identity)) is None:
         return _method(identity)
@@ -1472,6 +1537,7 @@ async def _resume(
     mirror: Mirror,
     destination: Destination,
     threads: DiskThreads,
+    hashing: asyncio.Lock,
     policy: TransferPolicy,
     progress: ActiveFile,
 ) -> list[_Stream]:
@@ -1479,9 +1545,12 @@ async def _resume(
     once the entry's record is a `partial` one for `identity`.
 
     A `partial` record for `identity` in the manifest now is kept once the cloud file is confirmed to still have that
-    identity, with the segments it was started with. Each segment keeps the bytes its journal confirms when the
-    partial file holds them and they hash to the recorded digest; otherwise that segment is reset to its start in
-    the journal. Any other record is replaced by a new `partial` one with the segments of `policy`'s plan.
+    identity. Each segment keeps the bytes its journal confirms when the partial file holds them and they hash to the
+    recorded digest; otherwise that segment is reset to its start in the journal. All the segments are re-hashed in one
+    hold of `hashing`, the partial folder's hash hold, taken after the cloud check. While any segment keeps bytes, the
+    record keeps the segments it was started with. When none does, and for any other record, the record is replaced
+    by a new `partial` one with the plan a new download gets now: the segments of `policy`'s plan, one segment in a
+    partial folder without sparse files. A record that already is that plan is not written.
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
     check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
@@ -1490,9 +1559,9 @@ async def _resume(
     size = identity.size
     record = mirror.download(entry.entry_id)
     if record is None or record.state != 'partial' or record.identity != identity:
-        segments = segment_plan(size, segments=policy.segments, threshold=policy.segment_threshold)
-        mirror.record_partial(entry.entry_id, identity, segments)
-        return _streams(segments, size)
+        plan = _new_plan(size, policy, destination)
+        mirror.record_partial(entry.entry_id, identity, plan)
+        return _streams(plan, size)
     try:
         live = await client.resource(entry.resource.path)
     except api.RemotePathNotFoundError:
@@ -1505,22 +1574,52 @@ async def _resume(
         return _streams((), size)
     held = partial.size()
     streams = _streams(record.segments, size)
-    path = entry.resource.path
-    for position, segment in enumerate(record.segments):
-        if segment.start < segment.confirmed <= held:
-            stream = streams[position]
-            progress.state('hashing')
-            await stream.rehash(partial, segment.confirmed, threads)
-            if stream.sha256 != segment.digest:
-                _log.debug('%s: segment at byte %d does not match its checkpoint; fetched again', path, segment.start)
-                streams[position] = _Stream.of(segment, size)
-            else:
-                kept = segment.confirmed - segment.start
-                _log.debug('%s: segment at byte %d resumed with %d bytes kept', path, segment.start, kept)
-                progress.kept(kept)
+    if _movable(record.segments, held):
+        async with _hash_turn(hashing, entry.resource.path, progress, 'hashing'):
+            await _rehash_kept(entry.resource.path, record.segments, streams, held, partial, threads, progress)
+    if all(stream.written == stream.start for stream in streams):
+        plan = _new_plan(size, policy, destination)
+        if plan != record.segments:
+            mirror.record_partial(entry.entry_id, identity, plan)
+        return _streams(plan, size)
     if [stream.written for stream in streams] != [segment.confirmed for segment in record.segments]:
         mirror.checkpoint(entry.entry_id, [stream.segment() for stream in streams])
     return streams
+
+
+async def _rehash_kept(
+    path: str,
+    segments: Sequence[Segment],
+    streams: list[_Stream],
+    held: int,
+    partial: PartialFile,
+    threads: DiskThreads,
+    progress: ActiveFile,
+) -> None:
+    """Re-hash, in `streams` (one per segment of the journal `segments`), the confirmed bytes of each segment within
+    the first `held` bytes of the partial file; a segment whose bytes do not hash to its recorded digest gets a stream
+    from its start again."""
+    size = streams[-1].end
+    for position, segment in enumerate(segments):
+        if not segment.start < segment.confirmed <= held:
+            continue
+        stream = streams[position]
+        await stream.rehash(partial, segment.confirmed, threads)
+        if stream.sha256 != segment.digest:
+            _log.debug('%s: segment at byte %d does not match its checkpoint; fetched again', path, segment.start)
+            streams[position] = _Stream.of(segment, size)
+            continue
+        kept = segment.confirmed - segment.start
+        _log.debug('%s: segment at byte %d resumed with %d bytes kept', path, segment.start, kept)
+        progress.kept(kept)
+
+
+def _new_plan(size: int, policy: TransferPolicy, destination: Destination) -> tuple[Segment, ...]:
+    """The journal a new download of a `size`-byte file starts with: `policy`'s segments in a partial folder with
+    sparse files, one otherwise, so a partial file is only appended to and its filesystem writes no zeros ahead of the
+    data."""
+    segments = policy.segments if destination.sparse_partials else 1
+    return segment_plan(size, segments=segments, threshold=policy.segment_threshold)
 
 
 def _movable(segments: Sequence[Segment], held: int) -> list[Segment]:
@@ -1551,17 +1650,24 @@ async def _preallocate(partial: PartialFile, size: int, threads: DiskThreads) ->
 
 
 async def _file_digest(
-    journal: _Journal, partial: PartialFile, threads: DiskThreads, size: int, progress: ActiveFile
+    journal: _Journal,
+    partial: PartialFile,
+    threads: DiskThreads,
+    hold: asyncio.Lock,
+    path: str,
+    size: int,
+    progress: ActiveFile,
 ) -> Digest:
     """The digest of the whole fetched file: the one computed as it arrived when it was fetched as one stream;
-    otherwise, after a checkpoint, the digest of the partial file read back in full."""
+    otherwise, after a checkpoint, the digest of the partial file read back in full under `hold`, the partial folder's
+    hash hold."""
     match journal.streams:
         case [_Stream(hasher=Digest() as digest)]:
             return digest
     await journal.take()
-    progress.state('reading back')
     digest = Digest()
-    await _feed(digest.update, partial.chunks(0, size), threads, 0)
+    async with _hash_turn(hold, path, progress, 'reading back'):
+        await _feed(digest.update, partial.chunks(0, size), threads, 0)
     return digest
 
 

@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, closing, contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
@@ -131,11 +131,12 @@ def _separate_folder(dest, partial_root):
 
 def _partials(dest, partial_root=None) -> list:
     """The partial files of `dest`: in its own partial folder, or in its folder below `partial_root`, without the
-    run's transient rename probes."""
+    run's transient probes."""
     folder = dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
     if not folder.is_dir():
         return []
-    return sorted(path for path in folder.iterdir() if path.name not in destination_module._PROBE_NAMES)
+    transient = (*destination_module._PROBE_NAMES, destination_module._SPARSE_PROBE_NAME)
+    return sorted(path for path in folder.iterdir() if path.name not in transient)
 
 
 def _partial_sizes(dest) -> list[int]:
@@ -186,6 +187,52 @@ def _io_log(monkeypatch, calls: tuple[str, ...]) -> list[tuple[str, str, int, in
     for call in calls:
         monkeypatch.setattr(os, call, logged(call))
     return log
+
+
+@dataclass
+class ZeroFill:
+    """The zeros an emulated filesystem without sparse files wrote, by the name of the file it extended."""
+
+    written: dict[str, int] = field(default_factory=dict)
+
+
+@pytest.fixture
+def non_sparse(monkeypatch) -> Callable[[Path], ZeroFill]:
+    """`emulate(folder)` makes the files below `folder` behave as on a filesystem without sparse files (HFS+, exFAT,
+    FAT), as Linux `hfsplus` does: an `os.ftruncate` that extends a file, or an `os.pwrite` past its end, first writes
+    the zeros of the gap, one call at a time. There is no such filesystem an unprivileged test can mount; everything
+    else is real: the files, their `st_blocks`, the fake server and the CLI."""
+    ftruncate, pwrite = os.ftruncate, os.pwrite
+    lock = threading.Lock()
+
+    def emulate(folder: Path) -> ZeroFill:
+        zero_fill = ZeroFill()
+
+        def fill_to(fd: int, end: int) -> None:
+            path = os.readlink(f'/proc/self/fd/{fd}')
+            offset = os.fstat(fd).st_size
+            if not _below(path, folder) or end <= offset:
+                return
+            name = Path(path).name
+            zero_fill.written[name] = zero_fill.written.get(name, 0) + end - offset
+            while offset < end:
+                offset += pwrite(fd, bytes(min(MiB, end - offset)), offset)
+
+        def extending_ftruncate(fd: int, length: int) -> None:
+            with lock:
+                fill_to(fd, length)
+                ftruncate(fd, length)
+
+        def extending_pwrite(fd: int, data, offset: int) -> int:
+            with lock:
+                fill_to(fd, offset)
+                return pwrite(fd, data, offset)
+
+        monkeypatch.setattr(os, 'ftruncate', extending_ftruncate)
+        monkeypatch.setattr(os, 'pwrite', extending_pwrite)
+        return zero_fill
+
+    return emulate
 
 
 def _below(path: str, folder) -> bool:
@@ -594,6 +641,8 @@ def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and
     assert failed['path'] == 'disk:/Checks/short.bin'
     assert failed['reason'].startswith('the download failed: ')
     assert (document['partial_dir'], document['partial_move'], document['partial_room']) == (None, None, None)
+    assert document['sparse_partials'] is True
+    assert f'Partial folder {_own_partial_folder(dest)} keeps sparse files: yes' in log_messages()
     assert document['partials_left'] == []
     report = stderr_lines(result.stderr)
     assert report[report.index('Failed: 1') + 1] == f'  disk:/Checks/short.bin: {failed["reason"]}'
@@ -2124,6 +2173,150 @@ def test_with_a_partial_folder_a_resume_reads_that_folder_only(big, dest, partia
     assert _partials(dest) == []
 
 
+_HASHED_ROOT = 'disk:/Hashed'
+
+
+def _slow_preads(monkeypatch) -> list[tuple[str, str, int, int]]:
+    """The `_io_log` of every `os.pread`, each of which first sleeps 20 ms, so readers running at once interleave."""
+    log = _io_log(monkeypatch, ('pread',))
+    logged = os.pread
+
+    def slow(fd, size, offset):
+        time.sleep(0.02)
+        return logged(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', slow)
+    return log
+
+
+def _finishing_together(monkeypatch, folder, count: int, size: int) -> None:
+    """Hold the write that completes each of the first `count` `size`-byte partial files in `folder` until all of them
+    are there, so the read-backs that follow start together."""
+    together = threading.Barrier(count, timeout=10)
+    written: dict[str, int] = {}
+    lock = threading.Lock()
+    pwrite = os.pwrite
+
+    def gated(fd, data, offset):
+        path = os.readlink(f'/proc/self/fd/{fd}')
+        done = pwrite(fd, data, offset)
+        if _below(path, folder) and Path(path).name.isdigit():
+            with lock:
+                written[path] = written.get(path, 0) + done
+                complete = written[path] == size
+            if complete:
+                together.wait()
+        return done
+
+    monkeypatch.setattr(os, 'pwrite', gated)
+
+
+@pytest.mark.parametrize('phase', ['resume', 'read back', 'adopt'])
+def test_bytes_on_disk_are_hashed_for_one_file_at_a_time(disk, dest, monkeypatch, phase):
+    monkeypatch.setattr(destination_module, '_READ_SIZE', 256 * 1024)
+    size = {'resume': 2 * MiB, 'read back': 4 * MiB, 'adopt': MiB}[phase]
+    count = {'resume': 4, 'read back': 2, 'adopt': 3}[phase]
+    files = {f'{_HASHED_ROOT}/{n}.bin': random.Random(40 + n).randbytes(size) for n in range(count)}
+    for path, content in files.items():
+        disk.add_file(path, content, modified=MODIFIED)
+    partials = dest / '.yandex-disk-rescue' / 'partial'
+    hashed = dest if phase == 'adopt' else partials
+    args: tuple[str, ...] = ()
+    if phase == 'resume':
+        for path in files:
+            disk.inject('GET', '/download', Truncate(after_bytes=MiB), where={'path': path})
+        cut = run_download('--download-retries', '0', '--download-passes', '1', _HASHED_ROOT, str(dest))
+        assert cut.exit_code == 1, cut.output
+        assert [partial.stat().st_size for partial in _partials(dest)] == [MiB] * count
+    elif phase == 'read back':
+        args = SEGMENTED_ARGS
+        _finishing_together(monkeypatch, partials, count, size)
+    else:
+        dest.mkdir()
+        for path, content in files.items():
+            (dest / PurePosixPath(path).name).write_bytes(content)
+    log = _slow_preads(monkeypatch)
+
+    result = run_download('-v', *args, _HASHED_ROOT, str(dest))
+    calls = list(log)
+
+    assert result.exit_code == 0, result.output
+    for path, content in files.items():
+        assert (dest / PurePosixPath(path).name).read_bytes() == content
+    paths = [path for _, path, _, _ in calls if _below(path, hashed) and Path(path).name[0].isdigit()]
+    assert len(set(paths)) == count
+    runs = [path for path, _ in itertools.groupby(paths)]
+    assert len(runs) == len(set(runs)), f'the files were hashed interleaved: {runs}'
+    assert any(message.endswith(" waits for another file's hash") for message in log_messages())
+
+
+def test_with_a_partial_folder_resume_re_hashes_do_not_wait_for_an_adoption_hash_of_dest(
+    big, dest, partial_root, monkeypatch
+):
+    partial = _leave_partial(big, dest, partial_root=partial_root)
+    copy = random.Random(5).randbytes(MiB)
+    big.add_file('disk:/Big/a.bin', copy, modified=MODIFIED)
+    (dest / 'a.bin').write_bytes(copy)
+    monkeypatch.setattr(destination_module, '_READ_SIZE', 256 * 1024)
+    resumed = threading.Event()
+    timed_out: list[str] = []
+    pread = os.pread
+
+    def adoption_waits_for_the_resume(fd, size, offset):
+        path = os.readlink(f'/proc/self/fd/{fd}')
+        if path == str(partial):
+            resumed.set()
+        elif path == str(dest / 'a.bin') and offset == 0 and not resumed.wait(10):
+            timed_out.append(path)
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', adoption_waits_for_the_resume)
+    earlier = len(big.requests)
+
+    result = run_download('--partial-dir', str(partial_root), '--scan-max-age', '0', 'disk:/Big', str(dest))
+
+    assert timed_out == []
+    assert result.exit_code == 0, result.output
+    assert (dest / 'a.bin').read_bytes() == copy
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    assert _fetches(big, 'disk:/Big/a.bin', earlier) == []
+
+
+@pytest.mark.anyio
+async def test_a_copy_waiting_for_the_hash_of_another_shows_it_waits_to_hash(disk, dest, monkeypatch):
+    files = {f'{_HASHED_ROOT}/{n}.bin': random.Random(50 + n).randbytes(MiB) for n in range(2)}
+    dest.mkdir()
+    for path, content in files.items():
+        disk.add_file(path, content, modified=MODIFIED)
+        (dest / PurePosixPath(path).name).write_bytes(content)
+    monkeypatch.setattr(destination_module, '_READ_SIZE', 256 * 1024)
+    held, release = threading.Event(), threading.Event()
+    pread = os.pread
+
+    def held_at_the_first_read(fd, size, offset):
+        if not held.is_set() and _below(os.readlink(f'/proc/self/fd/{fd}'), dest):
+            held.set()
+            release.wait(10)
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', held_at_the_first_read)
+    progress = MirrorProgress()
+
+    def states() -> list[str]:
+        return sorted(transfer.state for transfer in progress.snapshot().active)
+
+    async with _mirror_run(disk, _HASHED_ROOT, dest, progress=progress) as run:
+        task = asyncio.create_task(run())
+        try:
+            await _until(lambda: states() == ['hashing', 'waiting to hash'], 'one copy hashing, the other waiting')
+        finally:
+            release.set()
+        report = await task
+
+    assert report.adopted == list(files)
+
+
 def test_with_a_partial_folder_every_run_deletes_the_staged_copies_left_in_dest_and_nothing_else(
     big, dest, partial_root, monkeypatch
 ):
@@ -2573,7 +2766,9 @@ def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_by
     assert missing in log_messages()
     assert not [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert _fetches(disk, BIG_PATH, earlier) == [None]
-    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == sorted(SEGMENT_RANGES)
+    # Its journal keeps no byte once the partial folder is lost, so it is planned again with this run's (default)
+    # segment threshold.
+    assert _fetches(disk, SEGMENTED_PATH, earlier) == [None]
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
     assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
     again = run_download(*_partial_args(new_root), str(dest))
@@ -3433,6 +3628,77 @@ def test_a_file_above_the_segment_threshold_is_fetched_as_parallel_segments_tili
     assert _journal() == []
 
 
+def _own_partial_folder(dest) -> Path:
+    return dest.resolve() / '.yandex-disk-rescue' / 'partial'
+
+
+def _one_stream_headline(folder) -> str:
+    return f'Partial files in {folder} cannot be sparse: new downloads are fetched as one stream each, not as segments.'
+
+
+@pytest.mark.parametrize('partials', ['in-dest', 'separate'])
+def test_a_partial_folder_without_sparse_files_gets_each_file_as_one_stream_without_zero_fill(
+    segmented, dest, non_sparse, request, partials
+):
+    """DEST is on a filesystem without sparse files; with a partial folder, the partial files are on `/dev/shm`,
+    which keeps them."""
+    partial_root = request.getfixturevalue('partial_root') if partials == 'separate' else None
+    zero_fill = non_sparse(dest)
+
+    result = run_download('--json', *SEGMENTED_ARGS, *_partial_args(partial_root), 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+    assert _journal() == []
+    document = json.loads(result.stdout)
+    notices = stderr_lines(result.stderr)
+    if partial_root is None:
+        folder = _own_partial_folder(dest)
+        assert _fetches(segmented, SEGMENTED_PATH) == [None]
+        assert zero_fill.written == {destination_module._SPARSE_PROBE_NAME: MiB}
+        assert _one_stream_headline(folder) in notices
+        assert notices.index(_one_stream_headline(folder)) > notices.index(f'Downloading 1 file (4.0 MiB) to {dest}')
+        assert document['sparse_partials'] is False
+        assert f'Partial folder {folder} keeps sparse files: no' in log_messages()
+    else:
+        folder = _separate_folder(dest, partial_root)
+        assert sorted(_fetches(segmented, SEGMENTED_PATH)) == SEGMENT_RANGES
+        assert zero_fill.written == {}
+        assert not [line for line in notices if 'cannot be sparse' in line]
+        assert document['sparse_partials'] is True
+        assert f'Partial folder {folder} keeps sparse files: yes' in log_messages()
+
+
+def test_the_partial_folder_probe_reports_sparse_files_and_leaves_nothing_behind(dest, non_sparse):
+    with Destination.open(dest, partial_dir=None) as destination:
+        assert destination.sparse_partials is True
+        assert list(destination.partial_folder.iterdir()) == []
+    non_sparse(dest)
+
+    with Destination.open(dest, partial_dir=None) as destination:
+        assert destination.sparse_partials is False
+        assert list(destination.partial_folder.iterdir()) == []
+
+
+def test_a_probe_error_in_the_separate_partial_folder_names_that_folder(disk, dest, partial_root, monkeypatch):
+    folder = _separate_folder(dest, partial_root)
+    ftruncate = os.ftruncate
+
+    def full(fd: int, length: int) -> None:
+        if _below(os.readlink(f'/proc/self/fd/{fd}'), folder):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        ftruncate(fd, length)
+
+    monkeypatch.setattr(os, 'ftruncate', full)
+
+    result = run_download('--partial-dir', str(partial_root), str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {folder}: {os.strerror(errno.ENOSPC)}.']
+    assert _transfers(disk) == []
+    assert list(folder.iterdir()) == []
+
+
 def _segments_confirmed(at_least: int) -> bool:
     journal = _journal()
     return len(journal) == 4 and all(confirmed - start >= at_least for start, _, confirmed, _ in journal)
@@ -3538,6 +3804,46 @@ def test_an_interrupted_segmented_download_resumes_each_segment_from_its_own_che
     assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier)) == sorted(
         f'bytes={resumed_from[start]}-{end - 1}' for start, end, _, _ in journal
     )
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def _leave_empty_segmented_journal(fake, dest) -> None:
+    """Run a segmented download of `SEGMENTED_PATH` whose 4 segments all get HTTP 503, with no later pass: its journal
+    keeps 4 segments confirming no byte."""
+    fake.inject('GET', '/download', 503, 503, 503, 503, where={'path': SEGMENTED_PATH})
+    result = run_download(*SEGMENTED_ARGS, '--download-passes', '1', 'disk:/Seg', str(dest))
+    assert result.exit_code == 1, result.output
+    assert _journal() == [(n * MiB, (n + 1) * MiB, n * MiB, None) for n in range(4)]
+
+
+@pytest.mark.parametrize(
+    ('segments', 'fetched'), [('1', [None]), ('2', [f'bytes=0-{2 * MiB - 1}', f'bytes={2 * MiB}-{4 * MiB - 1}'])]
+)
+def test_a_segmented_download_that_kept_no_byte_starts_again_with_the_current_segments(
+    segmented, dest, segments, fetched
+):
+    _leave_empty_segmented_journal(segmented, dest)
+    earlier = len(segmented.requests)
+
+    result = run_download(*SEGMENTED_ARGS, '--download-segments', segments, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier), key=str) == fetched
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def test_an_empty_segmented_journal_in_a_folder_without_sparse_files_is_fetched_as_one_stream(
+    segmented, dest, non_sparse
+):
+    _leave_empty_segmented_journal(segmented, dest)
+    zero_fill = non_sparse(dest)
+    earlier = len(segmented.requests)
+
+    result = run_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(segmented, SEGMENTED_PATH, earlier) == [None]
+    assert zero_fill.written == {destination_module._SPARSE_PROBE_NAME: MiB}
     assert (dest / 'large.bin').read_bytes() == SEGMENTED
 
 

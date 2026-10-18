@@ -152,16 +152,19 @@ yandex-disk-rescue/
 │   │                 #   what they allocate, each fetched file its full size, in the order files start: wait, defer
 │   │                 #   to the next pass, or fail a file larger than the room, and every file deferred for room at
 │   │                 #   once when a pass changed nothing in it),
-│   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
-│   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
-│   │                 #   pipeline (adopt a matching local copy, record one that cannot be read as a `corrupt`
-│   │                 #   finding and fetch the file again, or resume a partial file segment by segment
-│   │                 #   from its checkpoint journal once the cloud file is confirmed unchanged and each
-│   │                 #   segment's confirmed bytes re-hashed; the segment plan of a new download; one link per
-│   │                 #   file shared by its segments and taken once one holds a connection, preallocation of
-│   │                 #   a segmented file, parallel ranged fetches of its segments while hashing with
-│   │                 #   checkpoints, immediate retries after new data and one link refresh per pass, the
-│   │                 #   fallback to one stream when the host ignores a range;
+│   │                 #   one placement lock over each check-clear-place-record of a final path, one hash of
+│   │                 #   bytes on disk at a time per folder (re-hashing confirmed bytes, a read-back, a local
+│   │                 #   copy), the first run-stopping error raised as itself once the other files are
+│   │                 #   cancelled, the per-file pipeline (adopt a matching local copy, record one that cannot
+│   │                 #   be read as a `corrupt` finding and fetch the file again, or resume a partial file
+│   │                 #   segment by segment from its checkpoint journal once the cloud file is confirmed
+│   │                 #   unchanged and each segment's confirmed bytes re-hashed, a journal keeping no byte
+│   │                 #   planned again as a new download; the segment plan of a new download, one segment
+│   │                 #   in a partial folder without sparse files; one link per file shared by its segments
+│   │                 #   and taken once one holds a connection, preallocation of a segmented file, parallel
+│   │                 #   ranged fetches of its segments while hashing with checkpoints, immediate retries
+│   │                 #   after new data and one link refresh per pass, the fallback to one stream when the host
+│   │                 #   ignores a range;
 │   │                 #   verify, by reading a segmented file back, or with separate partial files by
 │   │                 #   copying the finished file to its staged copy in DEST, one copy of the run at a time,
 │   │                 #   hashing the bytes copied; quarantining a file that fails; move aside
@@ -189,8 +192,9 @@ yandex-disk-rescue/
 │   │                 #   `partial/<id>.copy` a separate partial file is copied to (each left by a stopped run
 │   │                 #   deleted at the start of the next), the partial folder an earlier run used (reading,
 │   │                 #   deleting its partial files and its leftovers, whether it is this run's folder under
-│   │                 #   another path), the free space of the partial folder and
-│   │                 #   the bytes each partial file allocates there, reading existing files, whether the
+│   │                 #   another path), the free space of the partial folder,
+│   │                 #   the bytes each partial file allocates there and whether its filesystem keeps sparse
+│   │                 #   files (probed on open), reading existing files, whether the
 │   │                 #   destination itself is still readable (`reachable`),
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
