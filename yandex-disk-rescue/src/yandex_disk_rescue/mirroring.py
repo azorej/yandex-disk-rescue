@@ -747,7 +747,9 @@ class MirrorRun:
         room_measured: Callable[[PartialRoom], None],
     ) -> MirrorReport:
         """With separate partials, measure the room of the partial folder and pass it to `room_measured`; every file
-        fetched takes a turn of it. Raises `RuntimeError` when `move_partials` has not run.
+        fetched takes a turn of it. The caller starts the transfer phase of the run's progress first
+        (`MirrorProgress.start_transferring`), so whatever shows it opens on that phase. Raises `RuntimeError` when
+        `move_partials` has not run.
 
         Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
         most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
@@ -766,7 +768,6 @@ class MirrorRun:
         once every file's turn has ended."""
         if not self._move_done:
             raise RuntimeError('the partial files must be moved before the run')
-        self._progress.start_transferring(self.pending_files, self.pending_size, passes=passes)
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         with DiskThreads(content.connections + _SPARE_THREADS) as threads:
             room = None

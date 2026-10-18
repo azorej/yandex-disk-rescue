@@ -326,6 +326,7 @@ async def _mirror(
             room = {'folder': str(measured.folder), 'available': available}
             output.headline(f'Partial files in {measured.folder} ({format_size(available)} available)')
 
+        progress.start_transferring(run.pending_files, run.pending_size, passes=transfers.passes)
         with output.progress(progress):
             report = await run.run(client, content, policy, passes=transfers.passes, room_measured=room_measured)
     facts = {

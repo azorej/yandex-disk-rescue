@@ -3255,15 +3255,17 @@ async def _mirror_run(
         scan_root = await resolve_scan_root(client, root)
         with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=partial_dir) as destination:
             await scan_tree(client, manifest, account, scan_root, ScanProgress())
+            state = progress or MirrorProgress()
             run = MirrorRun(
                 manifest.mirror(account.uid, scan_root.path, destination.path),
                 destination,
                 retry_failed=False,
-                progress=progress or MirrorProgress(),
+                progress=state,
             )
 
             async def mirrored() -> MirrorReport:
                 await run.move_partials(MoveProgress())
+                state.start_transferring(run.pending_files, run.pending_size, passes=1)
                 return await run.run(client, content, policy, passes=1, room_measured=lambda _: None)
 
             yield mirrored

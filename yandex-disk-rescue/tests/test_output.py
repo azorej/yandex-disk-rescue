@@ -610,6 +610,21 @@ def test_a_report_line_written_during_a_phase_goes_on_the_terminal_while_the_vie
     assert _after_the_view(shown).startswith('Mirrored disk:/ to ')
 
 
+def test_the_view_of_the_transfer_phase_opens_on_its_own_line_and_never_on_the_check(slow, dest):
+    slow.chunk_delay = 0
+    assert run_download(str(dest)).exit_code == 0
+    slow.chunk_delay = 0.5
+    slow.add_file('disk:/New/slow.bin', bytes(4 * 64 * 1024), modified=MODIFIED)
+
+    code, _, shown = _Terminal('download', '--scan-max-age', '0', str(dest), report_on_terminal=True).finish()
+
+    assert code == 0, shown
+    assert b'Checking 6 files already in ' in shown
+    transfers = shown.partition(b'Downloading 1 file (')[2]
+    assert b'Downloading: 0 of 1 file, ' in transfers
+    assert b'Checking ' not in transfers
+
+
 RED = 'disk:/Docs/\x1b[31mred\r.txt'
 BELL = 'disk:/Docs/bell\x07\x9b.txt'
 
