@@ -1108,4 +1108,4 @@ def test_a_verify_pass_round_trips_is_replaced_by_a_new_one_and_goes_with_its_mi
         connection.execute('PRAGMA foreign_keys = ON')
         connection.execute('DELETE FROM mirrors')
         connection.commit()
-        assert connection.execute('SELECT count(partial_folder) FROM mirrors').fetchone()[0] == 0
+        assert connection.execute('SELECT count(*) FROM verify_passes').fetchone()[0] == 0

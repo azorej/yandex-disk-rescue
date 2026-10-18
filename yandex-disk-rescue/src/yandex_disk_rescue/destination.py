@@ -420,6 +420,15 @@ class Destination(_Tree):
         self._previous_fds.append(fd)
         return PreviousPartials(fd, self._own_partials, own=True)
 
+    def is_partial_folder(self, previous: PreviousPartials) -> bool:
+        """Whether `previous` is the folder partial files live in, opened under the same or another path. Any error
+        raises `DestinationError` naming `previous`."""
+        try:
+            here, there = os.fstat(self._files_fd), previous.stat()
+        except OSError as exc:
+            raise DestinationError.of(previous.path, exc) from None
+        return (here.st_dev, here.st_ino) == (there.st_dev, there.st_ino)
+
     def remove_staged_copies(self) -> None:
         """Delete every regular file named `<digits>.copy` in the destination's `.yandex-disk-rescue/partial/`: the
         staged copies a stopped run left there, whichever folder partial files live in now. Any error raises
@@ -429,6 +438,7 @@ class Destination(_Tree):
                 stray = [e.name for e in found if _COPY_NAME.fullmatch(e.name) and e.is_file(follow_symlinks=False)]
             for name in stray:
                 os.unlink(name, dir_fd=self._partial_fd)
+            os.fsync(self._partial_fd)
         except OSError as exc:
             raise DestinationError.of(self._own_partials, exc) from None
 
@@ -621,6 +631,9 @@ class PreviousPartials:
         self.path = path
         self._fd = fd
         self._own = own
+
+    def stat(self) -> os.stat_result:
+        return os.fstat(self._fd)
 
     def size(self, entry_id: int) -> int | None:
         """The size of the partial file of `entry_id`; `None` when there is no regular file of that name."""

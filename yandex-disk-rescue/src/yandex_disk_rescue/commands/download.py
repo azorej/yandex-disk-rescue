@@ -224,13 +224,13 @@ async def _mirror(
         )
     else:
         typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
-    if (move := run.partial_move) is not None:
+    if (move := run.partial_move) is not None and move.downloads:
         if move.missing:
             typer.echo(
                 f'The partial folder of the last run, {move.source}, is missing; its downloads in progress start '
                 'again from their first byte.'
             )
-        elif move.downloads:
+        else:
             downloads = 'download' if move.downloads == 1 else 'downloads'
             typer.echo(
                 f'Moving the confirmed bytes ({format_size(move.size)}) of {move.downloads} {downloads} in progress '

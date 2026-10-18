@@ -244,12 +244,19 @@ resume — happens on that disk, not on DEST:
   (<size> available)`. A file being downloaded counts its full size; a
   partial file kept for a later pass or run counts the disk space it
   actually takes, which for a segmented file is only what was written so
-  far. Files take their room in path order, a file that does not fit yet
-  waits for one in progress to end, and when none is left in progress it is
-  deferred to the next pass with `no room yet in the partial folder <folder>
-  (<size> needed, <size> available)`. A file larger than the whole room
-  fails with `larger than the room in the partial folder <folder> (<size>
-  needed, <size> available)`; `--retry-failed` fetches it once there is room.
+  far, until it is deleted (also when its file is found already in DEST
+  and adopted). Files take their room in path order, a file that does not
+  fit yet waits for one in progress to end, and when none is left in
+  progress it is deferred to the next pass with `no room yet in the partial
+  folder <folder> (<size> needed, <size> available)`. When a pass starts no
+  download and frees no room, and every file it defers waits for room, the
+  partial files kept there can never make room for each other: those files
+  fail at once, whatever `--download-passes` says, with `no room in the
+  partial folder <folder> next to the partial files kept there (<size>
+  needed, <size> available); free space there, then run again or with
+  --retry-failed`. A file larger than the whole room fails with `larger than
+  the room in the partial folder <folder> (<size> needed, <size>
+  available)`; `--retry-failed` fetches it once there is room.
   When another program fills that disk anyway, the run stops with `Error:
   Could not write <path>: No space left on device.` (below) and a rerun
   resumes from the journals.
@@ -269,9 +276,11 @@ resume — happens on that disk, not on DEST:
   during the move goes on with it on the next run, losing no confirmed byte.
   A confirmed range missing from an old file cut short (by hand, or by a
   power cut on a disk that lost the end of a write) is fetched again. When
-  the recorded folder is gone, the run prints `The partial folder of the last
-  run, <old>, is missing; its downloads in progress start again from their
-  first byte.`, and they do.
+  the recorded folder is gone and downloads were in progress, the run prints
+  `The partial folder of the last run, <old>, is missing; its downloads in
+  progress start again from their first byte.`, and they do. The recorded
+  folder reached under another path (a bind mount, a link on the way) is
+  the same folder: nothing is moved, and the new path is recorded.
 - Remounting DEST at another path makes it a new mirror with a new `<key>`;
   the old `PATH/<key>/` can then be deleted.
 

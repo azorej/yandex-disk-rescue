@@ -35,12 +35,14 @@ The manifest records the folder the mirror's partial files are in. A run whose f
 download in progress there, one at a time: only each segment's confirmed bytes are copied, a segment whose confirmed
 bytes the old file no longer holds is reset in the journal, and the copy is made durable before the old file is
 deleted. Then what is left in the old folder is deleted and the new folder recorded; a run stopped on the way leaves
-the old folder recorded, so the next run moves the files still there. A recorded folder that is gone is reported, and
-its downloads start again.
+the old folder recorded, so the next run moves the files still there. A recorded folder that is gone is reported when
+downloads were in progress, and they start again. The recorded folder reached under another path is this run's
+folder: nothing is moved, and the new path is recorded.
 
 With separate partials, the partial files take no more than the room of their folder, measured once the move is
 done (`PartialRoom`): a file fetched takes a turn of the room for its full size, in path order, and waits, is deferred
-to the next pass or fails when it does not fit. An error writing the folder all the same stops the run.
+to the next pass or fails when it does not fit. A pass that changed nothing in the room fails the files it deferred
+for room at once, since no later pass could fit them. An error writing the folder all the same stops the run.
 
 A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
 conversion, which is then recorded as its local name.
@@ -139,6 +141,15 @@ class FileDeferred(FileFailed):
         self.retry_after = retry_after
 
 
+class NoRoomYet(FileDeferred):
+    """The file's turn of the partial folder's room does not fit next to the bytes counted there now; `final` is the
+    reason it fails with once no turn of the room can end to free any."""
+
+    def __init__(self, reason: str, *, final: str) -> None:
+        super().__init__(reason, retry_after=None)
+        self.final = final
+
+
 @dataclass(frozen=True)
 class Failure:
     path: str
@@ -156,8 +167,8 @@ class PartialLeft:
 @dataclass(frozen=True)
 class PartialMove:
     """The partial files of downloads in progress moving from `source`, the folder the last run recorded, to `target`,
-    this run's: `downloads` of them, with `size` confirmed bytes to copy. With `missing`, `source` no longer exists and
-    nothing is moved."""
+    this run's: `downloads` of them, with `size` confirmed bytes to copy. With `missing`, `source` no longer exists,
+    nothing is moved and `downloads` start again from byte 0."""
 
     source: Path
     target: Path
@@ -329,7 +340,11 @@ class PartialRoom:
     A turn that does not fit waits while an admitted turn is running, and is deferred to a later pass once none is; a
     file larger than the capacity on its own fails. When an admitted turn ends, whatever its outcome, its reservation
     is returned, its partial file counts what it allocates then, and the turns waiting are checked again in order, so a
-    turn waits only while some admitted turn runs, and every admitted turn ends.
+    turn waits only while some admitted turn runs, and every admitted turn ends. An idle partial file deleted outside
+    any turn is released the same way.
+
+    `changes` counts the turns admitted and the partial files released: while it stays the same, the counted bytes do
+    too, so a deferred turn would be deferred again.
     """
 
     def __init__(self, destination: Destination, capacity: int, idle: dict[int, int]) -> None:
@@ -340,6 +355,11 @@ class PartialRoom:
         self._reserved: dict[int, int] = {}
         self._counted = sum(idle.values())
         self._waiting: deque[tuple[int, int, asyncio.Future[None]]] = deque()
+        self._changes = 0
+
+    @property
+    def changes(self) -> int:
+        return self._changes
 
     @classmethod
     def measure(cls, destination: Destination, in_progress: Iterable[int]) -> Self:
@@ -366,6 +386,7 @@ class PartialRoom:
     async def _admitted(self, entry_id: int, size: int) -> None:
         if self._reservation(entry_id, size) == 0:
             self._reserved[entry_id] = 0
+            self._changes += 1
             return
         if size > self.capacity:
             raise FileFailed(
@@ -399,19 +420,30 @@ class PartialRoom:
             elif self._counted + reservation <= self.capacity:
                 self._reserved[entry_id] = reservation
                 self._counted += reservation
+                self._changes += 1
                 admitted.set_result(None)
             elif self._reserved:
                 return
             else:
-                free = format_size(max(self.capacity - self._counted, 0))
-                admitted.set_exception(
-                    FileDeferred(
-                        f'no room yet in the partial folder {self.folder} '
-                        f'({format_size(reservation)} needed, {free} available)',
-                        retry_after=None,
-                    )
-                )
+                admitted.set_exception(self._no_room_yet(reservation))
             self._waiting.popleft()
+
+    def _no_room_yet(self, reservation: int) -> NoRoomYet:
+        sizes = f'({format_size(reservation)} needed, {format_size(max(self.capacity - self._counted, 0))} available)'
+        return NoRoomYet(
+            f'no room yet in the partial folder {self.folder} {sizes}',
+            final=(
+                f'no room in the partial folder {self.folder} next to the partial files kept there {sizes}; free '
+                'space there, then run again or with --retry-failed'
+            ),
+        )
+
+    def release(self, entry_id: int) -> None:
+        """Stop counting the idle partial file of `entry_id`, deleted outside any turn, and check the turns waiting."""
+        if allocated := self._idle.pop(entry_id, 0):
+            self._counted -= allocated
+            self._changes += 1
+            self._admit()
 
     def _end(self, entry_id: int) -> None:
         """Return the reservation of the turn of `entry_id`, count what its partial file allocates now, and check the
@@ -568,16 +600,19 @@ class MirrorRun:
 
     def _plan_move(self, in_progress: list[MirrorEntry]) -> PartialMove | None:
         """The move of the downloads in `in_progress` from the partial folder the mirror records to this run's; `None`
-        when it is the same folder. Opens the recorded folder, when it exists, for `run`."""
+        when it is the same folder, also under another path (a bind mount, a link on the way). Opens the recorded
+        folder, when it exists, for `run`."""
         recorded, destination = self._mirror.partial_folder, self._destination
         if recorded == self._partial_folder:
             return None
         if recorded is None:
             source = destination.own_partials()
         elif (found := destination.previous_partials(recorded)) is None:
-            return PartialMove(recorded, destination.partial_folder, 0, 0, missing=True)
+            return PartialMove(recorded, destination.partial_folder, len(in_progress), 0, missing=True)
         else:
             source = found
+        if destination.is_partial_folder(source):
+            return None
         for entry in in_progress:
             if entry.download is not None and (held := source.size(entry.entry_id)) is not None:
                 self._moved.append((entry.entry_id, entry.download.segments, held))
@@ -588,15 +623,15 @@ class MirrorRun:
     async def _move_partials(self, threads: DiskThreads) -> None:
         """Carry out `partial_move`: each download's partial file in turn, then the deletion of what is left in the
         recorded folder, then the record of this run's folder. A run stopped on the way keeps the recorded folder, so
-        the next run moves the partial files still there, writing their copies in this run's folder again."""
-        if self.partial_move is None:
-            return
-        if self._source is not None:
+        the next run moves the partial files still there, writing their copies in this run's folder again. This run's
+        folder is recorded also when there is nothing to move."""
+        if self.partial_move is not None and self._source is not None:
             for entry_id, segments, held in self._moved:
                 with _fatal_errors(self._destination.partial_folder):
                     await self._move_partial(entry_id, segments, held, self._source, threads)
             await threads.run(self._source.remove_leftovers)
-        self._mirror.record_partial_folder(self._partial_folder)
+        if self._mirror.partial_folder != self._partial_folder:
+            self._mirror.record_partial_folder(self._partial_folder)
 
     async def _move_partial(
         self, entry_id: int, segments: tuple[Segment, ...], held: int, source: PreviousPartials, threads: DiskThreads
@@ -611,7 +646,8 @@ class MirrorRun:
         with source.partial(entry_id) as old, self._destination.partial(entry_id) as new:
             await threads.run(new.truncate, 0)
             for segment in movable:
-                await _feed(new.write, old.chunks(segment.start, segment.confirmed), threads, segment.start)
+                chunks = _read_errors(old.chunks(segment.start, segment.confirmed), source.path / str(entry_id))
+                await _feed(new.write, chunks, threads, segment.start)
             await threads.run(new.sync)
         await threads.run(self._destination.sync_partial_folder)
         await threads.run(source.remove, entry_id)
@@ -651,9 +687,10 @@ class MirrorRun:
                 room = await threads.run(PartialRoom.measure, self._destination, self._in_progress)
                 room_measured(room)
             tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), room, report, policy)
+            changes = _changes(room)
             deferred = await self._first_pass(tools)
             if deferred:
-                await self._later_passes(deferred, tools, passes=passes)
+                await self._later_passes(deferred, tools, passes=passes, changes=changes)
         report.replaced_folder = self._destination.replaced_folder
         report.failed += [Failure(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()]
         self._in_path_order(report)
@@ -720,21 +757,27 @@ class MirrorRun:
             return failed.reason, local
 
     async def _later_passes(
-        self, deferred: list[tuple[MirrorEntry, FileDeferred]], tools: _RunTools, *, passes: int
+        self, deferred: list[tuple[MirrorEntry, FileDeferred]], tools: _RunTools, *, passes: int, changes: int
     ) -> None:
+        """Resume the `deferred` files in later passes, at most `passes` in all (0: no limit). When the files a pass
+        deferred all wait for room, and the room is as it was when that pass began (at `changes`), no later pass could
+        fit them: they fail at once with their final reason."""
         used = 1
-        while deferred and (passes == 0 or used < passes):
+        while deferred and not _stuck_for_room(deferred, tools.room, changes) and (passes == 0 or used < passes):
             waits = [failure.retry_after for _, failure in deferred if failure.retry_after is not None]
             await asyncio.sleep(max([PASS_PAUSE_SECONDS, *waits]))
             used += 1
+            changes = _changes(tools.room)
             remaining: list[tuple[MirrorEntry, FileDeferred]] = []
             async with _FileTurns(tools.content.connections) as turns:
                 for entry, _ in deferred:
                     await turns.start(self._turn(entry, tools, remaining))
             deferred = self._sorted(remaining)
+        stuck = _stuck_for_room(deferred, tools.room, changes)
         suffix = f' (after {used} passes)' if used > 1 else ''
         for entry, failure in deferred:
-            self._fail(tools.report, entry, failure.reason + suffix)
+            reason = failure.final if stuck and isinstance(failure, NoRoomYet) else failure.reason + suffix
+            self._fail(tools.report, entry, reason)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -866,6 +909,8 @@ async def download_file(
                 verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads, placement)
                 if verified_by is not None:
                     left = await _remove_recorded_partial(entry.entry_id, destination, threads)
+                    if left is None and room is not None:
+                        room.release(entry.entry_id)
                     return FileOutcome(local, verified_by, adopted=True, moved_aside=False, partial_left=left)
     async with nullcontext() if room is None else room.turn(entry.entry_id, identity.size):
         with _local_errors(destination, local, 'write'):
@@ -1663,6 +1708,23 @@ def _fatal_errors(path: Path) -> Iterator[None]:
         yield
     except OSError as exc:
         raise DestinationError.of(path, exc) from None
+
+
+def _read_errors(chunks: Iterator[bytes], path: Path) -> Iterator[bytes]:
+    """`chunks`, read from the file at `path`; an error reading them raises `DestinationError` naming it."""
+    try:
+        yield from chunks
+    except OSError as exc:
+        raise DestinationError.of(path, exc) from None
+
+
+def _changes(room: PartialRoom | None) -> int:
+    return 0 if room is None else room.changes
+
+
+def _stuck_for_room(deferred: list[tuple[MirrorEntry, FileDeferred]], room: PartialRoom | None, changes: int) -> bool:
+    """Whether every file of `deferred` waits for room in `room`, unchanged since it counted `changes`."""
+    return room is not None and room.changes == changes and all(isinstance(f, NoRoomYet) for _, f in deferred)
 
 
 def _blocked_by(local: PurePosixPath, blocked: dict[PurePosixPath, str]) -> str | None:
