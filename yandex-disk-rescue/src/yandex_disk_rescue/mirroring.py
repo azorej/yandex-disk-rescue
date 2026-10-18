@@ -23,8 +23,9 @@ downloaded as several segments, ranged fetches running in parallel into one part
 file's size first and, with partial files in the destination, read back in full to be verified once every segment is
 in; any other file is one stream, there verified by the digest computed as it arrives. In a partial folder without
 sparse files (HFS+, exFAT, FAT), where extending a file writes its zeros first, a new download is always one stream,
-so its partial file is only appended to. The segments are fixed when the download starts and kept by every later turn
-of it.
+so its partial file is only appended to. A later turn of a download keeps its segments while any of them keeps
+confirmed bytes; a download that kept none is planned again, as a new one is, with the current policy and partial
+folder.
 
 Every download keeps a checkpoint journal in the manifest: for each segment, the offset up to which its bytes were
 fsynced and the SHA-256 of those bytes. A checkpoint is taken every `checkpoint_bytes` a segment receives,
@@ -1092,8 +1093,9 @@ async def download_file(
     The entry's download record is read from `mirror` when the turn starts. A partial file whose `partial` record
     is for the entry's identity is resumed, segment by segment, from its journal's confirmed offsets after
     `client.resource` confirms the cloud file still has it and each segment's confirmed bytes hash to the recorded
-    digest; any other partial file is started again from byte 0 with the segments of `policy` (one segment in a
-    partial folder without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
+    digest, keeping the segments it was started with; a partial file none of whose segments keeps bytes, and any
+    other partial file, is started again from byte 0 with the segments of `policy` (one segment in a partial folder
+    without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
     module.
 
     Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
@@ -1482,10 +1484,11 @@ async def _resume(
     once the entry's record is a `partial` one for `identity`.
 
     A `partial` record for `identity` in the manifest now is kept once the cloud file is confirmed to still have that
-    identity, with the segments it was started with. Each segment keeps the bytes its journal confirms when the
-    partial file holds them and they hash to the recorded digest; otherwise that segment is reset to its start in
-    the journal. Any other record is replaced by a new `partial` one with the segments of `policy`'s plan, one
-    segment in a partial folder without sparse files.
+    identity. Each segment keeps the bytes its journal confirms when the partial file holds them and they hash to the
+    recorded digest; otherwise that segment is reset to its start in the journal. While any segment keeps bytes, the
+    record keeps the segments it was started with. When none does, and for any other record, the record is replaced
+    by a new `partial` one with the plan a new download gets now: the segments of `policy`'s plan, one segment in a
+    partial folder without sparse files. A record that already is that plan is not written.
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
     check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
@@ -1494,9 +1497,9 @@ async def _resume(
     size = identity.size
     record = mirror.download(entry.entry_id)
     if record is None or record.state != 'partial' or record.identity != identity:
-        segments = segment_plan(size, segments=_segments(policy, destination), threshold=policy.segment_threshold)
-        mirror.record_partial(entry.entry_id, identity, segments)
-        return _streams(segments, size)
+        plan = _new_plan(size, policy, destination)
+        mirror.record_partial(entry.entry_id, identity, plan)
+        return _streams(plan, size)
     try:
         live = await client.resource(entry.resource.path)
     except api.RemotePathNotFoundError:
@@ -1522,15 +1525,22 @@ async def _resume(
                 kept = segment.confirmed - segment.start
                 _log.debug('%s: segment at byte %d resumed with %d bytes kept', path, segment.start, kept)
                 progress.kept(kept)
+    if all(stream.written == stream.start for stream in streams):
+        plan = _new_plan(size, policy, destination)
+        if plan != record.segments:
+            mirror.record_partial(entry.entry_id, identity, plan)
+        return _streams(plan, size)
     if [stream.written for stream in streams] != [segment.confirmed for segment in record.segments]:
         mirror.checkpoint(entry.entry_id, [stream.segment() for stream in streams])
     return streams
 
 
-def _segments(policy: TransferPolicy, destination: Destination) -> int:
-    """The segments of a new download's plan: `policy`'s in a partial folder with sparse files, one otherwise, so a
-    partial file is only appended to and its filesystem writes no zeros ahead of the data."""
-    return policy.segments if destination.sparse_partials else 1
+def _new_plan(size: int, policy: TransferPolicy, destination: Destination) -> tuple[Segment, ...]:
+    """The journal a new download of a `size`-byte file starts with: `policy`'s segments in a partial folder with
+    sparse files, one otherwise, so a partial file is only appended to and its filesystem writes no zeros ahead of the
+    data."""
+    segments = policy.segments if destination.sparse_partials else 1
+    return segment_plan(size, segments=segments, threshold=policy.segment_threshold)
 
 
 def _movable(segments: Sequence[Segment], held: int) -> list[Segment]:

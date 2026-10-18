@@ -157,7 +157,8 @@ yandex-disk-rescue/
 │   │                 #   pipeline (adopt a matching local copy, record one that cannot be read as a `corrupt`
 │   │                 #   finding and fetch the file again, or resume a partial file segment by segment
 │   │                 #   from its checkpoint journal once the cloud file is confirmed unchanged and each
-│   │                 #   segment's confirmed bytes re-hashed; the segment plan of a new download, one segment
+│   │                 #   segment's confirmed bytes re-hashed, a journal keeping no byte planned again as a new
+│   │                 #   download; the segment plan of a new download, one segment
 │   │                 #   in a partial folder without sparse files; one link per file shared by its segments
 │   │                 #   and taken once one holds a connection, preallocation of a segmented file, parallel
 │   │                 #   ranged fetches of its segments while hashing with checkpoints, immediate retries

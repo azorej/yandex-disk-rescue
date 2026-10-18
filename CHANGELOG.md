@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - `download` fetches files as one stream, without segments, when the partial folder's filesystem has no sparse files
   (HFS+, exFAT, FAT), instead of writing each segmented file's zeros first. The run says so in one line, and its JSON
   report has `sparse_partials`.
+- A download that has not kept any confirmed byte is planned again with the current `--download-segments` (and the
+  partial folder's sparse files) when it resumes.
 - `download` starts the files that failed before only after all the others, fewest failures first, in every pass,
   so a restart reaches new data at once.
 - A file whose transfer failed is recorded as failed at once, before its later passes, so a run stopped between

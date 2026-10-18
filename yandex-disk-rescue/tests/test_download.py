@@ -2622,7 +2622,8 @@ def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_by
     assert missing in log_messages()
     assert not [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert _fetches(disk, BIG_PATH, earlier) == [None]
-    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == sorted(SEGMENT_RANGES)
+    # Its journal now keeps no byte, so it is planned again with this run's (default) segment threshold.
+    assert _fetches(disk, SEGMENTED_PATH, earlier) == [None]
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
     assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
     again = run_download(*_partial_args(new_root), str(dest))
@@ -3658,6 +3659,46 @@ def test_an_interrupted_segmented_download_resumes_each_segment_from_its_own_che
     assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier)) == sorted(
         f'bytes={resumed_from[start]}-{end - 1}' for start, end, _, _ in journal
     )
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def _leave_empty_segmented_journal(fake, dest) -> None:
+    """Run a segmented download of `SEGMENTED_PATH` whose 4 segments all get HTTP 503, with no later pass: its journal
+    keeps 4 segments confirming no byte."""
+    fake.inject('GET', '/download', 503, 503, 503, 503, where={'path': SEGMENTED_PATH})
+    result = run_download(*SEGMENTED_ARGS, '--download-passes', '1', 'disk:/Seg', str(dest))
+    assert result.exit_code == 1, result.output
+    assert _journal() == [(n * MiB, (n + 1) * MiB, n * MiB, None) for n in range(4)]
+
+
+@pytest.mark.parametrize(
+    ('segments', 'fetched'), [('1', [None]), ('2', [f'bytes=0-{2 * MiB - 1}', f'bytes={2 * MiB}-{4 * MiB - 1}'])]
+)
+def test_a_segmented_download_that_kept_no_byte_starts_again_with_the_current_segments(
+    segmented, dest, segments, fetched
+):
+    _leave_empty_segmented_journal(segmented, dest)
+    earlier = len(segmented.requests)
+
+    result = run_download(*SEGMENTED_ARGS, '--download-segments', segments, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert sorted(_fetches(segmented, SEGMENTED_PATH, earlier), key=str) == fetched
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def test_an_empty_segmented_journal_in_a_folder_without_sparse_files_is_fetched_as_one_stream(
+    segmented, dest, non_sparse
+):
+    _leave_empty_segmented_journal(segmented, dest)
+    zero_fill = non_sparse(dest)
+    earlier = len(segmented.requests)
+
+    result = run_download(*SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _fetches(segmented, SEGMENTED_PATH, earlier) == [None]
+    assert zero_fill.written == {destination_module._SPARSE_PROBE_NAME: MiB}
     assert (dest / 'large.bin').read_bytes() == SEGMENTED
 
 

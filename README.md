@@ -277,9 +277,10 @@ the run says so:
 Partial files in /mnt/usb/.yandex-disk-rescue/partial cannot be sparse: new downloads are fetched as one stream each, not as segments.
 ```
 
-The segments of a download are fixed when it starts: a download
-resumed by a later pass or a later run keeps them, even when the options
-changed since.
+A download resumed by a later pass or a later run keeps its segments while
+any of them keeps confirmed bytes, even when the options changed since. A
+download that has not kept any confirmed byte is planned again, as a new one
+is, with the current `download_segments` and partial folder.
 
 **Partial files.** A file being downloaded lives in a partial file, named by
 the file's id in the manifest. By default partial files are in
