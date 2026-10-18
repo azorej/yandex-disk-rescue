@@ -96,7 +96,7 @@ NOTICE_TIMESTAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ')
 STATUS_LINE = re.compile(
     NOTICE_TIMESTAMP.pattern
     + r'(?:(?:Scanning|Scanned) \S.*: \d+ files?, \d+ folders? \(.*\) listed'
-    + r'|(?:Checking|Checked) \d+ files? already in '
+    + r'|Checking \d+ files? already in |Checked \d+ of \d+ files? already in '
     + r'|(?:Moving|Moved|Downloading|Downloaded|Verifying|Verified): \d+ of \d+ files?, )'
 )
 

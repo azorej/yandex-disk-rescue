@@ -165,7 +165,7 @@ Status line formats (the log record has the same text):
 Scanning disk:/: 45120 files, 3200 folders (812.3 GiB) listed, 1024 folders to list
 Scanned disk:/: 133521 files, 9800 folders (2.1 TiB) listed in 14 min 5 s
 Checking 133521 files already in /mnt/backup: 40210 checked
-Checked 133521 files already in /mnt/backup in 6 min 12 s
+Checked 133521 of 133521 files already in /mnt/backup in 6 min 12 s
 Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
 Downloading: …; pass 2 of 7 starts in 4 s
 Downloaded: 133521 of 133521 files, 2.1 TiB in 6 d 9 h, average 4.0 MiB/s; 0 to retry, 3 failed, 0 quarantined; 2 of 7 passes
@@ -329,7 +329,7 @@ quarantined in this run (excluding the held files).
     pending set. The final `Downloaded:` line's failed and quarantined counts equal the summary's minus those
     entries.
   - **Final lines of the other phases.** A `scan` with `--progress-interval 1` ends with one `Scanned disk:/…` line.
-    A rerun of `download` ends its check phase with one `Checked N files already in …` line.
+    A rerun of `download` ends its check phase with one `Checked N of N files already in …` line.
   - **A stalled file is visible.** One file is `Delay`ed beyond `--download-timeout 6`, with `--progress-interval 1`:
     some status line shows `1 without data`, and after the deferral `1 to retry` and `pass 2 of 2 starts in`.
   - **Resumed `verify`.** With `--progress-interval 1` and a slow read, `verify` shows `Verifying: … of N files`

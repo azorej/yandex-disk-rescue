@@ -284,10 +284,12 @@ class MirrorSnapshot:
             case 'idle':
                 return None
             case 'checking':
-                checking = f'{_count(self.to_check, "file")} already in {self.destination}'
                 if final:
-                    return f'Checked {checking} in {format_duration(self.elapsed)}'
-                return f'Checking {checking}: {self.checked} checked'
+                    return (
+                        f'Checked {_of(self.checked, self.to_check, "file")} already in {self.destination} in '
+                        f'{format_duration(self.elapsed)}'
+                    )
+                return f'Checking {_count(self.to_check, "file")} already in {self.destination}: {self.checked} checked'
         settled = sum(self.settled.values())
         outcomes = (
             f'{self.to_retry} to retry, {self.settled["failed"]} failed, {self.settled["quarantined"]} quarantined'

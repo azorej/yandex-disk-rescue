@@ -780,7 +780,7 @@ writes one line a minute:
 2026-10-17T09:30:14.002Z Scanning disk:/: 45120 files, 3200 folders (812.3 GiB) listed, 1024 folders to list
 2026-10-17T09:44:05.310Z Scanned disk:/: 133521 files, 9800 folders (2.1 TiB) listed in 14 min 5 s
 2026-10-17T09:45:05.311Z Checking 133521 files already in /mnt/backup: 40210 checked
-2026-10-17T09:50:17.020Z Checked 133521 files already in /mnt/backup in 6 min 12 s
+2026-10-17T09:50:17.020Z Checked 133521 of 133521 files already in /mnt/backup in 6 min 12 s
 2026-10-17T09:51:17.021Z Moving: 1 of 3 files, 1.2 GiB of 3.5 GiB (34.3%), 210.0 MiB/s, ETA 11 s
 2026-10-17T09:51:28.402Z Moved: 3 of 3 files, 3.5 GiB in 17 s, average 210.8 MiB/s
 2026-10-17T10:50:17.021Z Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
@@ -809,7 +809,9 @@ writes one line a minute:
   a connection open but no data for 5 s or more. `to retry` counts the
   files deferred to a later pass; between passes the line ends with
   `pass 2 of 7 starts in 4 s`.
-- The last line of a phase gives the time it took and the average speed.
+- The last line of a phase gives how many of its files it got through
+  (fewer than all when an error stopped it), the time it took and the
+  average speed.
 
 Every status line also goes to the log file, on a terminal too.
 

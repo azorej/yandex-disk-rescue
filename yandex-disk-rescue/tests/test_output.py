@@ -31,7 +31,7 @@ from mirror_tree import (
     stderr_lines,
     wait_until,
 )
-from yandex_disk_rescue import localfs, logs, mirroring, progress
+from yandex_disk_rescue import destination, localfs, logs, mirroring, progress
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.commands.download import INTERRUPTED
@@ -379,9 +379,29 @@ def test_the_last_line_of_each_phase_closes_it_once(disk, dest):
     assert re.fullmatch(r'Scanned disk:/: 6 files, 4 folders \(.+\) listed in \d+ s', scan_line)
     assert [line.partition(':')[0] for line in status_lines(first.stderr)] == ['Downloaded']
     checked, downloaded = status_lines(again.stderr)
-    assert re.fullmatch(f'Checked 6 files already in {re.escape(str(dest))} in \\d+ s', checked)
+    assert re.fullmatch(f'Checked 6 of 6 files already in {re.escape(str(dest))} in \\d+ s', checked)
     assert downloaded.startswith('Downloaded: 0 of 0 files, 0 B in ')
-    assert re.search(r'Checked 6 files already in .* in \d+ s', '\n'.join(log_messages()))
+    assert re.search(r'Checked 6 of 6 files already in .* in \d+ s', '\n'.join(log_messages()))
+
+
+def test_a_check_stopped_by_an_error_ends_with_the_files_it_checked(disk, dest, monkeypatch):
+    assert run_download(str(dest)).exit_code == 0
+    lstat = destination.Destination.lstat
+    calls = []
+
+    def failing(self, local):
+        calls.append(local)
+        if len(calls) == 3:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return lstat(self, local)
+
+    monkeypatch.setattr(destination.Destination, 'lstat', failing)
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 1
+    [checked] = status_lines(result.stderr)
+    assert re.fullmatch(f'Checked 2 of 6 files already in {re.escape(str(dest))} in \\d+ s', checked)
 
 
 def test_the_last_status_line_counts_the_files_the_run_attempted_as_the_report_does(disk, dest, monkeypatch):
