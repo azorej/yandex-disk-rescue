@@ -47,7 +47,10 @@ FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS})
 _WORK_FATAL_ERRNOS = FATAL_ERRNOS | {errno.EACCES, errno.EPERM}
 # How a filesystem refuses a name it cannot hold, as exFAT refuses `?`.
 NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
-_MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+# A path, or a folder on the way to it, that is missing or not a real folder.
+MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
+# A read failing with one of these means the device is gone, whatever the destination's path still answers.
+DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
 
 
 class DestinationUsageError(RescueError):
@@ -134,7 +137,7 @@ class _Tree:
             with self._folder(local.parent) as parent_fd:
                 return _lstat_name(local.name, parent_fd)
         except OSError as exc:
-            if exc.errno in _MISSING_ERRNOS:
+            if exc.errno in MISSING_ERRNOS:
                 return None
             raise
 
@@ -147,6 +150,21 @@ class _Tree:
             yield ExistingFile(fd)
         finally:
             os.close(fd)
+
+    def reachable(self) -> bool:
+        """Whether the destination itself can still be read: its path `lstat`ed afresh and its folder listed through a
+        new descriptor, so a disk that is gone fails even where open descriptors still answer."""
+        try:
+            os.lstat(self.path)
+            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                with os.scandir(fd) as found:
+                    next(found, None)
+            finally:
+                os.close(fd)
+        except OSError:
+            return False
+        return True
 
     @contextmanager
     def _folder(self, local: PurePosixPath) -> Iterator[int]:
@@ -197,21 +215,6 @@ class ReadOnlyDestination(_Tree):
             _close_all(fds)
             raise
         return cls(resolved, fds[0], lock_fd)
-
-    def reachable(self) -> bool:
-        """Whether the destination itself can still be read: its path `lstat`ed afresh and its folder listed through a
-        new descriptor, so a disk that is gone fails even where open descriptors still answer."""
-        try:
-            os.lstat(self.path)
-            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-            try:
-                with os.scandir(fd) as found:
-                    next(found, None)
-            finally:
-                os.close(fd)
-        except OSError:
-            return False
-        return True
 
     def close(self) -> None:
         _close_all([self._root_fd] if self._lock_fd is None else [self._root_fd, self._lock_fd])
@@ -416,7 +419,7 @@ class Destination(_Tree):
         try:
             fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
         except OSError as exc:
-            if exc.errno in _MISSING_ERRNOS:
+            if exc.errno in MISSING_ERRNOS:
                 return None
             raise DestinationError.of('read', folder, exc) from None
         self._previous_fds.append(fd)
@@ -806,13 +809,13 @@ def _read_lock(root_fd: int, destination: Path) -> int | None:
     try:
         work_fd = localfs.open_dir(WORK_DIR_NAME, dir_fd=root_fd)
     except OSError as exc:
-        if exc.errno in _MISSING_ERRNOS:
+        if exc.errno in MISSING_ERRNOS:
             return None
         raise
     try:
         fd = os.open(LOCK_FILE_NAME, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=work_fd)
     except OSError as exc:
-        if exc.errno in _MISSING_ERRNOS:
+        if exc.errno in MISSING_ERRNOS:
             return None
         raise
     finally:

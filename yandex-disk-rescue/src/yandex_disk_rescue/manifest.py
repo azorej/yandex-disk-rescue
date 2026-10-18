@@ -11,7 +11,7 @@ A `Mirror` is one destination directory holding one remote folder of one account
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
 of a partial download (`download_segments`), the reason the last turn of an entry failed (`failures`), and the copy
 of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
-wrong at the entry's final path (`verify_findings`), all keyed by `entries.id`. A rescan never rewrites them: a
+wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all keyed by `entries.id`. A rescan never rewrites them: a
 record keeps the remote identity it was made for, and only an entry's removal from the manifest deletes its rows.
 A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got, and the
 folder its partial files were last in (`mirrors.partial_folder`).
@@ -199,7 +199,8 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         """,
     ),
     (
-        # What `verify` found wrong with the file at the entry's final path, whatever the entry's download record.
+        # What `verify` found wrong with the file at the entry's final path, or `download` found unreadable there,
+        # whatever the entry's download record.
         """
         CREATE TABLE verify_findings (
             mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
@@ -317,9 +318,9 @@ class Quarantine:
 
 @dataclass(frozen=True)
 class Finding:
-    """What `verify` found wrong with the file at an entry's final path: nothing there (`missing`), something else
-    there (`modified`), or the recorded file with other content or unreadable (`corrupt`); `reason` is the
-    user-facing text."""
+    """What was found wrong with the file at an entry's final path: by `verify`, nothing there (`missing`), something
+    else there (`modified`), or the recorded file with other content or unreadable (`corrupt`); by `download`, a copy
+    there it could not read (`corrupt`). `reason` is the user-facing text."""
 
     kind: FindingKind
     reason: str
@@ -342,7 +343,7 @@ class MirrorEntry:
     download: DownloadRecord | None
     failure: str | None  # why the entry's last turn in this mirror failed; `None` once it succeeded
     quarantine: Quarantine | None  # the last quarantined copy; `None` once the file is verified
-    finding: Finding | None  # what `verify` found wrong at the final path; `None` once a copy is verified there
+    finding: Finding | None  # what was found wrong at the final path; `None` once a copy is verified there
 
 
 @dataclass(frozen=True)
@@ -759,7 +760,7 @@ class Mirror:
     def record_quarantined(self, entry_id: int, identity: RemoteIdentity, copy: PurePosixPath, reason: str) -> None:
         """Record that the entry's download of `identity` failed verification for `reason` and was moved to `copy`,
         replacing any quarantine record; the entry's download record, with its segments, and its failure are
-        deleted, while its finding stays: the copy at the final path is still the one `verify` found."""
+        deleted, while its finding stays: the copy at the final path is still the one the finding is about."""
         params = {
             'mirror': self.id,
             'entry': entry_id,

@@ -21,6 +21,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - A `download` stopped by a destination error says what failed (`Could not read`, `Could not write` or
   `Could not inspect`), no longer `Could not write` for reads.
+- `download` no longer stops at a local copy it cannot read (a bad sector): the copy is recorded corrupt, the file is
+  downloaded again, and the copy is moved aside to `replaced/`; the summary lists such copies under
+  `Unreadable in DEST, downloaded again`, and `--json` reports them as `unreadable`.
+- An I/O error looking up a verified file at the start of `download` names that file, not DEST.
 
 ## [1.0.0rc1] - 2026-10-18
 

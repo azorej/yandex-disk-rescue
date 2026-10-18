@@ -71,7 +71,8 @@ def download(
         typer.Option(
             '--retry-failed',
             help='Download only the files whose last attempt in DEST failed, was quarantined or never finished, the '
-            'files verify found missing, modified or corrupt, and the folders that failed; leave everything else '
+            'files verify found missing, modified or corrupt or download found unreadable, and the folders that '
+            'failed; leave everything else '
             'alone.',
         ),
     ] = False,

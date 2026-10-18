@@ -8,8 +8,8 @@ file with the recorded fingerprint whose content does not match, or that cannot 
 its size, then every checksum the record has; a match is *intact*. Each finding is committed to the manifest as soon
 as it is made, an intact file drops its earlier finding, and `download` fetches again every file with a finding.
 
-Any other file is reported without being read: under its finding when it has one (the copy `verify` found is still at
-its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. A file
+Any other file is reported without being read: under its finding when it has one (the copy found broken, by `verify`
+or by `download` as unreadable, is still at its path), else as quarantined when its quarantine record is for its current identity, else as not downloaded. A file
 listed under its finding whose quarantine record is for its current identity has its repair quarantined, and its line
 says so with the quarantine reason and the copy's path.
 Paths with no manifest entry are never opened, listed or reported.
@@ -22,7 +22,6 @@ A read error stops the check instead of being recorded when the destination itse
 disconnected disk makes every file unreadable.
 """
 
-import errno
 import logging
 import stat
 import time
@@ -30,7 +29,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
-from yandex_disk_rescue.destination import ReadOnlyDestination
+from yandex_disk_rescue.destination import DEVICE_GONE_ERRNOS, ReadOnlyDestination
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import (
     DownloadRecord,
@@ -59,8 +58,6 @@ from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 # the files checked in this time, and the one in flight.
 CURSOR_SECONDS = 5.0
 
-# A read failing with one of these means the device is gone, whatever the destination's path still answers.
-_DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
 _log = logging.getLogger(__name__)
 
 
@@ -284,7 +281,7 @@ def _finding(entry: MirrorEntry, destination: ReadOnlyDestination, read: Callabl
             else:
                 mismatch = _content_mismatch(file.chunks(), record.identity, read)
     except OSError as exc:
-        if exc.errno in _DEVICE_GONE_ERRNOS or not destination.reachable():
+        if exc.errno in DEVICE_GONE_ERRNOS or not destination.reachable():
             raise DestinationUnreadableError(destination.path, exc.strerror or str(exc)) from None
         return Finding('corrupt', f'could not read {local}: {exc.strerror}')
     if mismatch is None:
