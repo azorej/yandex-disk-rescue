@@ -83,6 +83,7 @@ from yandex_disk_rescue.destination import (
     PreviousPartials,
 )
 from yandex_disk_rescue.disk_threads import DiskThreads
+from yandex_disk_rescue.display import display_path
 from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
     LocalFingerprint,
@@ -94,7 +95,7 @@ from yandex_disk_rescue.manifest import (
     VerifiedBy,
 )
 from yandex_disk_rescue.progress import ActiveFile, MirrorProgress, MoveProgress, Outcome
-from yandex_disk_rescue.scanning import SHOWN_PATHS, display_path, listed
+from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 from yandex_disk_rescue.units import format_size
 
 PASS_PAUSE_SECONDS = 5.0
@@ -779,9 +780,9 @@ class MirrorRun:
                 await self._later_passes(deferred, tools, passes=passes, changes=changes)
         report.replaced_folder = self._destination.replaced_folder
         for unencodable in self._mirror.unencodable():
-            path, reason = display_path(unencodable.path), unencodable_reason(unencodable)
-            _log.warning('%s failed: %s', path, reason)
-            report.failed.append(Failure(path, reason))
+            reason = unencodable_reason(unencodable)
+            _log.warning('%s failed: %s', display_path(unencodable.path), reason)
+            report.failed.append(Failure(unencodable.path, reason))
         self._in_path_order(report)
         return report
 
@@ -1740,7 +1741,7 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
     files, renamed entries, what was moved aside, quarantined files with their reasons and copies, and failures with
     their reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
-        f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
+        f'Mirrored {display_path(report.remote_root)} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
         f'{len(report.failed)} failed'
     ]
@@ -1749,26 +1750,29 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines.append(f'Passes: {used} of {most or "unlimited"}')
     if report.adopted:
         lines.append(f'Already on disk and verified: {len(report.adopted)}')
-        lines += listed('', report.adopted, len(report.adopted), '', limit=limit)
+        lines += listed('', [display_path(path) for path in report.adopted], len(report.adopted), '', limit=limit)
     if report.size_only:
         lines.append(f'Verified by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
+        lines += listed('', [display_path(path) for path in report.size_only], len(report.size_only), '', limit=limit)
     if report.renamed:
         lines.append(f'Renamed for the destination: {len(report.renamed)}')
-        shown = [f'{remote} -> {local}' for remote, local in report.renamed]
+        shown = [f'{display_path(remote)} -> {display_path(str(local))}' for remote, local in report.renamed]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.moved_aside:
         lines.append(f'Moved aside to {report.replaced_folder}/: {len(report.moved_aside)}')
-        shown = [str(local) for local in report.moved_aside]
+        shown = [display_path(str(local)) for local in report.moved_aside]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.quarantined:
         lines.append(f'Quarantined: {len(report.quarantined)}')
-        shown = [f'{held.path}: {held.reason}; kept at {held.copy}' for held in report.quarantined]
+        shown = [
+            f'{display_path(held.path)}: {held.reason}; kept at {display_path(str(held.copy))}'
+            for held in report.quarantined
+        ]
         lines += listed('', shown, len(shown), '', limit=limit)
         lines.append(_QUARANTINE_HINT)
     if report.failed:
         lines.append(f'Failed: {len(report.failed)}')
-        shown = [f'{failure.path}: {failure.reason}' for failure in report.failed]
+        shown = [f'{display_path(failure.path)}: {failure.reason}' for failure in report.failed]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.partials_left:
         lines.append(f'Partial files not deleted: {len(report.partials_left)}')

@@ -25,6 +25,7 @@ from typing import Annotated, Literal, TextIO
 import typer
 
 from yandex_disk_rescue import __version__, paths
+from yandex_disk_rescue.display import display_text
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.logs import CONSOLE, LOGGER_NAME, LogFile, Notices, notice, stderr_through
 from yandex_disk_rescue.progress import ProgressState
@@ -102,7 +103,9 @@ class Output:
         return self._log_file.path
 
     def line(self, text: str) -> None:
-        """Write the report line `text` to stdout, above the live view when one is shown."""
+        """Write the report line `text`, its control characters escaped, to stdout, above the live view when one is
+        shown."""
+        text = display_text(text)
         if self._view is None:
             typer.echo(text)
         else:

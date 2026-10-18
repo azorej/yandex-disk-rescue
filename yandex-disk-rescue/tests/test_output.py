@@ -28,7 +28,7 @@ from mirror_tree import (
     status_lines,
     stderr_lines,
 )
-from yandex_disk_rescue import localfs, logs, mirroring
+from yandex_disk_rescue import localfs, logs, mirroring, progress
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.paths import log_path, manifest_path, state_dir
@@ -559,3 +559,68 @@ def test_a_report_line_written_during_a_phase_goes_on_the_terminal_while_the_vie
     # The view erases its lines, the line is written where they began, and the view is drawn again below it.
     assert re.search(rb'\x1b\[2K' + headline + rb'[^\x1b]*\r\n\x1b\[\?25l', shown), shown
     assert _after_the_view(shown).startswith('Mirrored disk:/ to ')
+
+
+RED = 'disk:/Docs/\x1b[31mred\r.txt'
+BELL = 'disk:/Docs/bell\x07\x9b.txt'
+
+
+def test_control_characters_of_a_remote_name_are_escaped_in_the_report_the_notices_and_the_log(disk, dest):
+    disk.add_file(RED, b'red', modified=MODIFIED)
+    disk.add_file(BELL, b'bell', modified=MODIFIED)
+    disk.inject('GET', '/v1/disk/resources/download', 404, where={'path': RED})
+
+    result = run_download('-v', str(dest))
+
+    assert result.exit_code == 1
+    log = log_path().read_text(encoding='utf-8')
+    for text in (result.stdout, result.stderr, log):
+        assert not re.search('[\x00-\x09\x0b-\x1f\x7f-\x9f]', text)
+    red, bell = r'disk:/Docs/\x1b[31mred\x0d.txt', r'disk:/Docs/bell\x07\x9b.txt'
+    assert f'Failed: 1\n  {red}: removed from the Disk after the scan\n' in result.stdout
+    notices = stderr_lines(result.stderr)
+    assert f'{red} failed: removed from the Disk after the scan' in notices
+    assert any(notice.startswith(f'{bell} downloaded: ') for notice in notices)
+    assert f'{red} failed: removed from the Disk after the scan' in log_messages()
+    assert f'  {red}: removed from the Disk after the scan' in log_messages()
+
+
+def test_the_live_view_shows_the_control_characters_of_a_remote_name_escaped(disk, dest):
+    slow = 'disk:/\x1b[31mslow\r.bin'
+    disk.add_file(slow, bytes(6 * 64 * 1024), modified=MODIFIED)
+    disk.chunk_delay = 0.5
+
+    terminal = _Terminal('download', str(dest))
+    terminal.wait_for(rb'  disk:/\x1b[31mslow\x0d.bin ')
+    code, _, shown = terminal.finish()
+
+    assert code == 0, shown
+    assert b'\x1b[31mslow' not in shown
+    assert b'slow\r' not in shown
+
+
+def test_no_speed_shows_before_a_second_of_bytes_was_measured(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(progress.time, 'monotonic', lambda: clock[0])
+    state = progress.MirrorProgress()
+    state.start_transferring(1, 10 * 2**20, passes=7)
+    active = state.begin(1, 'disk:/big.bin', 10 * 2**20)
+
+    clock[0] += 0.01
+    active.wrote(64 * 1024)
+    early = state.snapshot()
+    clock[0] += 1.0
+    active.wrote(1024 * 1024)
+    later = state.snapshot()
+
+    [transfer] = early.active
+    assert transfer.speed is None
+    assert re.fullmatch(
+        r'Downloading: 0 of 1 file, 64\.0 KiB of 10\.0 MiB \(0\.6%\), ETA unknown; .*', early.status_line(final=False)
+    )
+    [transfer] = later.active
+    assert transfer.speed == pytest.approx((64 + 1024) * 1024 / 1.0)
+    assert re.fullmatch(
+        r'Downloading: 0 of 1 file, 1\.1 MiB of 10\.0 MiB \(10\.6%\), 1\.1 MiB/s, ETA 8 s; .*',
+        later.status_line(final=False),
+    )

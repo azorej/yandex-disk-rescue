@@ -750,7 +750,8 @@ data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
   in front of the status line while a scan lists folders.
 - During the passes of `download`, up to 10 files in progress follow, each
   with its path (shortened from the left to fit), the bytes its partial file
-  holds of its size, and its speed over the last 10 s or its state:
+  holds of its size, and its speed over the last 10 s (`…` during its first
+  second of data) or its state:
   `waiting for room` (in the partial folder), `waiting for a connection`,
   `no data for N s` (a connection with no data for 5 s or more),
   `preallocating`, `hashing` (a local copy), `reading back` (a segmented
@@ -797,7 +798,8 @@ writes one line a minute:
   that are not valid Unicode are in the summary but not in these counts.
 - The speed is the rate over the last minute, and the ETA divides the bytes
   left by the rate over the last 15 minutes (`ETA unknown` while it is 0).
-  Both count only the bytes this run moved.
+  Both count only the bytes this run moved. During the first second of a
+  phase there is no speed yet: the line leaves it out and says `ETA unknown`.
 - `N active, M without data`: the files in progress, and those of them that
   have had a connection but no data for 5 s or more. `to retry` counts the
   files deferred to a later pass; between passes the line ends with
@@ -810,6 +812,13 @@ Every status line also goes to the log file, on a terminal too.
 notices stay. Use it under cron, where periodic lines are noise. Off a
 terminal, nothing the tool writes contains escape codes or carriage returns,
 whatever `FORCE_COLOR` or `TTY_COMPATIBLE` say.
+
+A name on the Disk can hold any character. In the report, the notices, the
+status lines, the live view and the log file, each control character of a
+name (an escape, a carriage return, a newline, any other C0 or C1 control,
+U+2028 or U+2029) is shown as its escape, such as `\x1b` or `\x0d`, and a
+lone surrogate (a name that is not valid Unicode) as `\udcxx`: a hostile name
+cannot move the cursor, recolour the terminal or forge a line of the log.
 
 A notice is one line, `<UTC time> <message>` (on a terminal, the message
 alone):

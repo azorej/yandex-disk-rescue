@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from yandex_disk_rescue.destination import ReadOnlyDestination
+from yandex_disk_rescue.display import display_path
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import (
     DownloadRecord,
@@ -49,7 +50,7 @@ from yandex_disk_rescue.mirroring import (
     unencodable_reason,
 )
 from yandex_disk_rescue.progress import VerifyProgress
-from yandex_disk_rescue.scanning import SHOWN_PATHS, display_path, listed
+from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 
 # The longest a pass keeps its cursor uncommitted while files are checked: a killed pass reads again at most the files
 # checked in this time, and the one in flight.
@@ -152,9 +153,7 @@ class VerifyRun:
             self._commit_cursor()
             raise
         self._mirror.end_verify_pass()
-        report.not_downloaded += [
-            Problem(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()
-        ]
+        report.not_downloaded += [Problem(e.path, unencodable_reason(e)) for e in self._mirror.unencodable()]
         report.not_downloaded.sort(key=lambda problem: problem.path)
         self._progress.problems(report.problems)
         return report
@@ -203,22 +202,26 @@ def verify_summary(report: VerifyReport, *, limit: int | None = SHOWN_PATHS) -> 
     """The lines reporting a check: the counts, the files checked by size only, then each kind of problem with its
     reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
-        f'Verified {report.destination} ({report.remote_root}): {report.intact} intact, {len(report.missing)} missing, '
-        f'{len(report.modified)} modified, {len(report.corrupt)} corrupt, {len(report.quarantined)} quarantined, '
+        f'Verified {report.destination} ({display_path(report.remote_root)}): {report.intact} intact, '
+        f'{len(report.missing)} missing, {len(report.modified)} modified, {len(report.corrupt)} corrupt, {len(report.quarantined)} quarantined, '
         f'{len(report.not_downloaded)} not downloaded'
     ]
     if report.size_only:
         lines.append(f'Checked by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
+        lines += listed('', [display_path(path) for path in report.size_only], len(report.size_only), '', limit=limit)
     for title, problems in (('Missing', report.missing), ('Modified', report.modified), ('Corrupt', report.corrupt)):
-        lines += _problem_lines(title, [f'{problem.path}: {problem.reason}' for problem in problems], limit)
+        lines += _problem_lines(title, _problems(problems), limit)
     lines += _problem_lines(
-        'Quarantined', [f'{q.path}: {q.reason}; kept at {q.copy}' for q in report.quarantined], limit
+        'Quarantined',
+        [f'{display_path(q.path)}: {q.reason}; kept at {display_path(str(q.copy))}' for q in report.quarantined],
+        limit,
     )
-    lines += _problem_lines(
-        'Not downloaded', [f'{problem.path}: {problem.reason}' for problem in report.not_downloaded], limit
-    )
+    lines += _problem_lines('Not downloaded', _problems(report.not_downloaded), limit)
     return lines
+
+
+def _problems(problems: list[Problem]) -> list[str]:
+    return [f'{display_path(problem.path)}: {problem.reason}' for problem in problems]
 
 
 def _problem_lines(title: str, shown: list[str], limit: int | None) -> list[str]:

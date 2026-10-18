@@ -3,10 +3,11 @@
 import asyncio
 import bisect
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 
 from yandex_disk_rescue import api
+from yandex_disk_rescue.display import display_path
 from yandex_disk_rescue.manifest import Manifest, ScanDiff, ScanSession
 from yandex_disk_rescue.progress import ScanProgress
 from yandex_disk_rescue.units import format_size
@@ -125,36 +126,35 @@ async def scan_tree(
 def scan_summary(result: ScanResult, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a scan: totals, files without a checksum, vanished folders, entries left out for their
     names, and the changes; each list shows its first `limit` members (`None`: all)."""
-    totals, diff = result.totals, result.diff
+    totals, diff, root = result.totals, result.diff, display_path(result.root)
     lines = [
-        f'Scanned {result.root}: {_plural(totals.files, "file")}, {_plural(totals.folders, "folder")}, '
+        f'Scanned {root}: {_plural(totals.files, "file")}, {_plural(totals.folders, "folder")}, '
         f'{format_size(totals.size)}',
         f'Files without a cloud checksum: {totals.without_checksum.count}',
-        *listed('', totals.without_checksum.smallest, totals.without_checksum.count, '', limit=limit),
+        *listed('', _shown(totals.without_checksum.smallest), totals.without_checksum.count, '', limit=limit),
     ]
     if result.vanished:
         lines.append(f'Folders that disappeared during the scan: {len(result.vanished)}')
-        lines += listed('', result.vanished, len(result.vanished), '', limit=limit)
+        lines += listed('', _shown(result.vanished), len(result.vanished), '', limit=limit)
     if result.unencodable:
         lines.append(f'Not recorded, the name is not valid Unicode: {len(result.unencodable)}')
-        shown = [display_path(resource.path) for resource in result.unencodable]
+        shown = _shown(resource.path for resource in result.unencodable)
         lines += listed('', shown, len(shown), '', limit=limit)
     if diff.first_scan:
-        lines.append(f'First scan of {result.root}')
+        lines.append(f'First scan of {root}')
     else:
         lines.append(
             f'Changes since the last scan: {len(diff.added)} added, {len(diff.changed)} changed, '
             f'{len(diff.removed)} removed'
         )
-        lines += listed('+ ', diff.added, len(diff.added), ' added', limit=limit)
-        lines += listed('~ ', diff.changed, len(diff.changed), ' changed', limit=limit)
-        lines += listed('- ', diff.removed, len(diff.removed), ' removed', limit=limit)
+        lines += listed('+ ', _shown(diff.added), len(diff.added), ' added', limit=limit)
+        lines += listed('~ ', _shown(diff.changed), len(diff.changed), ' changed', limit=limit)
+        lines += listed('- ', _shown(diff.removed), len(diff.removed), ' removed', limit=limit)
     return lines
 
 
-def display_path(path: str) -> str:
-    """`path` safe to print: a lone surrogate, which no output encoding takes, is shown as `\\udcxx`."""
-    return path.encode('utf-8', 'backslashreplace').decode('utf-8')
+def _shown(paths: Iterable[str]) -> list[str]:
+    return [display_path(path) for path in paths]
 
 
 def listed(marker: str, shown: Sequence[str], count: int, what: str, *, limit: int | None) -> list[str]:

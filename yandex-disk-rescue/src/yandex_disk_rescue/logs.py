@@ -2,7 +2,8 @@
 
 Every line of the log file, and every notice on a stderr that is not a terminal, starts with a UTC timestamp; a
 multi-line message (a summary, a traceback) is written as one prefixed line per line, so each line of the log file
-says when and which run wrote it.
+says when and which run wrote it. Every control character of a message but its line breaks is escaped
+(`display.display_text`), in the log file as on stderr.
 """
 
 import contextlib
@@ -15,6 +16,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+
+from yandex_disk_rescue.display import display_text
 
 LOGGER_NAME = 'yandex_disk_rescue'
 MAX_BYTES = 10 * 2**20
@@ -40,6 +43,7 @@ class _PrefixedFormatter(logging.Formatter):
         text = record.getMessage()
         if record.exc_info:
             text = f'{text}\n{self.formatException(record.exc_info).rstrip()}'
+        text = display_text(text)
         prefix = self._prefix(record)
         return '\n'.join(f'{prefix}{line}' for line in text.splitlines() or [''])
 
@@ -133,8 +137,9 @@ def notice(text: str, *, timestamped: bool) -> None:
 
 
 def write_stderr(text: str) -> None:
-    """Write `text` and a newline to stderr, one caller at a time: through the writer `stderr_through` installed, or
-    else to the current `sys.stderr`, flushed."""
+    """Write `text`, its control characters but newlines escaped, and a newline to stderr, one caller at a time:
+    through the writer `stderr_through` installed, or else to the current `sys.stderr`, flushed."""
+    text = display_text(text)
     with _stderr.lock:
         if _stderr.writer is not None:
             _stderr.writer(text)

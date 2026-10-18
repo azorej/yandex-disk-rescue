@@ -4,7 +4,8 @@ their snapshots, which a renderer in another thread samples.
 A state is updated from the thread doing the work and read from any thread; each update and each `snapshot()` holds
 the state's lock for a few attribute changes only. Speeds are measured over the bytes the phase itself moved (never
 the bytes a resumed file already held): the current speed over the last `SPEED_SECONDS`, and the ETA from the speed
-over the last `ETA_SECONDS`, so one stall does not swing it.
+over the last `ETA_SECONDS`, so one stall does not swing it. A speed measured over less than `MIN_SPEED_SECONDS`, which
+the first bytes of a phase or a transfer would inflate, is not shown.
 """
 
 import threading
@@ -21,6 +22,7 @@ STALL_SECONDS = 5.0
 SPEED_SECONDS = 60.0
 TRANSFER_SPEED_SECONDS = 10.0
 ETA_SECONDS = 15 * 60.0
+MIN_SPEED_SECONDS = 1.0
 _SAMPLE_SECONDS = 1.0
 
 type TransferState = Literal[
@@ -60,21 +62,24 @@ class _Rate:
         while len(self._samples) > 1 and self._samples[1][0] <= now - ETA_SECONDS:
             self._samples.popleft()
 
-    def per_second(self, now: float, total: int, window: float) -> float:
+    def per_second(self, now: float, total: int, window: float) -> float | None:
         """The bytes a second from the newest sample at least `window` seconds old (the oldest one kept while none
-        is) to `total` now."""
+        is) to `total` now; `None` while that sample is less than `MIN_SPEED_SECONDS` old."""
         since, base = self._samples[0]
         for moment, value in self._samples:
             if moment > now - window:
                 break
             since, base = moment, value
-        return (total - base) / (now - since) if now > since else 0.0
+        return (total - base) / (now - since) if now - since >= MIN_SPEED_SECONDS else None
 
 
 @dataclass(frozen=True)
 class Speeds:
-    current: float
-    for_eta: float
+    """The current speed and the one the ETA uses (`None` until measured over `MIN_SPEED_SECONDS`), and the average
+    over the whole phase."""
+
+    current: float | None
+    for_eta: float | None
     average: float
 
     @classmethod
@@ -91,8 +96,13 @@ def _speed(per_second: float) -> str:
     return f'{format_size(round(per_second))}/s'
 
 
-def _eta(remaining: int, per_second: float) -> str:
-    return f'ETA {format_duration(remaining / per_second)}' if per_second > 0 else 'ETA unknown'
+def _current(per_second: float | None) -> str:
+    """The current speed and the separator after it, or nothing before it is measured."""
+    return '' if per_second is None else f'{_speed(per_second)}, '
+
+
+def _eta(remaining: int, per_second: float | None) -> str:
+    return f'ETA {format_duration(remaining / per_second)}' if per_second else 'ETA unknown'
 
 
 def _share(done: int, total: int) -> str:
@@ -183,7 +193,7 @@ class MoveSnapshot:
             )
         return (
             f'Moving: {_of(self.moved, self.files, "file")}, {_share(self.moved_size, self.size)}, '
-            f'{_speed(self.speeds.current)}, {_eta(self.size - self.moved_size, self.speeds.for_eta)}'
+            f'{_current(self.speeds.current)}{_eta(self.size - self.moved_size, self.speeds.for_eta)}'
         )
 
 
@@ -235,14 +245,14 @@ class MoveProgress:
 class ActiveTransfer:
     """A file in progress: its `held` bytes of `size`, its state, `idle`, the seconds since it last received bytes or
     got its connection (`None` while it has no connection), `speed`, the bytes a second its connection received over
-    the last `TRANSFER_SPEED_SECONDS`, and `copied`, the bytes of its copy to the destination written so far."""
+    the last `TRANSFER_SPEED_SECONDS` (`None` until measured over `MIN_SPEED_SECONDS`), and `copied`, the bytes of its copy to the destination written so far."""
 
     path: str
     size: int
     held: int
     state: TransferState
     idle: float | None
-    speed: float
+    speed: float | None
     copied: int
 
     @property
@@ -292,7 +302,7 @@ class MirrorSnapshot:
         starts = '' if self.starts_in is None else f' starts in {format_duration(self.starts_in)}'
         return (
             f'Downloading: {_of(settled, self.files, "file")}, {_share(self.done_size, self.size)}, '
-            f'{_speed(self.speeds.current)}, {_eta(self.size - self.done_size, self.speeds.for_eta)}; '
+            f'{_current(self.speeds.current)}{_eta(self.size - self.done_size, self.speeds.for_eta)}; '
             f'{len(self.active)} active, {without_data} without data; {outcomes}; '
             f'pass {self.pass_number}{limit}{starts}'
         )
@@ -496,7 +506,7 @@ class VerifySnapshot:
             )
         line = (
             f'Verifying: {_of(self.checked, self.files, "file")}, {_share(self.done_size, self.size)}, '
-            f'{_speed(self.speeds.current)}, {_eta(self.size - self.done_size, self.speeds.for_eta)}; {problems}'
+            f'{_current(self.speeds.current)}{_eta(self.size - self.done_size, self.speeds.for_eta)}; {problems}'
         )
         if self.reading is not None:
             path, read, size = self.reading

@@ -2160,7 +2160,8 @@ def test_a_move_of_partial_files_shows_its_status_lines_then_its_last_one(disk, 
     lines = [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert lines[:-1]
     assert all(
-        re.fullmatch(rf'Moving: [01] of 2 files, .+ of {size} \(\d+\.\d%\), .+/s, ETA .+', line) for line in lines[:-1]
+        re.fullmatch(rf'Moving: [01] of 2 files, .+ of {size} \(\d+\.\d%\), (?:.+/s, )?ETA .+', line)
+        for line in lines[:-1]
     )
     assert lines[:-1]
     assert re.fullmatch(rf'Moved: 2 of 2 files, {size} in \d+ s, average .+/s', lines[-1])
