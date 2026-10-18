@@ -74,11 +74,14 @@ mirror up by its destination without creating one.
   forgetting the download deletes its journal. A partial record from schema version 3 or older gets one segment
   confirming nothing on the upgrade, so its file is downloaded again from byte 0.
 - A failure record (`failures`) holds, for files and folders alike, the reason the entry's last failed turn in the
-  mirror was reported with and the count of its failed turns there since it last succeeded (at least 1).
-  `Mirror.record_failure(entry_id, reason, turns=…)` replaces any earlier record (the caller owns the count) and
+  mirror was reported with, the count of its failed turns there since it last succeeded (at least 1), and its silent
+  streak: how many of the last of those turns in a row got no byte from the download host (`silent_turns`, at most
+  the count) and when the first of them did (`silent_since`, set exactly when `silent_turns` is above 0).
+  `Mirror.record_failure(entry_id, reason, turns=…, silent_turns=…, silent_since=…)` replaces any earlier record (the
+  caller owns the counts; a streak breaking those rules raises `ValueError` and writes nothing) and
   `Mirror.clear_failure` drops it; verifying the entry's file (`record_verified`) drops it too, while `forget` keeps
   it. `MirrorEntry.failure` reads it as a `FailureRecord`. A failure record from schema version 9 or older counts 1
-  failed turn on the upgrade.
+  failed turn on the upgrade, and one from version 10 or older has no silent streak.
 - A quarantine record (`quarantined`) holds the copy of the entry's last download that failed verification: its
   path relative to the destination, the reason, and the remote identity the download was for.
   `Mirror.record_quarantined` replaces any earlier record and deletes the entry's download record (with its journal)
@@ -171,7 +174,9 @@ yandex-disk-rescue/
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
 │   │                 #   failure records written and counted as each turn fails (also one deferred to a
-│   │                 #   later pass) and dropped as entries succeed, the summary
+│   │                 #   later pass) and dropped as entries succeed, with the silent streak of turns that got
+│   │                 #   no byte (throttling neither counts nor breaks it) and the unavailable-on-Yandex-Disk
+│   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, the summary
 │   │                 #   lines (with the partial files that could not be deleted once their file was
 │   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names

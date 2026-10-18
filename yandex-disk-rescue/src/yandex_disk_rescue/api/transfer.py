@@ -37,11 +37,14 @@ class LinkExpiredError(TransferError):
 
 
 class TransientTransferError(TransferError):
-    """A transport error, a timeout, 408, 429 or 5xx; every byte written before it is valid."""
+    """A transport error, a timeout, 408, 429 or 5xx; every byte written before it is valid. `retry_after` is the wait
+    the host asked for, if any; `throttled` is set when the host was throttling: it answered 429 or with a
+    `Retry-After`."""
 
-    def __init__(self, reason: str, *, retry_after: float | None = None) -> None:
+    def __init__(self, reason: str, *, retry_after: float | None = None, throttled: bool = False) -> None:
         super().__init__(reason)
         self.retry_after = retry_after
+        self.throttled = throttled
 
 
 class RangeNotHonouredError(TransferError):
@@ -149,7 +152,10 @@ def _check_response(response: httpx.Response, *, start: int, end: int, size: int
         raise LinkExpiredError(f'the download host {host} rejected the link (HTTP {status})', status=status)
     if status in (httpx.codes.TOO_MANY_REQUESTS, httpx.codes.REQUEST_TIMEOUT) or 500 <= status <= 599:
         retry_after = parse_retry_after(response.headers.get('Retry-After'), now=datetime.now(UTC))
-        raise TransientTransferError(f'the download host {host} returned HTTP {status}', retry_after=retry_after)
+        throttled = status == httpx.codes.TOO_MANY_REQUESTS or retry_after is not None
+        raise TransientTransferError(
+            f'the download host {host} returned HTTP {status}', retry_after=retry_after, throttled=throttled
+        )
     if status == httpx.codes.OK and ranged:
         raise RangeNotHonouredError(f'the download host {host} ignored the Range header (HTTP 200)')
     if status == httpx.codes.PARTIAL_CONTENT:

@@ -21,7 +21,9 @@ from mirror_tree import (
     FILES,
     MODIFIED,
     SIZE_ONLY,
+    age_silence,
     corrupted_bytes,
+    failure_record,
     local_file,
     quarantine_runs,
     replaced_runs,
@@ -366,6 +368,27 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
     assert local_file(dest, EDITED).stat().st_ino not in reads
     assert (run / 'Photos' / '2024' / 'a.jpg').stat().st_ino not in reads
     assert _findings() == []
+
+
+def test_a_file_unavailable_on_yandex_disk_is_listed_as_not_downloaded_with_that_reason(disk, dest):
+    disk.inject('GET', '/download', *[503] * 7, where={'path': README})
+    assert run_download('--download-passes', '7', str(dest)).exit_code == 1
+    aged = age_silence(README, 25)
+    disk.inject('GET', '/download', 503, where={'path': README})
+    assert run_download('--retry-failed', '--download-passes', '1', str(dest)).exit_code == 1
+    reason, *_ = failure_record(README)
+    assert reason == (
+        'Yandex Disk never started sending this file: no data in its last 8 attempts since '
+        f'{aged:%Y-%m-%d %H:%M} UTC, each with a new download link (the last: the download host 127.0.0.1 returned '
+        'HTTP 503)'
+    )
+
+    result = _verify(str(dest))
+
+    assert result.exit_code == 1
+    assert (
+        _intact_lines(dest, len(FILES) - 1, not_downloaded=1) + f'Not downloaded: 1\n  {README}: {reason}\n'
+    ) in result.stdout
 
 
 def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_finding_with_the_repair(disk, dest):

@@ -29,7 +29,9 @@ from mirror_tree import (
     MODIFIED,
     SIZE_ONLY,
     TOKEN,
+    age_silence,
     corrupted_bytes,
+    failure_record,
     local_file,
     log_messages,
     quarantine_runs,
@@ -619,6 +621,7 @@ def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and
         'moved_aside': 0,
         'quarantined': 1,
         'failed': 1,
+        'unavailable': 0,
     }
     assert (document['schema_version'], document['command'], document['exit_code']) == (1, 'download', 1)
     assert document['error'] == {'message': '1 failed and 1 quarantined; see the lists above.'}
@@ -638,7 +641,7 @@ def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and
     assert quarantined['last_retry'] is None
     assert (dest / quarantined['copy']).read_bytes() == content
     [failed] = document['failed']
-    assert failed['path'] == 'disk:/Checks/short.bin'
+    assert (failed['path'], failed['unavailable']) == ('disk:/Checks/short.bin', False)
     assert failed['reason'].startswith('the download failed: ')
     assert (document['partial_dir'], document['partial_move'], document['partial_room']) == (None, None, None)
     assert document['sparse_partials'] is True
@@ -1910,6 +1913,161 @@ def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succee
     assert again.exit_code == 1
     assert _fetches(big, BIG_PATH) == [None, None, None, None]
     assert _failure_records() == [(BIG_PATH, stalled, 4)]
+
+
+DEAD_PATH = 'disk:/Dead/napkin.jpg'
+DEAD = b'napkin' * 1000
+SERVICE_UNAVAILABLE = 'the download host 127.0.0.1 returned HTTP 503'
+NEVER_STARTED = 'Yandex Disk never started sending this file: no data in its last'
+UNAVAILABLE_HINT = (
+    '1 of them never got data from Yandex Disk for a day or more: open them in the Yandex Disk web interface, and ask '
+    'Yandex support about those that do not open there either.'
+)
+
+
+@pytest.fixture
+def dead(disk):
+    """The `disk` tree plus `DEAD` at `DEAD_PATH`."""
+    disk.add_file(DEAD_PATH, DEAD, modified=MODIFIED)
+    return disk
+
+
+def _silent_run(fake, dest, path: str, turns: int, *args: str, root: str = 'disk:/'):
+    """A run of `root` whose download host answers 503 on each of the `turns` passes it gets for `path`."""
+    fake.inject('GET', '/download', *[503] * turns, where={'path': path})
+    return run_download('--download-passes', str(turns), *args, root, str(dest))
+
+
+def _since(moment: datetime) -> str:
+    return f'since {moment.astimezone(UTC):%Y-%m-%d %H:%M} UTC, each with a new download link'
+
+
+def _unavailable_run(fake, dest, *args: str):
+    """Seven silent turns of `DEAD_PATH` in one run, aged by a day, then one more silent turn with `--retry-failed`:
+    the result of that last run, with `args` added, and the start of the streak."""
+    assert _silent_run(fake, dest, DEAD_PATH, 7).exit_code == 1
+    aged = age_silence(DEAD_PATH, 25)
+    return _silent_run(fake, dest, DEAD_PATH, 1, '--retry-failed', *args), aged
+
+
+def test_seven_silent_turns_in_one_run_are_not_yet_unavailable(dead, dest):
+    started = datetime.now(UTC)
+
+    result = _silent_run(dead, dest, DEAD_PATH, 7)
+
+    assert result.exit_code == 1
+    assert f'Failed: 1\n  {DEAD_PATH}: {SERVICE_UNAVAILABLE} (after 7 passes)\n' in result.stdout
+    assert 'Yandex Disk' not in result.stdout
+    assert len(_fetches(dead, DEAD_PATH)) == 7
+    reason, turns, silent_turns, since = failure_record(DEAD_PATH)
+    assert (reason, turns, silent_turns) == (f'{SERVICE_UNAVAILABLE} (after 7 passes)', 7, 7)
+    assert since is not None
+    assert started <= since <= datetime.now(UTC)
+
+
+def test_a_file_silent_for_a_day_fails_as_unavailable_and_the_others_succeed(dead, dest):
+    result, aged = _unavailable_run(dead, dest)
+
+    assert result.exit_code == 1
+    assert ', 0 quarantined, 1 failed\n' in result.stdout
+    reason = f'{NEVER_STARTED} 8 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n{UNAVAILABLE_HINT}\n' in result.stdout
+    assert stderr_lines(result.stderr) == [f'{DEAD_PATH} failed: {reason}', 'Error: 1 failed; see the list above.']
+    assert failure_record(DEAD_PATH) == (reason, 8, 8, aged)
+    assert _others_verified(dest, DEAD_PATH)
+
+
+def test_json_flags_a_file_unavailable_on_yandex_disk(dead, dest):
+    result, aged = _unavailable_run(dead, dest, '--json')
+
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    assert (document['counts']['failed'], document['counts']['unavailable']) == (1, 1)
+    reason = f'{NEVER_STARTED} 8 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert document['failed'] == [{'path': DEAD_PATH, 'reason': reason, 'unavailable': True}]
+
+
+def test_any_byte_ends_the_silent_streak(dead, dest):
+    assert _unavailable_run(dead, dest)[0].exit_code == 1
+    dead.inject('GET', '/download', Truncate(after_bytes=4), where={'path': DEAD_PATH})
+
+    result = run_download('--retry-failed', '--download-retries', '0', '--download-passes', '1', str(dest))
+
+    assert result.exit_code == 1
+    truncated = (
+        'the download failed: peer closed connection without sending complete message body '
+        f'(received 4 bytes, expected {len(DEAD)})'
+    )
+    assert f'Failed: 1\n  {DEAD_PATH}: {truncated}\n' in result.stdout
+    assert 'Yandex Disk' not in result.stdout
+    assert failure_record(DEAD_PATH) == (truncated, 9, 0, None)
+
+
+@pytest.mark.parametrize(
+    ('answer', 'throttled'),
+    [
+        (429, 'the download host 127.0.0.1 returned HTTP 429'),
+        (FakeResponse.error(503, {'Retry-After': '0'}), SERVICE_UNAVAILABLE),
+    ],
+    ids=['429', '503-retry-after'],
+)
+def test_throttling_is_not_silence(dead, dest, answer, throttled):
+    def throttled_run(passes: int, *args: str):
+        dead.inject('GET', '/download', *[answer] * passes, where={'path': DEAD_PATH})
+        result = run_download('--download-passes', str(passes), *args, str(dest))
+        assert result.exit_code == 1
+        return result
+
+    throttled_run(7)
+    assert failure_record(DEAD_PATH) == (f'{throttled} (after 7 passes)', 7, 0, None)
+    assert _silent_run(dead, dest, DEAD_PATH, 7).exit_code == 1
+    *_, since = failure_record(DEAD_PATH)
+
+    again = throttled_run(7)
+
+    assert f'Failed: 1\n  {DEAD_PATH}: {throttled} (after 7 passes)\n' in again.stdout
+    assert failure_record(DEAD_PATH) == (f'{throttled} (after 7 passes)', 21, 7, since)
+    aged = age_silence(DEAD_PATH, 25)
+
+    late = throttled_run(1, '--retry-failed')
+
+    reason = f'{NEVER_STARTED} 7 attempts {_since(aged)}'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n{UNAVAILABLE_HINT}\n' in late.stdout
+    assert failure_record(DEAD_PATH) == (reason, 22, 7, aged)
+
+
+def test_a_file_that_stops_sending_midway_is_reported_as_stopped_after_its_confirmed_bytes(big, dest):
+    _leave_partial(big, dest)
+    assert _silent_run(big, dest, BIG_PATH, 7, root='disk:/Big').exit_code == 1
+    assert failure_record(BIG_PATH)[1:3] == (8, 7)
+    aged = age_silence(BIG_PATH, 25)
+
+    result = _silent_run(big, dest, BIG_PATH, 1, '--retry-failed', root='disk:/Big')
+
+    assert result.exit_code == 1
+    reason = (
+        f'Yandex Disk stopped sending this file after {format_size(300_000)}: no data in its last 8 attempts '
+        f'{_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    )
+    assert f'Failed: 1\n  {BIG_PATH}: {reason}\n{UNAVAILABLE_HINT}\n' in result.stdout
+    assert failure_record(BIG_PATH) == (reason, 9, 8, aged)
+    assert _partial_size(dest) == 300_000
+
+
+def test_a_local_error_ends_the_silent_streak(dead, dest, monkeypatch):
+    assert _silent_run(dead, dest, DEAD_PATH, 7).exit_code == 1
+    age_silence(DEAD_PATH, 25)
+    local = local_file(dest, DEAD_PATH)
+    local.write_bytes(DEAD)
+    _refuse(monkeypatch, 'open_file', errno.EACCES, lambda name: name == local.name)
+
+    result = run_download('--retry-failed', '--download-passes', '1', str(dest))
+
+    assert result.exit_code == 1
+    denied = f'could not read Dead/napkin.jpg: {os.strerror(errno.EACCES)}'
+    assert f'Failed: 1\n  {DEAD_PATH}: {denied}\n' in result.stdout
+    assert 'Yandex Disk' not in result.stdout
+    assert failure_record(DEAD_PATH) == (denied, 8, 0, None)
 
 
 def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_others(disk, dest):
@@ -3471,6 +3629,32 @@ def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_
     )
     assert (dest / 'big.bin').read_bytes() == BIG
     assert _failure_records() == []
+
+
+def test_ctrl_c_between_passes_records_the_unavailable_reason_once_it_applies(dead, dest):
+    assert _silent_run(dead, dest, DEAD_PATH, 6).exit_code == 1
+    aged = age_silence(DEAD_PATH, 25)
+    dead.inject('GET', '/download', 503, Delay(30), where={'path': DEAD_PATH})
+    child = start_command('download', '--retry-failed', '--download-passes', '3', str(dest))
+    try:
+        wait_until(lambda: failure_record(DEAD_PATH)[1] == 7, child, 'recorded the deferred turn')
+        time.sleep(1)
+        child.send_signal(signal.SIGINT)
+        _, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    assert child.returncode == 130, stderr
+    assert stderr_lines(stderr)[-1] == 'Interrupted; rerun to continue the download.'
+    assert len(_fetches(dead, DEAD_PATH)) == 7
+    reason = f'{NEVER_STARTED} 7 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert failure_record(DEAD_PATH) == (reason, 7, 7, aged)
+
+    checked = runner.invoke(app, ['verify', str(dest)])
+
+    assert checked.exit_code == 1
+    assert f'Not downloaded: 1\n  {DEAD_PATH}: {reason}\n' in checked.stdout
 
 
 # Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, an fsync of a partial file
