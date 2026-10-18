@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- SIGTERM (`kill`, `systemctl stop`, `docker stop`) stops `scan`, `download` and `verify` cleanly, as Ctrl+C does,
+  with exit code 143.
+
 ### Changed
 
 - Every HTTP request names the tool in its `User-Agent`:

@@ -2,7 +2,7 @@
 mirrors made from it.
 
 A scan streams its rows into a staging table through a `ScanSession`; only `ScanSession.commit()` moves them into
-`entries`, in one transaction. A scan that stops in any other way (an exception, Ctrl+C, SIGKILL, a power cut)
+`entries`, in one transaction. A scan that stops in any other way (an exception, Ctrl+C, SIGTERM, SIGKILL, a power cut)
 leaves `entries` as the previous completed scan wrote it. The commit also records when that scan completed, and
 the entries it left out because their names are not valid Unicode (`unencodable_entries`), so a run that reuses the
 scan still knows about them.

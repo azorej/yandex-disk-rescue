@@ -216,9 +216,11 @@ everything under it as removed. Only the scanned folder itself disappearing
 fails the scan.
 
 The manifest only ever holds completed scans: a scan that fails or is
-interrupted (Ctrl+C, a kill, a crash) leaves the previous scan in place, and
-the next run scans again from the start. Ctrl+C prints `Interrupted; the
-manifest holds the last completed scan.` and exits with 130. Scanning a
+interrupted (Ctrl+C, SIGTERM, SIGKILL, a crash) leaves the previous scan in
+place, and the next run scans again from the start. Ctrl+C or SIGTERM
+(`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; the manifest
+holds the last completed scan.` and exits with 130 (Ctrl+C) or 143
+(SIGTERM). Scanning a
 folder replaces only that folder's part of the manifest. The manifest also
 records when each scan completed, and the entries left out because their
 names are not valid Unicode. Only one run can use
@@ -282,9 +284,9 @@ resume — happens on that disk, not on DEST:
   the disk, and is then placed like any verified file, or quarantined in
   DEST's `quarantine/` (below) when the check fails. The partial file below
   `PATH` is deleted once that is recorded.
-- A run stopped anywhere on the way (Ctrl+C, a kill, a crash, a power cut)
-  never leaves a cut-short file at a final path, and fetches nothing of that
-  file again. Until the outcome is recorded, the partial file below `PATH`
+- A run stopped anywhere on the way (Ctrl+C, SIGTERM, SIGKILL, a crash, a
+  power cut) never leaves a cut-short file at a final path, and fetches
+  nothing of that file again. Until the outcome is recorded, the partial file below `PATH`
   and its journal stay as they are. Stopped before the copy is placed, it
   leaves a staged copy, which the next run deletes at its start and then
   copies the file again. Stopped once the copy is placed but before it is
@@ -411,8 +413,9 @@ journal in the manifest: for each segment (a file fetched as one stream has
 one), how many of its bytes were flushed to the disk, and their SHA-256. A
 checkpoint is taken every `download_checkpoint_mib` MiB a segment receives
 (default 32), every 15 s while bytes arrive, and whenever a download attempt
-ends — a dropped connection, a stall, Ctrl+C. After a kill, a crash or a power
-cut, at most one checkpoint interval per segment is fetched again.
+ends — a dropped connection, a stall, Ctrl+C or SIGTERM. After SIGKILL, a
+crash or a power cut, at most one checkpoint interval per segment is fetched
+again.
 
 A later pass or a later run asks the Disk for the file again and, when its
 size, checksums and modification time are unchanged, re-reads each segment's
@@ -466,8 +469,8 @@ fails: a file still failing after the last pass, a refused download, a file
 changed or removed in the cloud, a local error, a hard link to another file of
 the mirror, a refused name, a folder that could not be made, and every entry
 under such a folder. The record is dropped once the entry succeeds: a file
-verified or adopted, a folder made or found in place. Files stopped by Ctrl+C
-or by an error that stops the run get no failure record; their unfinished
+verified or adopted, a folder made or found in place. Files stopped by Ctrl+C,
+SIGTERM or an error that stops the run get no failure record; their unfinished
 downloads stay recorded as partial.
 
 A quarantined file gets no failure record and is not listed under `Failed`.
@@ -598,9 +601,11 @@ as it was.
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run: the files still
 in progress stop too, only the first error is shown, files already verified
-stay verified, and a rerun picks up where it stopped. Ctrl+C prints
-`Interrupted; rerun to continue the download.` and exits with 130; every file
-in progress takes a checkpoint first, and the next run resumes it from there.
+stay verified, and a rerun picks up where it stopped. Ctrl+C or SIGTERM
+(`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; rerun to
+continue the download.` and exits with 130 (Ctrl+C) or 143 (SIGTERM); every
+file in progress takes a checkpoint first, and the next run resumes it from
+there.
 
 ### Local file names
 
@@ -751,17 +756,18 @@ once. A DEST that is not an existing folder, or that no `download` recorded in
 the manifest, is a usage error (exit `2`); `verify` never creates a manifest.
 
 **Resuming.** A check is one *pass* over the mirror, kept in the manifest
-until every file is checked. Ctrl+C prints `Interrupted; rerun verify to
-continue where it stopped.` and exits with 130; the findings made so far stay
-recorded. The next `verify DEST` continues the pass instead of starting over:
+until every file is checked. Ctrl+C or SIGTERM (`kill`, `systemctl stop`,
+`docker stop`) prints `Interrupted; rerun verify to continue where it
+stopped.` and exits with 130 (Ctrl+C) or 143 (SIGTERM); the findings made so
+far stay recorded. The next `verify DEST` continues the pass instead of starting over:
 it reads only the files after the last one checked, and starts with
 
 ```
 Continuing the verification started 2026-10-17 09:30 UTC: 412 files (380.5 MiB) left
 ```
 
-The pass records how far it got at least every 5 s and when it stops, so a
-kill or a power cut costs the files checked in the last 5 s and the one being
+The pass records how far it got at least every 5 s and when it stops, so
+SIGKILL or a power cut costs the files checked in the last 5 s and the one being
 read; a destination that became unreadable stops the pass the same way. Its
 summary always covers the whole pass: a file checked in an earlier part
 counts by what was recorded then (intact unless it was found missing,
@@ -821,13 +827,13 @@ data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
 - Notices and report lines written while a phase runs are printed above the
   view, literally: a name such as `[red]x[/red].txt` shows as it is.
 - The view is cleared when its phase ends, also when the run stops with an
-  error or Ctrl+C, and the cursor is shown again. What stays on the terminal
+  error, Ctrl+C or SIGTERM, and the cursor is shown again. What stays on the terminal
   is the report, the notices and the result line.
 
 **Status lines.** Off a terminal, each slow phase writes one status line every
 `progress_interval` seconds (default 60; see
 [Configuration](#configuration)), then a last line when it ends, also when
-the run stops with an error or Ctrl+C. A multi-day run under `nohup` thus
+the run stops with an error, Ctrl+C or SIGTERM. A multi-day run under `nohup` thus
 writes one line a minute:
 
 ```
@@ -931,7 +937,8 @@ summary lists them.
   `Moving the confirmed bytes …`, `The partial folder of the last run … is
   missing …`, `Partial files in …`), its full summary with every list complete (no `… and N more`), and its
   end: `completed (exit 0)`, `failed (exit N): <error>`,
-  `interrupted (exit 130)`, or an unexpected error with its traceback.
+  `interrupted (exit 130)` (Ctrl+C), `interrupted by SIGTERM (exit 143)`, or
+  an unexpected error with its traceback.
 - In between it logs every notice, every `-v` record and every status line,
   whatever the console flags (`-q` and `--no-progress` included). With `-v`
   it also logs DEBUG records: each file skipped as verified already or held
@@ -992,8 +999,8 @@ A command that got as far as its report adds the report's keys, also when it
 then exits `1` because files failed, were quarantined or have problems. A
 command that ended with no report (a token Yandex rejects, a log file that
 cannot be opened, an unreadable DEST, `--no-scan` with no scan, a DEST that is
-not a mirror, Ctrl+C) prints the common keys alone, with `error`. A usage
-error (exit `2` before the command starts) prints no JSON.
+not a mirror, Ctrl+C or SIGTERM) prints the common keys alone, with `error`. A
+usage error (exit `2` before the command starts) prints no JSON.
 
 Every list is complete, sizes are integers in bytes, and paths are the Disk's
 own, control characters included (JSON escapes them); a name that is not
@@ -1112,13 +1119,13 @@ tail -f ~/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 - `< /dev/null` keeps `nohup` from writing `nohup: ignoring input` into
   `download.err`.
 
-`verify` runs the same way. Started from an interactive shell, `kill -INT
-<pid>` stops the run as Ctrl+C does: it takes its last checkpoints, prints
-`Interrupted; …` and exits with 130, and the next run continues from there.
-A background job that a script starts has SIGINT ignored, so there `kill
--INT` does nothing. SIGTERM, the default of `kill`, ends the run at once
-with no last checkpoint; the next run still resumes, fetching again what
-arrived since the last checkpoint of each file in progress.
+`verify` runs the same way. `kill <pid>` (SIGTERM) stops the run as Ctrl+C
+does: it takes its last checkpoints, prints `Interrupted; …` and exits with
+143, and the next run continues from there. This holds also for a background
+job that a script starts, whose SIGINT is ignored; `kill -INT <pid>` stops
+the run only when it was started from an interactive shell. A SIGTERM sent
+while the run is already stopping is ignored, so the last checkpoints are
+never cut short; SIGKILL ends the run at once.
 
 ### As a systemd user service
 
@@ -1134,9 +1141,8 @@ ExecStart=%h/.local/bin/yandex-disk-rescue download -q --json disk:/ /mnt/backup
 StandardOutput=append:%h/yandex-disk-rescue.json
 StandardError=journal
 TimeoutStartSec=infinity
-KillSignal=SIGINT
 TimeoutStopSec=5min
-SuccessExitStatus=130
+SuccessExitStatus=143
 ```
 
 `~/.config/systemd/user/yandex-disk-rescue.timer`:
@@ -1170,10 +1176,11 @@ systemctl --user stop yandex-disk-rescue.service
   `TimeoutStartSec=infinity` is needed because a oneshot's start timeout
   would otherwise kill a run that lasts days. `systemctl start` waits for a
   oneshot to finish, hence `--no-block`.
-- `KillSignal=SIGINT` makes `systemctl stop` (and a shutdown) stop the run
-  as Ctrl+C does, with its last checkpoints; the default, SIGTERM, ends it at
-  once. `TimeoutStopSec` is how long systemd waits after it before it sends
-  SIGKILL. `SuccessExitStatus=130` counts a stopped run as a clean stop, not a
+- `systemctl stop` (and a shutdown) sends SIGTERM, which stops the run as
+  Ctrl+C does, with its last checkpoints. `TimeoutStopSec` is how long
+  systemd waits for them before it sends SIGKILL, which costs at most the
+  last checkpoint interval of each file in progress.
+  `SuccessExitStatus=143` counts a stopped run as a clean stop, not a
   failure.
 - `loginctl enable-linger` starts your user's systemd instance at boot and
   keeps it after you log out, so the timer fires and the run goes on without
@@ -1189,7 +1196,7 @@ systemctl --user stop yandex-disk-rescue.service
   add `--no-progress` then to keep the status line a minute out of it (the
   log file still gets them).
 - Stopped with `systemctl stop`, the run still writes its JSON document,
-  with `exit_code` 130.
+  with `exit_code` 143.
 - A run that exits `1` (files failed or were quarantined, or an error)
   leaves the unit failed: `systemctl --user --failed` lists it, and
   `OnFailure=` in `[Unit]` can start a unit that tells you.
@@ -1239,6 +1246,7 @@ systemctl --user stop yandex-disk-rescue.service
 | `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
 | `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers; for `verify` a DEST that is not an existing folder or is not a mirror recorded in the manifest |
 | `130` | Interrupted with Ctrl+C |
+| `143` | Stopped with SIGTERM (`kill`, `systemctl stop`, `docker stop`): the same clean stop as Ctrl+C |
 
 ## Rate limiting
 

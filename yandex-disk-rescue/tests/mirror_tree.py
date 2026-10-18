@@ -34,10 +34,14 @@ def run_download(*args: str):
     return runner.invoke(app, ['download', *args])
 
 
-def start_command(command: str, *args: str) -> subprocess.Popen[str]:
-    """Start `yandex-disk-rescue <command> <args>` in a child process with this process's environment."""
+def start_command(command: str, *args: str, sigint_ignored: bool = False) -> subprocess.Popen[str]:
+    """Start `yandex-disk-rescue <command> <args>` in a child process with this process's environment; with
+    `sigint_ignored`, as a shell script starts a background job: with SIGINT ignored."""
+    argv = ['yandex-disk-rescue', command, *args]
+    if sigint_ignored:
+        argv = ['sh', '-c', 'trap "" INT; exec "$0" "$@"', *argv]
     return subprocess.Popen(
-        ['yandex-disk-rescue', command, *args],
+        argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -45,14 +49,20 @@ def start_command(command: str, *args: str) -> subprocess.Popen[str]:
     )
 
 
+def _command(child: subprocess.Popen[str]) -> str:
+    """The command `start_command` started `child` with."""
+    args = list(child.args)
+    return args[args.index('yandex-disk-rescue') + 1]
+
+
 def wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
     """Wait up to 60 s for `condition()`, failing the test if `child` exits first."""
     deadline = time.monotonic() + 60
     while not condition():
         if child.poll() is not None:
-            pytest.fail(f'{child.args[1]} exited with {child.returncode} before it {what}: {child.communicate()}')
+            pytest.fail(f'{_command(child)} exited with {child.returncode} before it {what}: {child.communicate()}')
         if time.monotonic() > deadline:
-            pytest.fail(f'{child.args[1]} never {what}')
+            pytest.fail(f'{_command(child)} never {what}')
         time.sleep(0.01)
 
 

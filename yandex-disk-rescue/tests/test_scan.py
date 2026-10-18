@@ -1,7 +1,6 @@
 """Tests for `yandex-disk-rescue scan` against the fake Disk API, with the real manifest in the XDG state directory."""
 
 import json
-import os
 import signal
 import subprocess
 import time
@@ -9,7 +8,7 @@ from datetime import UTC
 
 import pytest
 from fake_disk_server import Delay, FakeResponse
-from mirror_tree import log_messages, stderr_lines
+from mirror_tree import log_messages, start_command, stderr_lines
 from typer.testing import CliRunner
 from yandex_disk_rescue import scanning
 from yandex_disk_rescue.api import Resource
@@ -276,17 +275,19 @@ def _wait_for_listing(fake, path: str, child: subprocess.Popen[str], *, after: i
         time.sleep(0.01)
 
 
-@pytest.mark.parametrize('stop', [signal.SIGINT, signal.SIGKILL], ids=['sigint', 'sigkill'])
-def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
+@pytest.mark.parametrize(
+    ('stop', 'exit_code'),
+    [(signal.SIGINT, 130), (signal.SIGTERM, 143), (signal.SIGKILL, -signal.SIGKILL)],
+    ids=['sigint', 'sigterm', 'sigkill'],
+)
+def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop, exit_code):
     assert _scan().exit_code == 0
     previous = _rows()
     disk.add_file('disk:/Photos/2024/new.jpg', b'new')
     disk.inject('GET', '/v1/disk/resources', Delay(120), where={'path': 'disk:/Photos/2024'})
     earlier_requests = len(disk.requests)
 
-    child = subprocess.Popen(
-        ['yandex-disk-rescue', 'scan'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=os.environ.copy()
-    )
+    child = start_command('scan')
     try:
         _wait_for_listing(disk, 'disk:/Photos/2024', child, after=earlier_requests)
         child.send_signal(stop)
@@ -295,12 +296,10 @@ def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
         child.kill()
         child.communicate()
 
-    if stop == signal.SIGINT:
-        assert child.returncode == 130, stderr
+    assert child.returncode == exit_code, stderr
+    if stop != signal.SIGKILL:
         assert stderr_lines(stderr) == ['Interrupted; the manifest holds the last completed scan.']
         assert stdout == ''
-    else:
-        assert child.returncode == -signal.SIGKILL
     assert _rows() == previous
 
     rescan = _scan()

@@ -600,22 +600,28 @@ def _after(through: str) -> list[str]:
     return [path for path in MANY if path > through]
 
 
-def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_uninterrupted_verify_does(
-    many, dest, tmp_path, monkeypatch
+STOPS = pytest.mark.parametrize(
+    ('stop', 'exit_code'), [(signal.SIGINT, 130), (signal.SIGTERM, 143)], ids=['sigint', 'sigterm']
+)
+
+
+@STOPS
+def test_ctrl_c_or_sigterm_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_uninterrupted_verify_does(
+    many, dest, tmp_path, monkeypatch, stop, exit_code
 ):
     gate = slow_reads(tmp_path, monkeypatch)
     child = start_command('verify', '--progress-interval', '1', str(dest))
     try:
         # Each file takes two reads, so 20 files take 2 s at least, the time of one status line and more.
         wait_until(lambda: len(list(gate.iterdir())) >= 20, child, 'read 20 files')
-        child.send_signal(signal.SIGINT)
+        child.send_signal(stop)
         stdout, stderr = child.communicate(timeout=60)
     finally:
         child.kill()
         child.communicate()
     monkeypatch.delenv('PYTHONPATH')
 
-    assert child.returncode == 130, stderr
+    assert child.returncode == exit_code, stderr
     assert stdout == f'Verifying 40 files ({MANY_SIZE}) in {dest}\n'
     *notices, result_line = stderr_lines(stderr)
     assert [notice.partition(' ')[0] for notice in notices] == [EARLY]
@@ -654,12 +660,15 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
     assert [path for path, *_ in _findings()] == [EARLY, LATE]
 
 
-def test_json_of_a_continued_pass_says_so_and_counts_what_an_uninterrupted_pass_does(many, dest, tmp_path, monkeypatch):
+@STOPS
+def test_json_of_a_continued_pass_says_so_and_counts_what_an_uninterrupted_pass_does(
+    many, dest, tmp_path, monkeypatch, stop, exit_code
+):
     gate = slow_reads(tmp_path, monkeypatch)
     child = start_command('verify', '--json', str(dest))
     try:
         wait_until(lambda: len(list(gate.iterdir())) >= 20, child, 'read 20 files')
-        child.send_signal(signal.SIGINT)
+        child.send_signal(stop)
         stopped, _ = child.communicate(timeout=60)
     finally:
         child.kill()
@@ -670,9 +679,9 @@ def test_json_of_a_continued_pass_says_so_and_counts_what_an_uninterrupted_pass_
     resumed = json.loads(_verify('--json', str(dest)).stdout)
     uninterrupted = json.loads(_verify('--json', str(dest)).stdout)
 
-    assert child.returncode == 130
+    assert child.returncode == exit_code
     interrupted = json.loads(stopped)
-    assert (interrupted['exit_code'], interrupted['error']) == (130, {'message': verify_command.INTERRUPTED})
+    assert (interrupted['exit_code'], interrupted['error']) == (exit_code, {'message': verify_command.INTERRUPTED})
     assert 'pass' not in interrupted
     left = _after(through)
     assert resumed['pass'] == {

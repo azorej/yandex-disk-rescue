@@ -8,7 +8,7 @@ from typing import Annotated, Any
 import typer
 import typer.core
 
-from yandex_disk_rescue import __version__, api, auth, config, settings
+from yandex_disk_rescue import __version__, api, auth, config, interrupts, settings
 from yandex_disk_rescue.commands import download, scan, verify
 from yandex_disk_rescue.display import display_line
 from yandex_disk_rescue.errors import RescueError
@@ -16,9 +16,10 @@ from yandex_disk_rescue.logs import write_stderr
 from yandex_disk_rescue.units import format_size
 
 
-class RescueErrorGroup(typer.core.TyperGroup):
-    """Root command group that renders a `RescueError` from any nested command as `Error: <message>`, one line with its
-    control characters escaped, and exits with its exit code also when stderr does not take the line."""
+class ExitCodeGroup(typer.core.TyperGroup):
+    """Root command group that turns how a nested command ended into its exit code: a `RescueError` is rendered as
+    `Error: <message>`, one line with its control characters escaped, and exits with its exit code also when stderr
+    does not take the line; a run stopped by SIGTERM exits with 143."""
 
     def invoke(self, ctx: typer.Context) -> Any:
         try:
@@ -26,10 +27,12 @@ class RescueErrorGroup(typer.core.TyperGroup):
         except RescueError as err:
             write_stderr(f'Error: {display_line(str(err))}')
             raise typer.Exit(err.exit_code) from None
+        except interrupts.Terminated:
+            raise typer.Exit(interrupts.EXIT_CODE) from None
 
 
 app = typer.Typer(
-    cls=RescueErrorGroup,
+    cls=ExitCodeGroup,
     help='Download everything from a Yandex Disk account: resumable, verified, rate-limit aware.',
     no_args_is_help=True,
     pretty_exceptions_show_locals=False,

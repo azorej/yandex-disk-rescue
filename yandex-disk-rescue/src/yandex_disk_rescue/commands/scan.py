@@ -1,13 +1,12 @@
 """`scan`: record the tree of a remote folder in the manifest and summarize what changed."""
 
-import asyncio
 from functools import partial
 from pathlib import Path
 from typing import Annotated
 
 import typer
 
-from yandex_disk_rescue import api, auth, console, paths, settings
+from yandex_disk_rescue import api, auth, console, interrupts, paths, settings
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.progress import ScanProgress
 from yandex_disk_rescue.scanning import ScanResult, resolve_scan_root, scan_document, scan_summary, scan_tree
@@ -57,7 +56,7 @@ def scan(
     with console.command_output('scan', options, details=details, interrupted=INTERRUPTED) as output:
         token = auth.get_token()
         manifest_path = paths.manifest_path()
-        result = asyncio.run(_run(token, root, output, base_url=api_url, limits=limits, manifest_path=manifest_path))
+        result = interrupts.run(_run(token, root, output, base_url=api_url, limits=limits, manifest_path=manifest_path))
         output.report(scan_document(result))
         output.summary(partial(scan_summary, result))
         output.footer(manifest_path)

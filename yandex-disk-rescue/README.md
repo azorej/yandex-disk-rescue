@@ -94,9 +94,9 @@ mirror up by its destination without creating one.
   moves its cursor (refused when no pass is in progress) and `Mirror.end_verify_pass` deletes it.
 
 - It only ever holds the result of completed scans. A scan stages its rows durably and moves them into the manifest
-  in one transaction when it finishes; a scan stopped by an error, Ctrl+C or SIGKILL leaves the previous content
-  unchanged, and the next scan discards its staged rows. Rescanning a folder replaces only that folder's subtree.
-  A scan can unstage a subtree before it commits (`ScanSession.discard`); `scan` does so for a folder deleted on
+  in one transaction when it finishes; a scan stopped by an error, Ctrl+C, SIGTERM or SIGKILL leaves the previous
+  content unchanged, and the next scan discards its staged rows. Rescanning a folder replaces only that folder's
+  subtree. A scan can unstage a subtree before it commits (`ScanSession.discard`); `scan` does so for a folder deleted on
   the Disk or replaced by a file mid-scan, which the commit then records as removed.
 - `Manifest.entries` and `ScanSession.staged` stream rows as the caller iterates; finish the iteration before
   writing to the same manifest. `Mirror.entries` returns a fully read list, so the caller can write records while
@@ -118,20 +118,22 @@ yandex-disk-rescue/
 ├── LICENSE           # A byte-identical copy of the repository LICENSE, shipped in the sdist and the wheel
 ├── src/yandex_disk_rescue/
 │   ├── __init__.py   # Package version (read from installed metadata)
-│   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, the global `--config`
+│   ├── cli.py        # Typer app — the entry point, `Error: ...` rendering of RescueError, exit code 143 of a run
+│   │                 #   stopped by SIGTERM, the global `--config`
 │   │                 #   (config-file values as Click's default_map), the `auth` commands, registration of
 │   │                 #   the commands in `commands/`
 │   ├── commands/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary, its JSON object and
-│   │   │             #   Ctrl+C message
+│   │   │             #   interrupt message
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
 │   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
 │   │   │             #   retry set (`--retry-failed`), its start line, the move line and the move's status
 │   │   │             #   lines, the partial-folder line with its room once measured, summary, JSON object
 │   │   │             #   (the report's, with the scan, the files to download, the move and the room), exit code
+│   │   │             #   and interrupt message
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, JSON
-│   │                 #   object with the pass, exit code and Ctrl+C message; no token, no network
+│   │                 #   object with the pass, exit code and interrupt message; no token, no network
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines and `scan_document`, the scan's JSON object
@@ -193,7 +195,8 @@ yandex-disk-rescue/
 │   │                 #   an open file and setting its times; the free space of a folder's filesystem
 │   ├── console.py    # The output of scan, download and verify: `-v`/`-q`/`--no-progress`/`--json`, the report
 │   │                 #   lines on stdout (on stderr with `--json`), the run wrapped in `command_output` (log file
-│   │                 #   and notice handlers attached for the run, its start and end records, the Ctrl+C line,
+│   │                 #   and notice handlers attached for the run, its start and end records, the
+│   │                 #   `Interrupted; …` line on Ctrl+C or SIGTERM, SIGTERM as a clean stop for the run,
 │   │                 #   `LogFileError`, and with `--json` the one JSON document: the common keys, then the
 │   │                 #   report object `Output.report` was given, or `error` alone), the start lines and the
 │   │                 #   full summary logged, the `Manifest:` and `Log:` lines, and `Output.progress`, which reports one phase:
@@ -220,6 +223,8 @@ yandex-disk-rescue/
 │   │                 #   escaped (`\x1b`, `\x0a`, `\udcxx`), applied where the report, stderr, the live view and
 │   │                 #   the log file are written
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
+│   ├── interrupts.py # SIGTERM as a clean stop: `Terminated`, the run-scoped handler (`sigterm_stops`) and the
+│   │                 #   asyncio runner of the commands (`run`)
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
