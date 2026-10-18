@@ -7,6 +7,7 @@ run wrote it.
 """
 
 import contextlib
+import io
 import logging
 import os
 import sys
@@ -16,6 +17,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TextIO
 
 from yandex_disk_rescue.display import display_line, display_text
 
@@ -139,14 +141,22 @@ def notice(text: str, *, timestamped: bool) -> None:
 
 def write_stderr(text: str) -> None:
     """Write `text`, its control characters but newlines escaped, and a newline to stderr, one caller at a time:
-    through the writer `stderr_through` installed, or else to the current `sys.stderr`, flushed."""
+    through the writer `stderr_through` installed, or else to the current `sys.stderr`, flushed. Raises `OSError` when
+    the write to `sys.stderr` fails; the line is dropped then, so a later write and Python's own flush at exit do not
+    retry it."""
     text = display_text(text)
     with _stderr.lock:
         if _stderr.writer is not None:
             _stderr.writer(text)
             return
-        sys.stderr.write(f'{text}\n')
-        sys.stderr.flush()
+        stream = sys.stderr
+        try:
+            stream.write(f'{text}\n')
+            stream.flush()
+        except OSError:
+            if stream is sys.__stderr__:
+                sys.stderr = _fresh_stderr(stream)
+            raise
 
 
 @contextmanager
@@ -159,6 +169,13 @@ def stderr_through(writer: Callable[[str], None]) -> Iterator[None]:
     finally:
         with _stderr.lock:
             _stderr.writer = None
+
+
+def _fresh_stderr(stream: TextIO) -> TextIO:
+    """A stream like `stream` on its file descriptor, without the bytes `stream` holds back after a failed write: no
+    API discards them, and Python retries them at exit and turns a failure then into exit code 120."""
+    raw = io.FileIO(stream.fileno(), 'w', closefd=False)
+    return io.TextIOWrapper(io.BufferedWriter(raw), encoding=stream.encoding, errors=stream.errors, line_buffering=True)
 
 
 def _open_log(path: Path) -> int:

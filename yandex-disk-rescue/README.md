@@ -195,7 +195,8 @@ yandex-disk-rescue/
 │   │                 #   report object `Output.report` was given, or `error` alone), the start lines and the
 │   │                 #   full summary logged, the `Manifest:` and `Log:` lines, and `Output.progress`, which reports one phase:
 │   │                 #   its status-line thread (to the log file always, to stderr off a terminal unless
-│   │                 #   `--no-progress` or `-q`) and on a terminal its live view; whether stderr is a terminal
+│   │                 #   `--no-progress` or `-q`, off for the run with one logged warning once a write there
+│   │                 #   fails) and on a terminal its live view; whether stderr is a terminal
 │   │                 #   (a tty, `TERM` neither dumb nor unknown); the engines and the API client log their own
 │   │                 #   records (failures, findings, per-file outcomes, passes, throttling) through
 │   │                 #   `logging.getLogger`
@@ -209,7 +210,7 @@ yandex-disk-rescue/
 │   │                 #   speed over the last minute, ETA over the last 15 minutes; no I/O
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the notices on stderr (timestamped off a terminal),
-│   │                 #   sent through the live view while one is shown
+│   │                 #   sent through the live view while one is shown; a line stderr fails to take is dropped
 │   ├── units.py      # format_size and format_duration — binary-unit byte counts and durations for command output
 │   ├── display.py    # display_line and display_text — text with every control character and lone surrogate
 │   │                 #   escaped (`\x1b`, `\x0a`, `\udcxx`), applied where the report, stderr, the live view and

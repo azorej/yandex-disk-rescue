@@ -177,6 +177,31 @@ def test_a_log_file_that_stops_taking_writes_never_stops_the_rescue(disk, dest, 
     assert (dest / 'Docs' / 'readme.txt').read_bytes() == b'read me'
 
 
+def test_a_stderr_that_stops_taking_writes_never_stops_the_rescue_or_its_status_records(slow, dest):
+    with open('/dev/full', 'w') as full:
+        child = subprocess.run(
+            ['yandex-disk-rescue', 'download', '--progress-interval', '1', str(dest)],
+            stdout=subprocess.PIPE,
+            stderr=full,
+            text=True,
+            timeout=120,
+        )
+
+    assert child.returncode == 0
+    assert 'Mirrored disk:/ to ' in child.stdout
+    assert child.stdout.endswith(f'Manifest: {manifest_path()}\nLog: {log_path()}\n')
+    reason = os.strerror(errno.ENOSPC)
+    warning = f'Could not write a status line to stderr: {reason}; status lines on stderr are off for this run.'
+    [record] = [line for line in log_path().read_text(encoding='utf-8').splitlines() if line.endswith(warning)]
+    assert LOG_LINE.match(record)['level'] == 'WARNING'
+    messages = log_messages()
+    after = messages[messages.index(warning) + 1 :]
+    assert any(DOWNLOADING.match(message) for message in after)
+    assert len([message for message in after if message.startswith('Downloaded: ')]) == 1
+    assert messages[-1] == 'download completed (exit 0)'
+    assert (dest / 'Photos' / '2024' / 'a.jpg').stat().st_size == 6 * 64 * 1024
+
+
 def test_the_log_names_every_failed_file_and_a_rerun_appends_to_it(disk, dest):
     refused = [f'disk:/Refused/{index:02}.bin' for index in range(25)]
     for path in refused:
