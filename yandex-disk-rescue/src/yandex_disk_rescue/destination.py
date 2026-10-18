@@ -12,7 +12,9 @@ All operations go through open folder descriptors and `localfs`, so none follows
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
 file through the no-replace rename, and whatever stood there is first moved, never deleted, into the run's folder
 under `.yandex-disk-rescue/replaced/`. A downloaded file that fails verification is moved, never deleted, into the
-run's folder under `.yandex-disk-rescue/quarantine/`.
+run's folder under `.yandex-disk-rescue/quarantine/`. The preview image of a file not downloaded is saved below
+`.yandex-disk-rescue/previews/`, at the file's local path, replacing only an earlier preview; deleting a preview
+deletes nothing outside `previews/`.
 """
 
 import errno
@@ -20,6 +22,7 @@ import fcntl
 import hashlib
 import os
 import re
+import secrets
 import stat
 from collections.abc import Collection, Iterator
 from contextlib import ExitStack, contextmanager, suppress
@@ -30,12 +33,23 @@ from typing import Literal, Self
 
 from yandex_disk_rescue import localfs
 from yandex_disk_rescue.errors import RescueError
-from yandex_disk_rescue.local_names import WORK_DIR_NAME, rejected_name_conversion
+from yandex_disk_rescue.local_names import WORK_DIR_NAME, rejected_name_conversion, with_ending
 
 LOCK_FILE_NAME = 'lock'
 PARTIAL_DIR_NAME = 'partial'
 REPLACED_DIR_NAME = 'replaced'
 QUARANTINE_DIR_NAME = 'quarantine'
+PREVIEWS_DIR_NAME = 'previews'
+_PREVIEW_EXTENSIONS = {
+    'image/jpeg': '.jpg',
+    'image/png': '.png',
+    'image/webp': '.webp',
+    'image/gif': '.gif',
+    'image/heic': '.heic',
+}
+_OTHER_IMAGE_EXTENSION = '.img'
+# A temporary name never ends like a preview name, `.preview<extension>`, and fits beside any name.
+_PREVIEW_TEMP_SUFFIX = '.preview-saving'
 _STAMP_FORMAT = '%Y-%m-%dT%H-%M-%SZ'
 _READ_SIZE = 1 << 20
 _PROBE_NAMES = ('probe', 'probe.renamed')
@@ -531,6 +545,84 @@ class Destination(_Tree):
             os.fsync(self._partial_fd)
         return self._run_folders[QUARANTINE_DIR_NAME][1] / local.parent / name
 
+    @staticmethod
+    def preview_path(local: PurePosixPath, content_type: str) -> PurePosixPath:
+        """Where the preview of the file at `local`, an image of `content_type`, is saved, relative to the destination:
+        `.yandex-disk-rescue/previews/<local parent>/<local name>.preview<extension>`, the name shortened to fit when
+        too long. Raises `ValueError` for a `content_type` that is not `image/*`."""
+        if not content_type.startswith('image/'):
+            raise ValueError(f'a preview is an image, not {content_type!r}')
+        if local.is_absolute() or local.parts in {(), ('.',)} or '..' in local.parts:
+            raise ValueError(f'local path {str(local)!r} is not a relative path inside the destination')
+        extension = _PREVIEW_EXTENSIONS.get(content_type, _OTHER_IMAGE_EXTENSION)
+        return PurePosixPath(
+            WORK_DIR_NAME, PREVIEWS_DIR_NAME, local.parent, with_ending(local.name, f'.preview{extension}')
+        )
+
+    def save_preview(self, path: PurePosixPath, content: bytes) -> None:
+        """Save `content` at `path`, a `preview_path`: written to a temporary file beside it, made durable and renamed
+        over it, so `path` holds either the earlier preview or all of `content`. The folders below `previews/` are
+        created as needed, never through a link.
+
+        Raises `FileExistsError` when something other than a regular file is at `path`, which is left as it is; any
+        other error is the `OSError` of the call."""
+        folder = _preview_folder(path)
+        with _made_folder(self._work_fd, folder) as folder_fd:
+            try:
+                existing = localfs.lstat(path.name, dir_fd=folder_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                if not stat.S_ISREG(existing.st_mode):
+                    raise FileExistsError(
+                        errno.EEXIST, 'something other than a preview is there', str(self.path / path)
+                    )
+            temp = f'{secrets.token_hex(8)}{_PREVIEW_TEMP_SUFFIX}'
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+            fd = os.open(temp, flags, 0o666, dir_fd=folder_fd)
+            try:
+                try:
+                    _write_all(fd, content)
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.rename(temp, path.name, src_dir_fd=folder_fd, dst_dir_fd=folder_fd)
+            except BaseException:
+                # The error of the save is what the caller needs; a temporary file left behind changes nothing.
+                with suppress(OSError):
+                    os.unlink(temp, dir_fd=folder_fd)
+                raise
+            os.fsync(folder_fd)
+
+    def remove_preview(self, path: PurePosixPath) -> None:
+        """Delete the regular file at `path`, a `preview_path`, and then each folder below `previews/` this left empty;
+        nothing when `path` or a folder on the way is gone. Raises `FileExistsError` when something other than a
+        regular file is at `path`, which is left as it is; any other error is the `OSError` of the call."""
+        folder = _preview_folder(path)
+        fds: list[int] = []
+        try:
+            try:
+                fds.append(localfs.open_dir(PREVIEWS_DIR_NAME, dir_fd=self._work_fd))
+                for part in folder.parts[1:]:
+                    fds.append(localfs.open_dir(part, dir_fd=fds[-1]))
+                found = localfs.lstat(path.name, dir_fd=fds[-1])
+            except FileNotFoundError:
+                return
+            if not stat.S_ISREG(found.st_mode):
+                raise FileExistsError(errno.EEXIST, 'something other than a preview is there', str(self.path / path))
+            os.unlink(path.name, dir_fd=fds[-1])
+            os.fsync(fds[-1])
+            for parent_fd, name in reversed(list(zip(fds, folder.parts[1:], strict=False))):
+                try:
+                    os.rmdir(name, dir_fd=parent_fd)
+                except OSError as exc:
+                    if exc.errno in (errno.ENOTEMPTY, errno.EEXIST):
+                        return
+                    raise
+                os.fsync(parent_fd)
+        finally:
+            _close_all(fds)
+
     @property
     def _own_partials(self) -> Path:
         return self.path / WORK_DIR_NAME / PARTIAL_DIR_NAME
@@ -774,6 +866,20 @@ def _made_folder(base_fd: int, local: PurePosixPath) -> Iterator[int]:
     finally:
         if fd != base_fd:
             os.close(fd)
+
+
+def _preview_folder(path: PurePosixPath) -> PurePosixPath:
+    """The folder of the preview at `path` relative to the work directory: `previews/` and the folders below it."""
+    parts = path.parts
+    if len(parts) < 3 or parts[:2] != (WORK_DIR_NAME, PREVIEWS_DIR_NAME) or {'', '.', '..'} & set(parts):
+        raise ValueError(f'{str(path)!r} is not a path below {WORK_DIR_NAME}/{PREVIEWS_DIR_NAME}/')
+    return PurePosixPath(*parts[1:-1])
+
+
+def _write_all(fd: int, content: bytes) -> None:
+    view = memoryview(content)
+    while view:
+        view = view[os.write(fd, view) :]
 
 
 def _copy_name(entry_id: int) -> str:

@@ -93,8 +93,13 @@ mirror up by its destination without creating one.
   `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there), `Mirror.clear_finding` and
   removing the entry drop it. `Mirror.record_finding` replaces any earlier one, and
   `MirrorEntry.finding` reads it.
-- A rescan never touches names, records, failures, quarantine records or findings; removing an entry from the
-  manifest deletes them all.
+- A preview record (`previews`) holds the preview image saved for a file not downloaded: its path relative to the
+  destination, its byte size, its content type, the preview size it was asked for, and the remote identity it was
+  taken for. `Mirror.record_preview` replaces any earlier one and `Mirror.forget_preview` drops it; every other
+  record (`record_partial`, `checkpoint`, `record_verified`, `forget`, `record_failure`, `record_quarantined`,
+  `record_finding` and the `clear_*` calls) keeps it. `MirrorEntry.preview` reads it as a `PreviewRecord`.
+- A rescan never touches names, records, failures, quarantine records, findings or preview records; removing an
+  entry from the manifest deletes them all.
 - A verify pass (`verify_passes`, one row per mirror) is the `verify` in progress on the mirror: when it started and
   the Disk path of the last file whose check is committed (`checked_through`, `None` before the first).
   `Mirror.verify_pass` reads it, `Mirror.start_verify_pass` replaces it with a new one, `Mirror.checked_through`
@@ -202,8 +207,9 @@ yandex-disk-rescue/
 │   │                 #   files (probed on open), reading existing files, whether the
 │   │                 #   destination itself is still readable (`reachable`),
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
-│   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
-│   │                 #   link; which errors stop the run;
+│   │                 #   or staged copy into the run's `quarantine/` folder, placement, and the `previews/`
+│   │                 #   folder (saving a preview atomically, replacing an earlier one, removing it with the
+│   │                 #   folders it emptied), never through a link; which errors stop the run;
 │   │                 #   the read-only destination `verify` opens (lookups, reading files, the run lock when a
 │   │                 #   lock file exists, whether the destination itself is still readable)
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
@@ -244,8 +250,8 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure and quarantine records, findings, the verify pass and the folder of the
-│   │                 #   partial files per destination)
+│   │                 #   failure and quarantine records, findings, preview records, the verify pass and the
+│   │                 #   folder of the partial files per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry

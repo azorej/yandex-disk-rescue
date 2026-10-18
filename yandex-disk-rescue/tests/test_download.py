@@ -3974,6 +3974,84 @@ def test_the_partial_folder_probe_reports_sparse_files_and_leaves_nothing_behind
         assert list(destination.partial_folder.iterdir()) == []
 
 
+PREVIEWS = PurePosixPath('.yandex-disk-rescue/previews')
+
+
+def test_a_preview_is_saved_below_the_work_folder_replaced_by_a_newer_one_and_never_through_a_link(dest, tmp_path):
+    with Destination.open(dest, partial_dir=None) as destination:
+        path = destination.preview_path(PurePosixPath('Photos/2024/a.jpg'), 'image/jpeg')
+        destination.save_preview(path, b'first')
+        destination.save_preview(path, b'second')
+        saved = sorted(p.relative_to(dest) for p in (dest / PREVIEWS).rglob('*'))
+        content = (dest / path).read_bytes()
+
+        outside = tmp_path / 'outside'
+        outside.mkdir()
+        shutil.rmtree(dest / PREVIEWS / 'Photos')
+        (dest / PREVIEWS / 'Photos').symlink_to(outside)
+        with pytest.raises(NotADirectoryError):
+            destination.save_preview(path, b'third')
+
+        folder_path = destination.preview_path(PurePosixPath('b.png'), 'image/png')
+        (dest / folder_path).mkdir()
+        with pytest.raises(FileExistsError):
+            destination.save_preview(folder_path, b'png')
+
+    assert path == PREVIEWS / 'Photos/2024/a.jpg.preview.jpg'
+    assert saved == [PREVIEWS / 'Photos', PREVIEWS / 'Photos/2024', PREVIEWS / 'Photos/2024/a.jpg.preview.jpg']
+    assert content == b'second'
+    assert list(outside.iterdir()) == []
+    assert (dest / folder_path).is_dir()
+    assert list((dest / folder_path).iterdir()) == []
+    assert sorted(p.name for p in (dest / PREVIEWS).iterdir()) == ['Photos', 'b.png.preview.png']
+
+
+@pytest.mark.parametrize(
+    ('content_type', 'ending'),
+    [('image/jpeg', '.preview.jpg'), ('image/heic', '.preview.heic'), ('image/x-portable-pixmap', '.preview.img')],
+)
+def test_a_long_name_gets_a_shortened_preview_name_that_fits(content_type, ending):
+    name = 'Я' * 120 + '.tiff'
+
+    path = Destination.preview_path(PurePosixPath('Scans', name), content_type)
+
+    assert path.parent == PREVIEWS / 'Scans'
+    assert len(path.name.encode()) <= 255
+    assert path.name.endswith(f'.tiff{ending}')
+    assert path.name.startswith('Я' * 100)
+    assert re.search(r'~[0-9a-f]{8}\.tiff\.preview', path.name)
+    assert Destination.preview_path(PurePosixPath('Scans', name[1:]), content_type).name != path.name
+    with pytest.raises(ValueError, match="a preview is an image, not 'text/html'"):
+        Destination.preview_path(PurePosixPath('a.jpg'), 'text/html')
+
+
+def test_removing_a_preview_deletes_the_folders_it_left_empty_but_not_previews(dest):
+    with Destination.open(dest, partial_dir=None) as destination:
+        deep = destination.preview_path(PurePosixPath('A/B/C/deep.jpg'), 'image/jpeg')
+        beside = destination.preview_path(PurePosixPath('A/beside.jpg'), 'image/jpeg')
+        top = destination.preview_path(PurePosixPath('top.jpg'), 'image/jpeg')
+        for path in (deep, beside, top):
+            destination.save_preview(path, b'jpeg')
+
+        destination.remove_preview(deep)
+        after_deep = sorted(str(p.relative_to(dest / PREVIEWS)) for p in (dest / PREVIEWS).rglob('*'))
+        destination.remove_preview(deep)
+        destination.remove_preview(destination.preview_path(PurePosixPath('X/Y/never.jpg'), 'image/jpeg'))
+        destination.remove_preview(beside)
+        destination.remove_preview(top)
+        emptied = list((dest / PREVIEWS).iterdir())
+
+        destination.save_preview(top, b'jpeg')
+        (dest / top).unlink()
+        (dest / top).mkdir()
+        with pytest.raises(FileExistsError):
+            destination.remove_preview(top)
+
+    assert after_deep == ['A', 'A/beside.jpg.preview.jpg', 'top.jpg.preview.jpg']
+    assert emptied == []
+    assert (dest / top).is_dir()
+
+
 def test_a_probe_error_in_the_separate_partial_folder_names_that_folder(disk, dest, partial_root, monkeypatch):
     folder = _separate_folder(dest, partial_root)
     ftruncate = os.ftruncate
