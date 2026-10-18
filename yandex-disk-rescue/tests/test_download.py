@@ -1262,6 +1262,91 @@ def test_a_link_refused_for_one_file_fails_only_that_file(disk, dest, status, re
     assert not (dest / 'Docs' / 'readme.txt').exists()
 
 
+LINK_500 = 'Yandex Disk API returned HTTP 500: Injected HTTP 500 (after 2 attempts)'
+
+
+def _account_checks(fake) -> int:
+    return sum(1 for r in fake.requests if r.path == '/v1/disk/')
+
+
+def test_a_link_request_failing_for_one_file_defers_only_that_file_and_retry_failed_covers_it(disk, dest):
+    readme = 'disk:/Docs/readme.txt'
+    disk.inject('GET', '/v1/disk/resources/download', *[500] * 4, where={'path': readme})
+
+    result = run_download('--api-retries', '1', '--download-passes', '2', str(dest))
+
+    assert result.exit_code == 1, result.output
+    assert '5 downloaded' in result.stdout
+    assert 'Passes: 2 of 2\n' in result.stdout
+    assert f'Failed: 1\n  {readme}: {LINK_500} (after 2 passes)\n' in result.stdout
+    assert _failure_records() == [(readme, f'{LINK_500} (after 2 passes)', 2)]
+    linked = _linked(disk)
+    turns = [index for index, path in enumerate(linked) if path == readme]
+    assert len(turns) == 4
+    assert linked[turns[1] + 1] != readme
+    assert turns[2] == turns[1] + 2
+    assert linked[turns[3] + 1 :] == [linked[turns[3] + 1]]
+    assert linked[-1] != readme
+    assert _account_checks(disk) == 1
+
+    again = run_download('--retry-failed', str(dest))
+
+    assert again.exit_code == 0, again.output
+    assert '1 downloaded' in again.stdout
+    assert _failure_records() == []
+    assert local_file(dest, readme).read_bytes() == FILES[readme]
+
+
+def _assert_stopped_by_an_outage(result) -> None:
+    assert result.exit_code == 1, result.output
+    error = stderr_lines(result.stderr)[-1]
+    assert error.startswith('Error: Could not download disk:/'), error
+    assert error.endswith('(after 2 attempts)'), error
+    assert 'Mirrored' not in result.stdout
+
+
+def test_a_link_endpoint_outage_stops_a_run_over_a_mirror_with_verified_files(disk, dest):
+    assert run_download(str(dest)).exit_code == 0
+    local_file(dest, 'disk:/Docs/readme.txt').unlink()
+    local_file(dest, 'disk:/Photos/2024/b.jpg').unlink()
+    disk.inject('GET', '/v1/disk/resources/download', *[500] * 50)
+    accounts = _account_checks(disk)
+
+    result = run_download('--api-retries', '1', str(dest))
+
+    _assert_stopped_by_an_outage(result)
+    assert _account_checks(disk) == accounts + 1
+    assert _failure_records() == []
+
+
+def test_a_disk_api_outage_during_the_first_run_stops_it(disk, dest):
+    disk.inject('GET', '/v1/disk/resources/download', *[500] * 50)
+    disk.inject('GET', '/v1/disk/', Delay(0), *[500] * 50)
+
+    result = run_download('--api-retries', '1', str(dest))
+
+    _assert_stopped_by_an_outage(result)
+    assert _failure_records() == []
+
+
+def test_a_fresh_mirror_whose_links_all_fail_stops_after_ten_files(disk, dest):
+    for index in range(12):
+        disk.add_file(f'disk:/Many/{index:02}.txt', b'many', modified=MODIFIED)
+    disk.inject('GET', '/v1/disk/resources/download', *[500] * 50)
+
+    result = run_download('--api-retries', '0', 'disk:/Many', str(dest))
+
+    assert result.exit_code == 1, result.output
+    error = stderr_lines(result.stderr)[-1]
+    assert error.startswith('Error: Could not download disk:/Many/'), error
+    assert error.endswith(
+        'Yandex Disk API returned HTTP 500: Injected HTTP 500 '
+        '(no file of this mirror got a download link: 10 failed the same way)'
+    ), error
+    assert 'Mirrored' not in result.stdout
+    assert _account_checks(disk) <= 1 + mirroring.UNREFERENCED_FAILURES
+
+
 def test_a_token_rejected_on_a_link_request_stops_the_run(disk, dest):
     disk.inject('GET', '/v1/disk/resources/download', 401)
 
@@ -2130,6 +2215,23 @@ def test_a_throttled_turn_of_an_unavailable_file_defers_it_to_the_next_pass(dead
     assert failure_record(DEAD_PATH) == (reason, 10, 9, aged)
 
 
+def test_a_link_failure_of_an_unavailable_file_defers_it_and_leaves_its_streak(dead, dest):
+    assert _unavailable_run(dead, dest)[0].exit_code == 1
+    *_, aged = failure_record(DEAD_PATH)
+    dead.inject('GET', '/v1/disk/resources/download', 500, 500, where={'path': DEAD_PATH})
+    dead.inject('GET', '/download', 503, where={'path': DEAD_PATH})
+    earlier = len(dead.requests)
+
+    result = run_download('--api-retries', '1', '--download-passes', '7', str(dest))
+
+    assert result.exit_code == 1
+    assert len(_fetches(dead, DEAD_PATH, earlier)) == 1
+    assert 'Passes: 2 of 7\n' in result.stdout
+    reason = f'{NEVER_STARTED} 9 attempts {_since(aged)} (the last: {SERVICE_UNAVAILABLE})'
+    assert f'Failed: 1\n  {DEAD_PATH}: {reason}\n' in result.stdout
+    assert failure_record(DEAD_PATH) == (reason, 10, 9, aged)
+
+
 def test_retry_failed_still_gives_an_unavailable_file_every_pass(dead, dest):
     assert _unavailable_run(dead, dest)[0].exit_code == 1
     *_, aged = failure_record(DEAD_PATH)
@@ -2249,6 +2351,16 @@ def test_a_failed_photo_gets_its_preview_saved_apart_and_the_summary_says_so(pho
     assert document['preview_only'] == [{'path': DEAD_PATH, 'preview': PREVIEW_FILE, 'bytes': len(PHOTO_PREVIEW)}]
     assert document['preview_errors'] == []
     assert document['failed'] == [{'path': DEAD_PATH, 'reason': SERVICE_UNAVAILABLE, 'unavailable': False}]
+
+
+def test_a_file_whose_link_request_keeps_failing_gets_its_preview(photo, dest):
+    photo.inject('GET', '/v1/disk/resources/download', *[500] * 10, where={'path': DEAD_PATH})
+
+    result = run_download('--api-retries', '1', '--download-passes', '1', str(dest))
+
+    assert result.exit_code == 1
+    assert f'Failed: 1\n  {DEAD_PATH}: {LINK_500}\n{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n' in result.stdout
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
 
 
 def test_a_failed_file_without_a_preview_ends_failed_with_no_preview_and_no_error(disk, dest):
@@ -2670,11 +2782,11 @@ def test_an_interrupted_or_stopped_transfer_phase_fetches_no_previews(photo, des
             child.communicate()
         assert child.returncode == 130, stderr
     else:
-        other = 'disk:/Docs/readme.txt'
-        photo.inject('GET', '/v1/disk/resources/download', *[500] * 10, where={'path': other})
+        photo.inject('GET', '/v1/disk/resources/download', *[500] * 50)
+        photo.inject('GET', '/v1/disk/', Delay(0), *[500] * 50)
         result = run_download('--api-retries', '1', '--download-passes', '1', str(dest))
         assert result.exit_code == 1
-        assert stderr_lines(result.stderr)[-1].startswith(f'Error: Could not download {other}: ')
+        assert stderr_lines(result.stderr)[-1].startswith('Error: Could not download disk:/')
 
     assert _preview_requests(photo) == []
     assert not _previews_folder(dest).exists()
@@ -4763,6 +4875,25 @@ def test_a_stalled_segment_alone_is_fetched_again_in_the_next_pass(segmented, de
     assert fetches[4:] == [SEGMENT_RANGES[2]]
     assert _linked(segmented) == [SEGMENTED_PATH] * 2
     assert (dest / 'large.bin').read_bytes() == SEGMENTED
+
+
+def test_a_segmented_file_whose_link_refresh_keeps_failing_waits_for_the_next_pass(segmented, dest):
+    for segment in SEGMENT_RANGES:
+        segmented.inject('GET', '/download', 410, where={'path': SEGMENTED_PATH}, where_headers={'range': segment})
+    segmented.inject('GET', '/v1/disk/resources/download', Delay(0), 500, 500, where={'path': SEGMENTED_PATH})
+
+    result = run_download('--api-retries', '1', *SEGMENTED_ARGS, 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'Passes: 2 of 7\n' in result.stdout
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+    fetches = [i for i, r in enumerate(segmented.requests) if r.path == '/download']
+    assert len(fetches) == 8
+    assert _linked(segmented) == [SEGMENTED_PATH] * 4
+    links = [i for i, r in enumerate(segmented.requests) if r.path == '/v1/disk/resources/download']
+    # The first link, its 4 rejected fetches, 2 attempts at a refresh, then the link and the fetches of pass 2.
+    assert links[0] < fetches[0] and fetches[3] < links[1] < links[2] < links[3] < fetches[4]
+    assert _account_checks(segmented) == 2
 
 
 def test_a_segment_failing_for_good_fails_the_file_and_its_other_segments_keep_their_checkpoints(segmented, dest):

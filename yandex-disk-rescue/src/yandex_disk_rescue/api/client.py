@@ -274,7 +274,7 @@ class DiskClient:
                 raise
             attempts = exc.last_attempt.attempt_number
             message = failure.message if attempts == 1 else f'{failure.message} (after {attempts} attempts)'
-            raise DiskApiError(_in_context(message, context)) from None
+            raise DiskApiError(message, context=context) from None
 
     async def _attempt(self, api_path: str, params: dict[str, str | int]) -> httpx.Response:
         async with self._limiter.slot():
@@ -344,7 +344,7 @@ class DiskClient:
                 "permissions. Run 'yandex-disk-rescue auth login' to store a token with Disk access."
             )
         if not response.is_success:
-            raise DiskApiError(_in_context(_status_failure(response), context))
+            raise DiskApiError(_status_failure(response), context=context)
 
 
 def _is_throttling(status: int) -> bool:
@@ -415,8 +415,4 @@ def _error_description(response: httpx.Response) -> str:
 
 def _unexpected_response(api_path: str, reason: str, *, context: str | None) -> DiskApiError:
     message = f'Yandex Disk API returned an unexpected response to GET {api_path}: {reason}.'
-    return DiskApiError(_in_context(message, context))
-
-
-def _in_context(message: str, context: str | None) -> str:
-    return f'{context}: {message}' if context else message
+    return DiskApiError(message, context=context)
