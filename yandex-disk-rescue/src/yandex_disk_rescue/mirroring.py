@@ -1327,17 +1327,19 @@ async def _copy_to_destination(
         progress.state('copying')
         started = time.monotonic()
         with destination.copy_target(entry.entry_id) as target:
-            await _feed(digest.update, _copied(partial.chunks(0, identity.size), target), threads, 0)
+            await _feed(digest.update, _copied(partial.chunks(0, identity.size), target, progress), threads, 0)
             await threads.run(target.finish, _mtime_ns(identity.modified))
         _log.debug('%s copied to %s in %.1f s', path, destination.path, time.monotonic() - started)
     return digest
 
 
-def _copied(chunks: Iterator[bytes], target: PartialFile) -> Iterator[bytes]:
-    """`chunks`, the bytes from offset 0 on, each written to `target` at its offset before it is passed on."""
+def _copied(chunks: Iterator[bytes], target: PartialFile, progress: ActiveFile) -> Iterator[bytes]:
+    """`chunks`, the bytes from offset 0 on, each written to `target` at its offset and counted in `progress` before
+    it is passed on."""
     offset = 0
     for chunk in chunks:
         target.write(offset, chunk)
+        progress.copied(len(chunk))
         yield chunk
         offset += len(chunk)
 

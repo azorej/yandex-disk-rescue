@@ -1,7 +1,8 @@
 """The handlers of the `yandex_disk_rescue` logger: the rotating log file and the notices on stderr.
 
-Every line either handler writes starts with a UTC timestamp; a multi-line message (a summary, a traceback) is
-written as one prefixed line per line, so each line of the log file says when and which run wrote it.
+Every line of the log file, and every notice on a stderr that is not a terminal, starts with a UTC timestamp; a
+multi-line message (a summary, a traceback) is written as one prefixed line per line, so each line of the log file
+says when and which run wrote it.
 """
 
 import contextlib
@@ -10,7 +11,8 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -103,31 +105,54 @@ class LogFile(logging.Handler):
 
 
 class Notices(logging.Handler):
-    """The notices on stderr: `<UTC timestamp> <message>`, with no level name, written and flushed one record at a
-    time. Records logged with `extra={CONSOLE: False}` are left to the log file."""
+    """The notices on stderr: `<UTC timestamp> <message>`, or the message alone when not `timestamped`, with no level
+    name, written one record at a time through `write_stderr`. Records logged with `extra={CONSOLE: False}` are left
+    to the log file."""
 
-    def __init__(self, level: int) -> None:
+    def __init__(self, level: int, *, timestamped: bool) -> None:
         super().__init__(level)
-        self.setFormatter(_PrefixedFormatter(lambda r: f'{timestamp(r.created)} '))
+        self.setFormatter(_PrefixedFormatter(lambda r: f'{timestamp(r.created)} ' if timestamped else ''))
         self.addFilter(lambda record: getattr(record, CONSOLE, True))
 
     def emit(self, record: logging.LogRecord) -> None:
         write_stderr(self.format(record))
 
 
-_stderr_lock = threading.Lock()
+class _Stderr:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.writer: Callable[[str], None] | None = None
 
 
-def notice(text: str) -> None:
-    """Write `text` to stderr as a notice: `<UTC timestamp> <text>`."""
-    write_stderr(f'{timestamp(time.time())} {text}')
+_stderr = _Stderr()
+
+
+def notice(text: str, *, timestamped: bool) -> None:
+    """Write `text` to stderr as a notice: `<UTC timestamp> <text>`, or `text` alone when not `timestamped`."""
+    write_stderr(f'{timestamp(time.time())} {text}' if timestamped else text)
 
 
 def write_stderr(text: str) -> None:
-    """Write `text` and a newline to the current `sys.stderr` and flush it, one caller at a time."""
-    with _stderr_lock:
+    """Write `text` and a newline to stderr, one caller at a time: through the writer `stderr_through` installed, or
+    else to the current `sys.stderr`, flushed."""
+    with _stderr.lock:
+        if _stderr.writer is not None:
+            _stderr.writer(text)
+            return
         sys.stderr.write(f'{text}\n')
         sys.stderr.flush()
+
+
+@contextmanager
+def stderr_through(writer: Callable[[str], None]) -> Iterator[None]:
+    """Send every line `write_stderr` gets to `writer(text)` while the context runs."""
+    with _stderr.lock:
+        _stderr.writer = writer
+    try:
+        yield
+    finally:
+        with _stderr.lock:
+            _stderr.writer = None
 
 
 def _open_log(path: Path) -> int:

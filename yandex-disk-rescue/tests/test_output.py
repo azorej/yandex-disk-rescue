@@ -2,10 +2,17 @@
 lines on stderr, the verbosity and progress flags and the log file in the XDG state directory."""
 
 import errno
+import fcntl
 import os
+import pty
 import re
+import signal
 import stat
+import struct
 import subprocess
+import termios
+import threading
+import time
 
 import pytest
 from fake_disk_server import Delay, FakeResponse
@@ -17,6 +24,7 @@ from mirror_tree import (
     log_messages,
     run_download,
     runner,
+    slow_reads,
     status_lines,
     stderr_lines,
 )
@@ -402,3 +410,152 @@ def test_no_progress_and_quiet_leave_the_status_lines_to_the_log_file(disk, dest
     assert result.stderr == ''
     status = [m for m in log_messages() if re.match(r'Scanned disk:/: .* listed in |Downloaded: ', m)]
     assert [m.partition(' ')[0] for m in status] == ['Scanned', 'Downloaded:']
+
+
+class _Terminal:
+    """`yandex-disk-rescue <args>` in a child process with stderr on a 100 x 40 pseudo-terminal, `TERM` set to `term`,
+    stdout a pipe (or the terminal too when `report_on_terminal`) and this process's environment plus `env`. A thread
+    drains the terminal while the child runs."""
+
+    def __init__(self, *args: str, term: str = 'xterm-256color', report_on_terminal: bool = False, **env: str) -> None:
+        master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 100, 0, 0))
+        self._master = master
+        self._received = bytearray()
+        self._lock = threading.Lock()
+        self._failure: OSError | None = None
+        self.child = subprocess.Popen(
+            ['yandex-disk-rescue', *args],
+            stdin=subprocess.DEVNULL,
+            stdout=slave if report_on_terminal else subprocess.PIPE,
+            stderr=slave,
+            env={**os.environ, 'TERM': term, 'COLUMNS': '100', 'LINES': '40', **env},
+        )
+        os.close(slave)
+        self._reader = threading.Thread(target=self._drain, daemon=True)
+        self._reader.start()
+
+    def _drain(self) -> None:
+        while True:
+            try:
+                data = os.read(self._master, 65536)
+            except OSError as exc:
+                # The terminal reports EIO once the child, its only writer, has exited.
+                if exc.errno != errno.EIO:
+                    self._failure = exc
+                return
+            if not data:
+                return
+            with self._lock:
+                self._received += data
+
+    def wait_for(self, text: bytes, timeout: float = 30) -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if text in self._received:
+                    return
+            time.sleep(0.05)
+        raise AssertionError(f'{text!r} never reached the terminal: {bytes(self._received)!r}')
+
+    def finish(self) -> tuple[int, str, bytes]:
+        """Wait for the child to exit: its exit code, its stdout and everything it wrote to the terminal."""
+        stdout, _ = self.child.communicate(timeout=120)
+        self._reader.join(timeout=10)
+        os.close(self._master)
+        if self._failure is not None:
+            raise self._failure
+        return self.child.returncode, (stdout or b'').decode(), bytes(self._received)
+
+
+ERASE_LINE = b'\x1b[2K'
+BAR = '━'.encode()
+
+
+def _after_the_view(terminal: bytes) -> str:
+    """What the terminal shows after the last line erased when the live view was cleared, newlines as written."""
+    return terminal.rpartition(ERASE_LINE)[2].decode().replace('\r\n', '\n')
+
+
+def test_a_terminal_shows_a_live_view_cleared_at_the_end_with_notices_above_it_literally(slow, tmp_path):
+    marked = 'disk:/[red]x[/red].txt'
+    slow.add_file(marked, b'marked', modified=MODIFIED)
+    slow.inject('GET', '/v1/disk/resources/download', 404, where={'path': marked})
+
+    terminal = _Terminal('download', str(tmp_path / 'dest'), XDG_STATE_HOME=str(tmp_path / 'state'))
+    terminal.wait_for(b'Photos/2024/a.jpg')
+    code, stdout, shown = terminal.finish()
+    slow.chunk_delay = 0
+    slow.inject('GET', '/v1/disk/resources/download', 404, where={'path': marked})
+    piped = _child('download', str(tmp_path / 'other'), XDG_STATE_HOME=str(tmp_path / 'elsewhere'))
+
+    assert code == piped.returncode == 1, shown
+    assert b'\x1b[?25l' in shown
+    assert re.search(rb'Downloading: \d of 7 files, ', shown)
+    assert BAR in shown
+    assert re.search(rb'\n  disk:/Photos/2024/a\.jpg +\d+\.\d KiB of 384\.0 KiB \(\d+\.\d%\)  [\d.]+ KiB/s\r', shown)
+    assert f'{marked} failed: removed from the Disk after the scan\r\n'.encode() in shown
+    assert not re.search(rb'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ', shown)
+    assert _after_the_view(shown) == 'Error: 1 failed; see the list above.\n'
+    logged = log_messages(tmp_path / 'state' / 'yandex-disk-rescue' / 'yandex-disk-rescue.log')
+    assert any(message.startswith('Downloaded: 7 of 7 files, ') for message in logged)
+    assert stdout.replace(str(tmp_path / 'state'), '<state>').replace(str(tmp_path / 'dest'), '<dest>') == (
+        piped.stdout.replace(str(tmp_path / 'elsewhere'), '<state>').replace(str(tmp_path / 'other'), '<dest>')
+    )
+
+
+def test_a_dumb_terminal_gets_status_lines_instead_of_the_live_view(slow, dest):
+    code, stdout, shown = _Terminal('download', '--progress-interval', '1', str(dest), term='dumb').finish()
+
+    assert code == 0, shown
+    assert b'\x1b' not in shown
+    lines = status_lines(shown.decode().replace('\r\n', '\n'))
+    assert any(line.startswith('Downloading: ') for line in lines)
+    assert lines[-1].startswith('Downloaded: 6 of 6 files, ')
+    assert stdout.startswith('Scanned disk:/: 6 files')
+
+
+def test_a_stalled_transfer_shows_on_the_terminal_and_ctrl_c_clears_the_view_and_ends_the_run(disk, dest):
+    disk.inject('GET', '/download', Delay(30), where={'path': 'disk:/Docs/readme.txt'})
+
+    terminal = _Terminal('download', '--download-timeout', '60', str(dest))
+    terminal.wait_for(b'  no data for 6 s')
+    terminal.child.send_signal(signal.SIGINT)
+    code, _, shown = terminal.finish()
+
+    assert code == 130, shown
+    assert re.search(rb'\n  disk:/Docs/readme\.txt +0 B of 7 B \(0\.0%\)  no data for 6 s\r\n', shown)
+    assert b'; 1 active, 1 without data; ' in shown.replace(b'\r\n', b'')
+    assert shown.rpartition(b'\x1b[?25l')[2].count(b'\x1b[?25h') == 1
+    assert _after_the_view(shown) == 'Interrupted; rerun to continue the download.\n'
+    assert log_messages()[-1] == 'download interrupted (exit 130)'
+
+
+def test_verify_on_a_terminal_shows_the_file_being_read(disk, dest, tmp_path, monkeypatch):
+    for index in range(30):
+        disk.add_file(f'disk:/Many/{index:02}.bin', bytes(1024), modified=MODIFIED)
+    assert run_download(str(dest)).exit_code == 0
+    slow_reads(tmp_path, monkeypatch)
+
+    terminal = _Terminal('verify', str(dest))
+    terminal.wait_for(b'  reading')
+    code, _, shown = terminal.finish()
+
+    assert code == 0, shown
+    assert re.search(rb'Verifying: \d+ of 36 files, ', shown)
+    assert re.search(rb'\n  disk:/\S+ +\d+ B of [\d.]+ (?:B|KiB) \(\d+\.\d%\)  reading\r', shown)
+    assert _after_the_view(shown) == ''
+
+
+def test_a_report_line_written_during_a_phase_goes_on_the_terminal_while_the_view_is_down(slow, dest, tmp_path):
+    partials = tmp_path / 'partials'
+    partials.mkdir()
+    terminal = _Terminal('download', '--partial-dir', str(partials), str(dest), report_on_terminal=True)
+    code, _, shown = terminal.finish()
+
+    assert code == 0, shown
+    [folder] = partials.iterdir()
+    headline = re.escape(f'Partial files in {folder} ('.encode())
+    # The view erases its lines, the line is written where they began, and the view is drawn again below it.
+    assert re.search(rb'\x1b\[2K' + headline + rb'[^\x1b]*\r\n\x1b\[\?25l', shown), shown
+    assert _after_the_view(shown).startswith('Mirrored disk:/ to ')

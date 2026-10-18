@@ -26,6 +26,7 @@ from mirror_tree import (
     replaced_runs,
     run_download,
     runner,
+    slow_reads,
     start_command,
     status_lines,
     stderr_lines,
@@ -566,33 +567,10 @@ def _after(through: str) -> list[str]:
     return [path for path in MANY if path > through]
 
 
-# Installed as `sitecustomize` in a verify subprocess: every `pread` sleeps 50 ms first, and leaves a marker named
-# after the inode it reads in the folder `READ_GATE`.
-_SLOW_READS = """
-import os, pathlib, time
-
-_gate, _pread = pathlib.Path(os.environ['READ_GATE']), os.pread
-
-
-def pread(fd, size, offset):
-    (_gate / str(os.fstat(fd).st_ino)).touch()
-    time.sleep(0.05)
-    return _pread(fd, size, offset)
-
-
-os.pread = pread
-"""
-
-
 def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_uninterrupted_verify_does(
     many, dest, tmp_path, monkeypatch
 ):
-    site, gate = tmp_path / 'site', tmp_path / 'gate'
-    site.mkdir()
-    gate.mkdir()
-    (site / 'sitecustomize.py').write_text(_SLOW_READS)
-    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
-    monkeypatch.setenv('READ_GATE', str(gate))
+    gate = slow_reads(tmp_path, monkeypatch)
     child = start_command('verify', '--progress-interval', '1', str(dest))
     try:
         # Each file takes two reads, so 20 files take 2 s at least, the time of one status line and more.

@@ -1,28 +1,34 @@
 """The output of the `scan`, `download` and `verify` commands: the report on stdout, the notices and status lines on
 stderr, and the log file every run writes.
 
-stdout carries the report only, whatever the verbosity. stderr carries the status lines of each slow phase (none with
+stdout carries the report only, whatever the verbosity. stderr carries the progress of each slow phase (none with
 `--no-progress` or `--quiet`), the notices (WARNING records; INFO too with `--verbose`; none with `--quiet`) and the
 final `Error: …` or `Interrupted; …` line. The log file gets every INFO record (DEBUG too with `--verbose`) and every
 status line whatever the console flags, and a start and an end record per run.
+
+On a terminal (stderr is one, and `TERM` is set and neither `dumb` nor `unknown`) the progress is a live view, and
+notices have no timestamp. Anywhere else it is a timestamped status line every `progress_interval` seconds, and so is
+each notice; nothing written then holds a control character, whatever the environment says about colours.
 """
 
 import dataclasses
 import logging
 import os
+import sys
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, TextIO
 
 import typer
 
 from yandex_disk_rescue import __version__, paths
 from yandex_disk_rescue.errors import RescueError
-from yandex_disk_rescue.logs import CONSOLE, LOGGER_NAME, LogFile, Notices, notice
+from yandex_disk_rescue.logs import CONSOLE, LOGGER_NAME, LogFile, Notices, notice, stderr_through
 from yandex_disk_rescue.progress import ProgressState
+from yandex_disk_rescue.view import LiveView
 
 type Verbosity = Literal['quiet', 'normal', 'verbose']
 
@@ -42,7 +48,9 @@ Quiet = Annotated[
 NoProgress = Annotated[
     bool,
     typer.Option(
-        '--no-progress', help='Write no status lines to stderr; the log file still gets them, and notices still show.'
+        '--no-progress',
+        help='Show no live view and write no status lines to stderr; the log file still gets them, and notices still '
+        'show.',
     ),
 ]
 
@@ -73,19 +81,32 @@ def output_options(*, verbose: bool, quiet: bool, no_progress: bool, progress_in
     return OutputOptions(verbosity=verbosity, progress=not no_progress, progress_interval=progress_interval)
 
 
-class Output:
-    """The running command's output: `line` writes one report line to stdout, and `progress` reports a slow phase."""
+def is_terminal(stream: TextIO) -> bool:
+    """Whether `stream` is a terminal that takes cursor movement: a tty, and `TERM` set and neither `dumb` nor
+    `unknown`."""
+    return stream.isatty() and os.environ.get('TERM', 'dumb') not in {'dumb', 'unknown'}
 
-    def __init__(self, log_file: LogFile, options: OutputOptions) -> None:
+
+class Output:
+    """The running command's output: `line` writes one report line to stdout, and `progress` reports a slow phase,
+    with a live view when `terminal`."""
+
+    def __init__(self, log_file: LogFile, options: OutputOptions, *, terminal: bool) -> None:
         self._log_file = log_file
         self._options = options
+        self._terminal = terminal
+        self._view: LiveView | None = None
 
     @property
     def log_path(self) -> Path:
         return self._log_file.path
 
     def line(self, text: str) -> None:
-        typer.echo(text)
+        """Write the report line `text` to stdout, above the live view when one is shown."""
+        if self._view is None:
+            typer.echo(text)
+        else:
+            self._view.above(lambda: typer.echo(text))
 
     def headline(self, text: str) -> None:
         """Write a report line saying what the run is about to do, and log it to the log file."""
@@ -102,10 +123,13 @@ class Output:
     @contextmanager
     def progress(self, state: ProgressState) -> Iterator[None]:
         """Report the phase `state` follows while the context runs: every `progress_interval` seconds its status line
-        goes to the log file and, unless `--no-progress` or `--quiet` was given, to stderr as a notice; when the
-        context exits, on every path, the phase's last line goes out the same way. Nothing is written for a phase that
-        has not started. No line is written once the context has exited."""
-        to_stderr = self._options.progress and self._options.verbosity != 'quiet'
+        goes to the log file; when the context exits, on every path, the phase's last line goes there too. Unless
+        `--no-progress` or `--quiet` was given, stderr shows the phase too: on a terminal as a live view, cleared on
+        every exit, with every notice and report line printed above it; anywhere else each status line goes to stderr
+        as a notice. Nothing is written for a phase that has not started. No line is written once the context has
+        exited."""
+        shown = self._options.progress and self._options.verbosity != 'quiet'
+        to_stderr = shown and not self._terminal
 
         def emit(*, final: bool) -> None:
             line = state.snapshot().status_line(final=final)
@@ -113,7 +137,7 @@ class Output:
                 return
             _log.info('%s', line, extra=FILE_ONLY)
             if to_stderr:
-                notice(line)
+                notice(line, timestamped=True)
 
         stop = threading.Event()
 
@@ -124,11 +148,24 @@ class Output:
         ticker = threading.Thread(target=tick, name='progress', daemon=True)
         ticker.start()
         try:
-            yield
+            if shown and self._terminal:
+                with self._live_view(state):
+                    yield
+            else:
+                yield
         finally:
             stop.set()
             ticker.join()
             emit(final=True)
+
+    @contextmanager
+    def _live_view(self, state: ProgressState) -> Iterator[None]:
+        with LiveView(state) as view, stderr_through(view.notice):
+            self._view = view
+            try:
+                yield
+            finally:
+                self._view = None
 
     def footer(self, manifest: Path) -> None:
         """The last lines of the report: the manifest's path, then the log's (with why it is incomplete, if it is)."""
@@ -146,9 +183,13 @@ def command_output(command: str, options: OutputOptions, *, details: Mapping[str
     Raises `LogFileError` when the log file cannot be opened; nothing is logged then.
     """
     path = paths.log_path()
+    terminal = is_terminal(sys.stderr)
 
     def log_failed(reason: str) -> None:
-        notice(f'Warning: could not write the log file {path}: {reason}; logging to it is off for this run.')
+        notice(
+            f'Warning: could not write the log file {path}: {reason}; logging to it is off for this run.',
+            timestamped=not terminal,
+        )
 
     try:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -157,8 +198,9 @@ def command_output(command: str, options: OutputOptions, *, details: Mapping[str
         raise LogFileError(path, exc.strerror or str(exc)) from None
     handlers: list[logging.Handler] = [log_file]
     if options.verbosity != 'quiet':
-        handlers.append(Notices(logging.INFO if options.verbosity == 'verbose' else logging.WARNING))
-    level = _log.level
+        level = logging.INFO if options.verbosity == 'verbose' else logging.WARNING
+        handlers.append(Notices(level, timestamped=not terminal))
+    previous = _log.level
     _log.setLevel(logging.DEBUG if options.verbosity == 'verbose' else logging.INFO)
     for handler in handlers:
         _log.addHandler(handler)
@@ -166,7 +208,7 @@ def command_output(command: str, options: OutputOptions, *, details: Mapping[str
         arguments = ', '.join(f'{name}={value}' for name, value in {**details, **dataclasses.asdict(options)}.items())
         _log.info('%s started: version %s, pid %d; %s', command, __version__, os.getpid(), arguments, extra=FILE_ONLY)
         try:
-            yield Output(log_file, options)
+            yield Output(log_file, options, terminal=terminal)
         except BaseException as exc:
             _log_end(command, exc)
             raise
@@ -175,7 +217,7 @@ def command_output(command: str, options: OutputOptions, *, details: Mapping[str
         for handler in handlers:
             _log.removeHandler(handler)
             handler.close()
-        _log.setLevel(level)
+        _log.setLevel(previous)
 
 
 def _log_end(command: str, exc: BaseException) -> None:

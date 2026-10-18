@@ -19,6 +19,7 @@ from yandex_disk_rescue.units import format_duration, format_size
 # as without data.
 STALL_SECONDS = 5.0
 SPEED_SECONDS = 60.0
+TRANSFER_SPEED_SECONDS = 10.0
 ETA_SECONDS = 15 * 60.0
 _SAMPLE_SECONDS = 1.0
 
@@ -232,14 +233,17 @@ class MoveProgress:
 
 @dataclass(frozen=True)
 class ActiveTransfer:
-    """A file in progress: its `held` bytes of `size`, its state, and `idle`, the seconds since it last received
-    bytes or got its connection (`None` while it has no connection)."""
+    """A file in progress: its `held` bytes of `size`, its state, `idle`, the seconds since it last received bytes or
+    got its connection (`None` while it has no connection), `speed`, the bytes a second its connection received over
+    the last `TRANSFER_SPEED_SECONDS`, and `copied`, the bytes of its copy to the destination written so far."""
 
     path: str
     size: int
     held: int
     state: TransferState
     idle: float | None
+    speed: float
+    copied: int
 
     @property
     def without_data(self) -> bool:
@@ -301,6 +305,9 @@ class _Active:
     held: int
     state: TransferState
     connected: float | None
+    rate: _Rate
+    received: int = 0
+    copied: int = 0
 
 
 class MirrorProgress:
@@ -362,7 +369,7 @@ class MirrorProgress:
         count again."""
         with self._lock:
             self._retry.pop(key, None)
-            self._active[key] = _Active(path, size, 0, 'waiting for a connection', None)
+            self._active[key] = _Active(path, size, 0, 'waiting for a connection', None, _Rate(time.monotonic()))
         return ActiveFile(self, key, path)
 
     def defer(self, key: int) -> None:
@@ -384,7 +391,13 @@ class MirrorProgress:
             now = time.monotonic()
             active = tuple(
                 ActiveTransfer(
-                    a.path, a.size, a.held, a.state, None if a.connected is None else max(now - a.connected, 0.0)
+                    path=a.path,
+                    size=a.size,
+                    held=a.held,
+                    state=a.state,
+                    idle=None if a.connected is None else max(now - a.connected, 0.0),
+                    speed=a.rate.per_second(now, a.received, TRANSFER_SPEED_SECONDS),
+                    copied=a.copied,
                 )
                 for a in self._active.values()
             )
@@ -407,16 +420,23 @@ class MirrorProgress:
                 speeds=Speeds.of(self._rate, now, self._started, self._received),
             )
 
-    def _update(self, key: int, *, state: TransferState | None = None, held: int = 0, received: int = 0) -> None:
+    def _update(
+        self, key: int, *, state: TransferState | None = None, held: int = 0, received: int = 0, copied: int = 0
+    ) -> None:
         with self._lock:
             active = self._active[key]
             now = time.monotonic()
             if state is not None and state != active.state:
                 active.state = state
                 active.connected = now if state == 'downloading' else None
+                if state == 'downloading':
+                    active.received, active.rate = 0, _Rate(now)
             active.held += held
+            active.copied += copied
             if received:
                 active.connected = now
+                active.received += received
+                active.rate.note(now, active.received)
                 self._received += received
                 self._rate.note(now, self._received)
 
@@ -447,6 +467,10 @@ class ActiveFile:
     def cut(self) -> None:
         """The partial file was cut back to byte 0."""
         self._progress._cut(self._key)
+
+    def copied(self, size: int) -> None:
+        """`size` more bytes of the finished file were written to its copy in the destination."""
+        self._progress._update(self._key, copied=size)
 
 
 @dataclass(frozen=True)

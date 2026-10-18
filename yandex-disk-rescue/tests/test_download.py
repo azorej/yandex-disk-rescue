@@ -40,6 +40,7 @@ from mirror_tree import (
     wait_until,
 )
 from yandex_disk_rescue import api, localfs, mirroring
+from yandex_disk_rescue import destination as destination_module
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import Destination, PartialFile
@@ -1843,8 +1844,8 @@ def _killed(*args, **kwargs):
 
 
 def _killed_after_the_first_chunk(copied):
-    def copying(chunks, target):
-        yield next(copied(chunks, target))
+    def copying(chunks, target, progress):
+        yield next(copied(chunks, target, progress))
         raise KeyboardInterrupt
 
     return copying
@@ -2502,17 +2503,18 @@ def test_a_run_stopped_while_a_file_waits_for_room_ends_at_once_and_the_rerun_go
 @pytest.mark.parametrize(
     ('free', 'waiting'), [(4 * MiB, 'waiting for the copy'), (MiB + MiB // 2, 'waiting for room')], ids=['copy', 'room']
 )
-async def test_with_a_partial_folder_a_file_in_progress_shows_its_copy_to_dest_and_what_it_waits_for(
+async def test_with_a_partial_folder_a_file_in_progress_shows_how_far_its_copy_to_dest_got_and_what_it_waits_for(
     big, dest, partial_root, monkeypatch, free, waiting
 ):
     big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
     _free(monkeypatch, free)
+    monkeypatch.setattr(destination_module, '_READ_SIZE', MiB // 4)
     held, release = threading.Event(), threading.Event()
     copied = mirroring._copied
 
-    def held_after_the_first_chunk(chunks, target):
+    def held_after_the_first_chunk(chunks, target, file_progress):
         hold = not held.is_set()
-        for chunk in copied(chunks, target):
+        for chunk in copied(chunks, target, file_progress):
             yield chunk
             if hold:
                 held.set()
@@ -2529,9 +2531,12 @@ async def test_with_a_partial_folder_a_file_in_progress_shows_its_copy_to_dest_a
         task = asyncio.create_task(run())
         try:
             await _until(lambda: states() == ['copying', waiting], f'one file copying and the other {waiting}')
+            [copying] = [transfer for transfer in progress.snapshot().active if transfer.state == 'copying']
         finally:
             release.set()
         report = await task
+
+    assert 0 < copying.copied < copying.size == copying.held
 
     assert report.downloaded == 2
     assert (dest / 'big.bin').read_bytes() == BIG

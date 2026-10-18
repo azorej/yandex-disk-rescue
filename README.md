@@ -8,9 +8,10 @@ account to local storage. It is a headless analogue of the Windows app
 > (`yandex-disk-rescue auth`), scanning the remote tree into a local
 > manifest (`yandex-disk-rescue scan`) and verified, parallel, resumable
 > mirroring with segmented downloads of large files
-> (`yandex-disk-rescue download`) and an offline, resumable integrity check
-> of a mirror (`yandex-disk-rescue verify`) work. Further features are being built;
-> planned work is tracked in GitHub issues.
+> (`yandex-disk-rescue download`), an offline, resumable integrity check
+> of a mirror (`yandex-disk-rescue verify`), and their progress (a live view
+> on a terminal, status lines elsewhere) and log file work. Further features
+> are being built; planned work is tracked in GitHub issues.
 
 ## Goals
 
@@ -721,10 +722,49 @@ every file.
 - **stdout** carries the report: the start lines, the scan summary, the
   final summary, then the `Manifest:` and `Log:` lines. Nothing else is ever
   written there, so `> report.txt` keeps exactly the report.
-- **stderr** carries the status lines and the notices as they happen, then
+- **stderr** carries the progress and the notices as they happen, then
   the `Error: …` or `Interrupted; …` line a run ends with.
 
-**Status lines.** Each slow phase writes one status line every
+The progress is a live view when stderr is a terminal, and status lines
+anywhere else. stderr counts as a terminal when it is a tty and `TERM` is set
+and neither `dumb` nor `unknown`; `TERM=dumb` thus gives status lines on a
+terminal too. Where stdout goes plays no part: `download … > report.txt` on a
+terminal shows the live view, and the file gets the report alone.
+
+**The live view.** On a terminal each slow phase is drawn in place and
+redrawn twice a second:
+
+```
+Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without
+data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  disk:/Photos/2024/IMG_2041.jpg               2.1 MiB of 4.0 MiB (52.5%)  612.0 KiB/s
+  …/Videos/2019/Summer/holiday-full.mkv        1.1 GiB of 16.5 GiB (6.7%)  no data for 9 s
+  disk:/Docs/archive.zip                       320.0 MiB of 320.0 MiB (100.0%)  copying 41.2%
+  disk:/Music/live.flac                        0 B of 512.3 MiB (0.0%)  waiting for a connection
+  … and 10 more
+```
+
+- The first lines are the phase's status line (described below); then comes a
+  bar of its bytes (of the files checked, in `download`'s check), or a spinner
+  in front of the status line while a scan lists folders.
+- During the passes of `download`, up to 10 files in progress follow, each
+  with its path (shortened from the left to fit), the bytes its partial file
+  holds of its size, and its speed over the last 10 s or its state:
+  `waiting for room` (in the partial folder), `waiting for a connection`,
+  `no data for N s` (a connection with no data for 5 s or more),
+  `preallocating`, `hashing` (a local copy), `reading back` (a segmented
+  file), `waiting for the copy` (of another file to DEST) and `copying N%`
+  (to DEST, with `--partial-dir`). `… and N more` counts the rest.
+- In `verify`, the file being read follows the bar, with the bytes read of
+  its size.
+- Notices and report lines written while a phase runs are printed above the
+  view, literally: a name such as `[red]x[/red].txt` shows as it is.
+- The view is cleared when its phase ends, also when the run stops with an
+  error or Ctrl+C, and the cursor is shown again. What stays on the terminal
+  is the report, the notices and the result line.
+
+**Status lines.** Off a terminal, each slow phase writes one status line every
 `progress_interval` seconds (default 60; see
 [Configuration](#configuration)), then a last line when it ends, also when
 the run stops with an error or Ctrl+C. A multi-day run under `nohup` thus
@@ -764,12 +804,15 @@ writes one line a minute:
   `pass 2 of 7 starts in 4 s`.
 - The last line of a phase gives the time it took and the average speed.
 
-`--no-progress` writes no status lines to stderr; the notices stay. Use it
-under cron, where periodic lines are noise. The status lines never contain
-escape codes or carriage returns, whatever `FORCE_COLOR` or
-`TTY_COMPATIBLE` say.
+Every status line also goes to the log file, on a terminal too.
 
-A notice is one line, `<UTC time> <message>`:
+`--no-progress` shows no live view and writes no status lines to stderr; the
+notices stay. Use it under cron, where periodic lines are noise. Off a
+terminal, nothing the tool writes contains escape codes or carriage returns,
+whatever `FORCE_COLOR` or `TTY_COMPATIBLE` say.
+
+A notice is one line, `<UTC time> <message>` (on a terminal, the message
+alone):
 
 ```
 2026-10-17T09:31:02.417Z disk:/Photos/gone.jpg failed: removed from the Disk after the scan
@@ -792,8 +835,8 @@ summary lists them.
   start and commit of a scan, and each Disk API throttling response and
   retry. It also logs DEBUG records to the log file.
 - `-q` / `--quiet` leaves only the final `Error: …` or `Interrupted; …` line
-  on stderr (and the log-file warning described below): no status lines and
-  no notices.
+  on stderr (and the log-file warning described below): no live view, no
+  status lines and no notices.
 - Neither changes stdout, and giving both is a usage error (exit `2`).
 
 **The log file.** Every run of `scan`, `download` and `verify` appends to

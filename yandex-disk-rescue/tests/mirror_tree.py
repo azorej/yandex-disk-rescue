@@ -7,6 +7,7 @@ import re
 import subprocess
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -109,3 +110,33 @@ def stderr_lines(stderr: str) -> list[str]:
 def status_lines(stderr: str) -> list[str]:
     """The status lines of a command's stderr, without their timestamps."""
     return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines() if STATUS_LINE.match(line)]
+
+
+# Installed as `sitecustomize` in a child process: every `pread` sleeps 50 ms first, and leaves a marker named after
+# the inode it reads in the folder `READ_GATE`.
+_SLOW_READS = """
+import os, pathlib, time
+
+_gate, _pread = pathlib.Path(os.environ['READ_GATE']), os.pread
+
+
+def pread(fd, size, offset):
+    (_gate / str(os.fstat(fd).st_ino)).touch()
+    time.sleep(0.05)
+    return _pread(fd, size, offset)
+
+
+os.pread = pread
+"""
+
+
+def slow_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Make every `pread` of the child processes started from now on sleep 50 ms first and leave a marker named after
+    the inode it reads in the folder returned."""
+    site, gate = tmp_path / 'site', tmp_path / 'gate'
+    site.mkdir()
+    gate.mkdir()
+    (site / 'sitecustomize.py').write_text(_SLOW_READS)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
+    monkeypatch.setenv('READ_GATE', str(gate))
+    return gate

@@ -232,9 +232,9 @@ quarantined in this run (excluding the held files).
 
     | Level | Records |
     |---|---|
-    | WARNING | a file or folder failed in this run (path, reason); a file quarantined in this run (path, reason, copy); a `verify` finding made in this run, missing, modified or corrupt (path, kind, reason); a folder vanished during a scan; an entry left out for its name |
-    | INFO | a file downloaded (path, size, seconds, average speed, verified by); adopted; moved aside; renamed; deferred to a later pass (path, reason); a pass starting (number, limit, files, size, pause); scan started and committed (totals); a reused scan; a verify pass started or continued; a Disk API throttling response (status, the new interval, `Retry-After`); a Disk API retry (reason, attempt) |
-    | DEBUG | a skipped current file; a held quarantined file; a file `verify` lists as not downloaded or quarantined; a file found intact by `verify`; each transfer attempt and immediate retry; a link refresh; a resumed segment (bytes kept); the fallback to one stream; each checkpoint; each folder listed |
+    | WARNING | a file or folder failed in this run (path, reason); a file quarantined in this run (path, reason, copy); a `verify` finding made in this run, missing, modified or corrupt (path, kind, reason); a folder vanished during a scan; an entry left out for its name; a partial file not deleted once its file's outcome was recorded (path, partial file, reason) |
+    | INFO | a file downloaded (path, size, seconds, average speed, verified by); adopted; moved aside; renamed; deferred to a later pass (path, reason); a pass starting (number, limit, files, size, pause); scan started and committed (totals); a reused scan; a verify pass started or continued; a Disk API throttling response (status, the new interval, `Retry-After`); a Disk API retry (reason, attempt); the end of a move of partial files to a new partial folder (downloads, confirmed bytes, from, to, seconds) |
+    | DEBUG | a skipped current file; a held quarantined file; a file `verify` lists as not downloaded or quarantined; a file found intact by `verify`; each transfer attempt and immediate retry; a link refresh; a resumed segment (bytes kept); the fallback to one stream; each checkpoint; each folder listed; each partial file moved to a new partial folder (path, from, to, confirmed bytes); a file waiting for room in the partial folder (needed, available); a file waiting for its turn behind files that wait for room; a file waiting for the copy of another file to DEST; a file copied to DEST (seconds) |
 
 - **Behaviour to lock** (new `tests/test_output.py` for the cross-command contract; per-command details in the
   existing files):
@@ -356,9 +356,10 @@ quarantined in this run (excluding the held files).
     `Output.progress` renders the phase's snapshot with rich `Live` on a `Console(file=sys.stderr,
     force_terminal=True)`, twice a second.
     - **The view.** The status text; a bar for bytes (or a spinner for a scan); up to 10 active transfers, each with
-      its path (shortened from the left), held of size, percent, and its speed or state (`waiting for a connection`,
-      `no data for 9 s`, `preallocating`, `hashing`, `reading back`); then `… and N more`. `verify` shows the file
-      being read.
+      its path (shortened from the left), held of size, percent, and its speed over the last 10 s or its state
+      (`waiting for room`, `waiting for a connection`, `no data for 9 s`, `preallocating`, `hashing`, `reading back`,
+      `waiting for the copy`, `copying 41.2%`, the copy's progress counted in `mirroring._copied`); then
+      `… and N more`. `verify` shows the file being read.
     - **`redirect_stdout` and `redirect_stderr` are off.** Report lines are never printed while a view is live, and
       notices go through the live console, above the view, with markup and highlighting off. A name such as
       `[red]x[/red].txt` prints literally.
