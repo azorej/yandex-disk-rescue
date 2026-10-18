@@ -828,6 +828,14 @@ class Mirror:
             ).fetchone()
         return None if row is None else _mirror_entry(row, ())
 
+    def verified_paths(self, limit: int) -> list[str]:
+        """The remote paths of up to `limit` files with a verified record: this mirror's first, then those of the
+        account's other mirrors, each in path order, a file verified in several mirrors listed once."""
+        params = {'mirror': self.id, 'account': self.account_uid, 'limit': limit}
+        with self._manifest._errors('read'):
+            rows = self._manifest._connection.execute(_VERIFIED_PATHS_SQL, params).fetchall()
+        return [path for (path,) in rows]
+
     def record_quarantined(self, entry_id: int, identity: RemoteIdentity, copy: PurePosixPath, reason: str) -> None:
         """Record that the entry's download of `identity` failed verification for `reason` and was moved to `copy`,
         replacing any quarantine record; the entry's download record, with its segments, and its failure are
@@ -1065,6 +1073,11 @@ _CHECKPOINT_SQL = """
 _VERIFIED_OWNER_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
     WHERE d.state = 'verified' AND d.local_ino = :ino
+"""
+_VERIFIED_PATHS_SQL = """
+    SELECT e.path FROM downloads d JOIN entries e ON e.id = d.entry_id
+    WHERE d.state = 'verified' AND e.account_uid = :account
+    GROUP BY e.path ORDER BY MIN(d.mirror_id != :mirror), e.path LIMIT :limit
 """
 _ENTRY_IN_MIRROR_SQL = """
     SELECT EXISTS (SELECT 1 FROM entries e WHERE e.id = :entry AND e.account_uid = :account

@@ -470,9 +470,11 @@ stream, never appended to the bytes kept.
   stall before the first byte, a refused connection, `408`, `429` or `5xx`)
   is not retried at once.
 - **Passes.** Files whose download failed that way, or ran out of retries,
-  are resumed in another pass over the files still to download, again up to
-  `download_connections` at once, each with a new download link, after a 5 s
-  pause (longer when the host sent `Retry-After`, up to 300 s). The other
+  and files whose download link or resume check the Disk API kept failing to
+  answer (see "Failures that stop the run"), are resumed in another pass over the files
+  still to download, again up to `download_connections` at once, each with a
+  new download link, after a 5 s pause (longer when the host sent
+  `Retry-After`, up to 300 s). The other
   segments of such a file finish first, and the next pass fetches only the
   segments still missing. A run makes at most `download_passes` passes
   (`0`: until every file is done or unavailable on Yandex Disk, or Ctrl+C); a
@@ -489,7 +491,9 @@ stream, never appended to the bytes kept.
   download link (the last: <reason>)`, or, when part of it is confirmed on
   disk, as `Yandex Disk stopped sending this file after <size>: …`. The
   attempts count across passes and runs. A `429` or any answer with
-  `Retry-After` is throttling, which neither counts nor starts over; a byte
+  `Retry-After` is throttling, which neither counts nor starts over; an
+  attempt whose download link or resume check the Disk API failed to answer,
+  like throttling, neither counts nor starts over; a byte
   received, or a failure for any other reason (a refused download, a local
   error), starts the count over. The summary then adds, after the `Failed`
   list, `N of them never got data from Yandex Disk for a day or more: open
@@ -512,8 +516,9 @@ stream, never appended to the bytes kept.
 recorded in the manifest for that DEST, as soon as a turn of it fails: a
 refused download, a file changed or removed in the cloud, a local error, a
 hard link to another file of the mirror, a refused name, a folder that could
-not be made, every entry under such a folder, and a transient transfer failure
-that waits for a later pass. The record holds the reason last shown, the
+not be made, every entry under such a folder, a transient transfer failure
+that waits for a later pass, and a download link or resume check the Disk API
+kept failing to answer. The record holds the reason last shown, the
 count of failed turns since the entry last succeeded, and how many of the
 last of them in a row got no byte from the download host, since when (what
 makes a file [unavailable on Yandex Disk](#downloading)); a file still failing
@@ -753,7 +758,21 @@ modification time of <path>: <reason>`, and leaves the path as it was.
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run: the files still
 in progress stop too, only the first error is shown, files already verified
-stay verified, and a rerun picks up where it stopped. Ctrl+C or SIGTERM
+stay verified, and a rerun picks up where it stopped. A Disk API request for
+one file (its download link, or the check of an unfinished download against
+the Disk) that keeps failing is told apart from an outage first: the
+tool asks the API for the download link of another file of the mirror that got
+one, the last one in this run, or else a verified one (of this mirror, or else
+of another mirror of the same account). When there is no such file (no other
+file got a link in this run, and no file of the account is verified), the tool
+asks for the account (`GET /v1/disk/`) instead. When that
+answers, only the file's turn fails: it waits for the next pass with the API's
+status as its reason, an unfinished download keeping the bytes it has, and the
+run goes on. When it does not answer, the run
+stops as an outage, with the file's error. The run also stops at the 11th such
+file of a run with no such file to ask about, its error ending with
+`(no file of this mirror got a download link: 10 failed the same way)`.
+Ctrl+C or SIGTERM
 (`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; rerun to
 continue the download.` and exits with 130 (Ctrl+C) or 143 (SIGTERM); every
 file in progress takes a checkpoint first, and the next run resumes it from

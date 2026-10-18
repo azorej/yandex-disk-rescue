@@ -944,6 +944,36 @@ def _stat(ino: int, size: int = 1) -> os.stat_result:
     return os.stat_result(fields)
 
 
+def test_verified_paths_list_this_mirrors_files_first_then_the_accounts_other_mirrors(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    _scan(db, TREE)
+    _scan(db, TREE, uid='2')
+    files = {r.path: r for r in TREE if r.kind == 'file'}
+
+    def verify(mirror: Mirror, *paths: str) -> None:
+        ids = _entry_ids(mirror)
+        for ino, path in enumerate(paths, start=1):
+            mirror.record_verified(ids[path], RemoteIdentity.of(files[path]), 'md5', _stat(ino))
+
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/', tmp_path / 'dest')
+        other = manifest.mirror(UID, 'disk:/', tmp_path / 'other-dest')
+        stranger = manifest.mirror('2', 'disk:/', tmp_path / 'stranger-dest')
+        fresh = manifest.mirror(UID, 'disk:/A', tmp_path / 'fresh-dest')
+        verify(mirror, 'disk:/top.bin', 'disk:/A/gone.txt')
+        verify(other, 'disk:/A/keep.txt', 'disk:/top.bin')
+        verify(stranger, 'disk:/A/edit.txt')
+        ids = _entry_ids(mirror)
+        edit = files['disk:/A/edit.txt']
+        mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), _unconfirmed(edit))
+
+        assert mirror.verified_paths(10) == ['disk:/A/gone.txt', 'disk:/top.bin', 'disk:/A/keep.txt']
+        assert mirror.verified_paths(1) == ['disk:/A/gone.txt']
+        assert other.verified_paths(10) == ['disk:/A/keep.txt', 'disk:/top.bin', 'disk:/A/gone.txt']
+        assert fresh.verified_paths(2) == ['disk:/A/gone.txt', 'disk:/A/keep.txt']
+        assert stranger.verified_paths(10) == ['disk:/A/edit.txt']
+
+
 @pytest.mark.parametrize('ino', [1, 2**63 - 1, 2**63, 2**64 - 1])
 def test_any_64_bit_inode_number_round_trips(tmp_path, ino):
     db = tmp_path / 'manifest.sqlite3'

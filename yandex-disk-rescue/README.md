@@ -67,7 +67,9 @@ mirror up by its destination without creating one.
   MD5, SHA-256, modification time); a record whose identity differs from the entry's current one is stale, and the
   caller decides what to do with it. A verified record also stores how the file was verified and the `lstat`
   fingerprint of the placed file (size, mtime in ns, inode number; no device number, which changes when a disk is
-  re-plugged). `Mirror.verified_owner` finds the entry whose verified copy is a given inode.
+  re-plugged). `Mirror.verified_owner` finds the entry whose verified copy is a given inode, and
+  `Mirror.verified_paths(limit)` lists files with a verified record, this mirror's before those of the account's
+  other mirrors, each in path order.
 - A partial record carries the checkpoint journal of its download (`download_segments`): segments tiling
   `[0, size)` in order (none for a zero-byte file), each with the offset up to which its bytes were fsynced before
   the row was committed and the SHA-256 of those bytes. `Mirror.record_partial` starts a journal,
@@ -181,9 +183,14 @@ yandex-disk-rescue/
 │   │                 #   hashing the bytes copied; quarantining a file that fails; move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
+│   │                 #   a per-file Disk API request failing past the retries deferring only its file while
+│   │                 #   the API still gives another file's link (`ApiProbe`; or answers the account
+│   │                 #   request, at most `UNREFERENCED_FAILURES` files, when no other file got a link in
+│   │                 #   this run and no file of the account is verified),
 │   │                 #   failure records written and counted as each turn fails (also one deferred to a
 │   │                 #   later pass) and dropped as entries succeed, with the silent streak of turns that got
-│   │                 #   no byte (throttling neither counts nor breaks it) and the unavailable-on-Yandex-Disk
+│   │                 #   no byte (throttling and turns deferred for a failed Disk API request neither count
+│   │                 #   nor break it) and the unavailable-on-Yandex-Disk
 │   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, each failure
 │   │                 #   flagged `on_yandex` when its cause is on Yandex's side, the summary lines (with the
 │   │                 #   previews saved and not saved or deleted, and the partial files that could not be deleted once
@@ -278,7 +285,8 @@ yandex-disk-rescue/
 │       ├── limiter.py # The AdaptiveLimiter every DiskClient request shares: pacing, concurrency cap, Retry-After
 │       ├── models.py # Parsing of account, resource, folder-page, preview-link and download-link bodies
 │       ├── remote_paths.py # `disk:/` path normalization
-│       ├── errors.py # The RescueError subclasses of failed API requests
+│       ├── errors.py # The RescueError subclasses of failed API requests; `DiskApiError.reason`, the failure
+│       │             #   without what the request was for
 │       ├── user_agent.py # USER_AGENT — the User-Agent every request sends: tool name, version, project URL
 │       └── transfer.py # ContentClient — fetches byte ranges from the download host into an async write
 │                       #   callback, awaited before the next chunk is read, at most `connections` fetches in

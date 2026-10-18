@@ -234,10 +234,9 @@ async def test_download_link_rejects_an_unexpected_body_without_quoting_the_href
         with pytest.raises(api.DiskApiError) as excinfo:
             await client.download_link('disk:/a.bin')
 
-    assert str(excinfo.value) == (
-        'Could not download disk:/a.bin: Yandex Disk API returned an unexpected response to '
-        f'GET /v1/disk/resources/download: {reason}.'
-    )
+    failure = f'Yandex Disk API returned an unexpected response to GET /v1/disk/resources/download: {reason}.'
+    assert str(excinfo.value) == f'Could not download disk:/a.bin: {failure}'
+    assert excinfo.value.reason == failure
     assert 's3cr3t' not in str(excinfo.value)
 
 
@@ -500,14 +499,19 @@ async def test_throttling_statuses_are_retried_until_the_listing_succeeds(fake_d
 async def test_retries_run_out_with_the_last_failure_and_the_attempt_count(fake_disk_api, status):
     fake_disk_api.add_dir('disk:/A')
     fake_disk_api.inject('GET', '/v1/disk/resources', status, status, status, status)
+    fake_disk_api.inject('GET', '/v1/disk/', status, status, status, status)
 
-    with pytest.raises(api.DiskApiError) as excinfo:
+    with pytest.raises(api.DiskApiError) as listing:
         await _list(fake_disk_api, 'disk:/A', retries=2)
+    with pytest.raises(api.DiskApiError) as account:
+        async with _client(fake_disk_api, retries=2) as client:
+            await client.account()
 
-    assert str(excinfo.value) == (
-        f'Could not list disk:/A: Yandex Disk API returned HTTP {status}: Injected HTTP {status} (after 3 attempts)'
-    )
-    assert len(fake_disk_api.requests) == 3
+    failure = f'Yandex Disk API returned HTTP {status}: Injected HTTP {status} (after 3 attempts)'
+    assert str(listing.value) == f'Could not list disk:/A: {failure}'
+    assert listing.value.reason == failure
+    assert str(account.value) == account.value.reason == failure
+    assert len(fake_disk_api.requests) == 6
 
 
 @pytest.mark.parametrize(

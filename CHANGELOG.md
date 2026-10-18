@@ -47,6 +47,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- A Disk API request the API keeps failing for one file (its download link, or the check of an unfinished download
+  against the Disk) no longer stops `download`. While the API still gives other files' links, only that file waits
+  for the next pass, keeping the bytes it has, fails with the API's status after the last pass, and gets its
+  preview; such attempts do not count toward "unavailable on Yandex Disk". An outage, also one of the download-link
+  endpoint alone, still stops the run.
 - A `download` stopped by a destination error says what failed (`Could not read`, `Could not write` or
   `Could not inspect`), no longer `Could not write` for reads.
 - `download` no longer stops at a local copy it cannot read (a bad sector): the copy is recorded corrupt, the file is

@@ -119,6 +119,9 @@ PASS_PAUSE_SECONDS = 5.0
 # least `UNAVAILABLE_AGE` ago, is unavailable on Yandex Disk.
 UNAVAILABLE_TURNS = 7
 UNAVAILABLE_AGE = timedelta(hours=24)
+# How many files of a run may fail to get a download link while no file of the mirror ever got one, each then probed
+# with an account request; the next such file stops the run as an outage of the download-link endpoint.
+UNREFERENCED_FAILURES = 10
 CHECKPOINT_SECONDS = 15.0
 # The bytes of a separate partial folder's filesystem the partial files leave free for everything else.
 PARTIAL_RESERVE = 2**30
@@ -162,17 +165,23 @@ class FileQuarantined(Exception):
 
 
 class FileDeferred(FileFailed):
-    """The file's transfer failed transiently (a stall, a connection error, 408, 429 or 5xx, the retries spent, a
-    refreshed link rejected again); its partial file and record are kept so a later pass resumes it. `retry_after` is
-    the wait the download host asked for, if any; `throttled` is set when the host was throttling (429 or a
-    `Retry-After`, on any segment), and `received` when any byte of the file was written in the turn, by any attempt
-    of any segment."""
+    """The file's turn failed transiently: its transfer (a stall, a connection error, 408, 429 or 5xx, the retries
+    spent, a refreshed link rejected again), or a Disk API request for its download link or resume check that kept
+    failing while the API still answered for other files (`ApiProbe`); its partial file and record are kept so a
+    later pass resumes it.
+    `retry_after` is the wait the download host asked for, if any; `throttled` is set when the host was throttling
+    (429 or a `Retry-After`, on any segment), `api_failed` when the turn was deferred only for such failed Disk API
+    requests, so the download host was not asked for the bytes, and `received` when any byte of the file was written
+    in the turn, by any attempt of any segment."""
 
-    def __init__(self, reason: str, *, retry_after: float | None, throttled: bool, received: bool) -> None:
+    def __init__(
+        self, reason: str, *, retry_after: float | None, throttled: bool, received: bool, api_failed: bool = False
+    ) -> None:
         super().__init__(reason)
         self.retry_after = retry_after
         self.throttled = throttled
         self.received = received
+        self.api_failed = api_failed
 
 
 class NoRoomYet(FileDeferred):
@@ -598,10 +607,71 @@ async def _hash_turn(hold: asyncio.Lock, path: str, progress: ActiveFile, state:
         yield
 
 
+class ApiProbe:
+    """Tells a Disk API request that keeps failing for one file of a run from an outage of the API, by asking the API
+    once more, with the usual retries, about something else.
+
+    The probe asks for the download link of a reference file: the file other than the failing one whose link the API
+    gave last in this run, else the first a verified record names, of this mirror before the account's other mirrors.
+    Any answer counts, a 404 or a refusal of that file included. With no reference file it asks for the account
+    (`GET /v1/disk/`), for at most `UNREFERENCED_FAILURES` failing files of the run: the next one is an outage.
+    """
+
+    def __init__(self, client: api.DiskClient, mirror: Mirror) -> None:
+        self._client = client
+        self._mirror = mirror
+        self._last: str | None = None
+        self._before_last: str | None = None
+        self._verified: list[str] | None = None
+        self._unreferenced: set[str] = set()
+
+    def linked(self, path: str) -> None:
+        """Note that the API gave the download link of `path`."""
+        if path != self._last:
+            self._before_last, self._last = self._last, path
+
+    async def check(self, path: str, error: api.DiskApiError) -> None:
+        """Return when the API still answers after a request for `path` failed with `error`, so the failure is the
+        file's own.
+
+        Raises `error` itself when the probe fails with a `DiskApiError` too, and a `DiskApiError` with `error`'s
+        message and the bound when `path` is one failing file too many with no reference file; a rejected token
+        propagates.
+        """
+        reference = self._reference(path)
+        if reference is None:
+            self._unreferenced.add(path)
+            if len(self._unreferenced) > UNREFERENCED_FAILURES:
+                bound = f'no file of this mirror got a download link: {UNREFERENCED_FAILURES} failed the same way'
+                raise api.DiskApiError(f'{error.reason} ({bound})', context=error.context) from None
+        target = 'the account' if reference is None else f'the download link of {reference}'
+        try:
+            if reference is None:
+                await self._client.account()
+            else:
+                await self._client.download_link(reference)
+                self.linked(reference)
+        except api.RemotePathNotFoundError, api.DownloadRefusedError:
+            pass
+        except api.DiskApiError as probe_error:
+            _log.info('%s: the Disk API failed for %s too, an outage: %s', path, target, probe_error)
+            raise error from None
+        _log.info('%s: the Disk API still answers for %s, so only this file waits', path, target)
+
+    def _reference(self, path: str) -> str | None:
+        if self._last is not None and self._last != path:
+            return self._last
+        if self._before_last is not None:
+            return self._before_last
+        if self._verified is None:
+            self._verified = self._mirror.verified_paths(2)
+        return next((verified for verified in self._verified if verified != path), None)
+
+
 @dataclass(frozen=True)
 class _RunTools:
     """What every turn of a run shares: the clients, the worker threads, the placement lock, the copy lock, the hash
-    holds, the room of a separate partial folder, the report and the transfer policy."""
+    holds, the room of a separate partial folder, the report, the transfer policy and the probe of the Disk API."""
 
     client: api.DiskClient
     content: api.ContentClient
@@ -612,6 +682,7 @@ class _RunTools:
     room: PartialRoom | None
     report: MirrorReport
     policy: TransferPolicy
+    probe: ApiProbe
 
 
 class _FileTurns:
@@ -722,13 +793,14 @@ class MirrorRun:
 
     The record also keeps the entry's silent streak, carried across runs. A deferred turn that received no byte of
     the file, while the host was not throttling, is silent and makes it one turn longer, the first starting it at the
-    turn's end; a throttled deferral and a deferral for room leave it as it is; any other failed turn (a deferral that
-    received a byte, a file or folder that fails, an entry below a failed folder, the one more failed turn counted
-    once the passes end) ends it. While the streak has at least `UNAVAILABLE_TURNS` turns and started
-    `UNAVAILABLE_AGE` or longer ago, the file is unavailable on Yandex Disk: every record written for it carries the
-    unavailable reason instead of the turn's own, and its failure is reported with that reason, flagged
-    `unavailable`. Outside `retry_failed`, a silent turn that leaves the file unavailable fails it at once, with no
-    later pass in the run; a throttled turn defers it as any other file.
+    turn's end; a throttled deferral, a deferral for room and a deferral for a failed Disk API request leave it as it
+    is; any other failed turn (a deferral that received a byte, a file or folder that fails, an entry below a failed
+    folder, the one more failed turn counted once the passes end) ends it. While the streak has at least
+    `UNAVAILABLE_TURNS` turns and started `UNAVAILABLE_AGE` or longer ago, the file is unavailable on Yandex Disk:
+    every record written for it carries the unavailable reason instead of the turn's own, and its failure is reported
+    with that reason, flagged `unavailable`. Outside `retry_failed`, a silent turn that leaves the file unavailable
+    fails it at once, with no later pass in the run; a throttled turn, or one deferred for a failed Disk API request,
+    defers it as any other file.
 
     A copy found unreadable gets its `corrupt` finding recorded and a notice when it is found, and is listed under
     `unreadable` whatever then happens to the file; a later pass of the run gives the file that finding, so the copy
@@ -909,8 +981,10 @@ class MirrorRun:
         checked, cleared, placed and recorded under one placement lock, so files in progress never race for a path or
         an inode. The report lists everything in path order, whatever the order the files ended in.
 
-        The first error that stops the run (`DestinationError`, `TokenRejectedError`, `DiskApiError`) cancels the
-        files in progress and is raised as itself once they have ended.
+        A Disk API request for one file (its download link or resume check) that keeps failing defers only that file
+        while the API still answers for other files (`ApiProbe`). The first error that stops the run
+        (`DestinationError`, `TokenRejectedError`, `DiskApiError`, for a download link or resume check only in an
+        outage) cancels the files in progress and is raised as itself once they have ended.
 
         The disk work goes to worker threads of this run's own, shut down when the run ends, also on cancellation,
         once every file's turn has ended."""
@@ -923,7 +997,18 @@ class MirrorRun:
                 room = await threads.run(PartialRoom.measure, self._destination, self._in_progress)
                 room_measured(room)
             holds = HashHolds.of(self._destination)
-            tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), holds, room, report, policy)
+            tools = _RunTools(
+                client,
+                content,
+                threads,
+                placement=asyncio.Lock(),
+                copying=asyncio.Lock(),
+                hashing=holds,
+                room=room,
+                report=report,
+                policy=policy,
+                probe=ApiProbe(client, self._mirror),
+            )
             changes = _changes(room)
             _log_pass(
                 1,
@@ -1055,7 +1140,7 @@ class MirrorRun:
             reason, unavailable = self._record(
                 entry, later.reason, turns=turns, streak=self._after_deferral(entry, later)
             )
-            if unavailable and not later.throttled and not self._retry_failed:
+            if unavailable and not later.throttled and not later.api_failed and not self._retry_failed:
                 self._report_failed(tools.report, entry, reason, unavailable=True, on_yandex=True)
                 return
         _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
@@ -1108,11 +1193,13 @@ class MirrorRun:
 
     def _after_deferral(self, entry: MirrorEntry, deferred: FileDeferred) -> _Streak:
         """The silent streak of `entry` after a turn `deferred`: ended when the turn received a byte, the same when
-        the host was throttling (with the turn's reason as its last while this run saw no silent turn), and one
-        silent turn longer otherwise."""
+        only failed Disk API requests deferred it, the same when the host was throttling (with the turn's reason as
+        its last while this run saw no silent turn), and one silent turn longer otherwise."""
         streak = self._streak(entry)
         if deferred.received:
             return _Streak()
+        if deferred.api_failed:
+            return streak
         if deferred.throttled:
             if streak.last is not None and not streak.throttled:
                 return streak
@@ -1196,6 +1283,7 @@ class MirrorRun:
                 names=self._names,
                 policy=tools.policy,
                 room=tools.room,
+                probe=tools.probe,
                 progress=self._progress.begin(entry.entry_id, path, size),
                 unreadable=lambda found: self._found_unreadable(report, entry, found),
             )
@@ -1254,6 +1342,7 @@ async def download_file(
     names: LocalNames,
     policy: TransferPolicy,
     room: PartialRoom | None,
+    probe: ApiProbe,
     progress: ActiveFile,
     unreadable: Callable[[Finding], None],
 ) -> FileOutcome:
@@ -1286,13 +1375,14 @@ async def download_file(
     digest, keeping the segments it was started with; a partial file none of whose segments keeps bytes, and any
     other partial file, is started again from byte 0 with the segments of `policy` (one segment in a partial folder
     without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
-    module.
+    module. A download link or resume check the Disk API keeps failing to answer goes to `probe`: while the API still
+    answers for other files, the turn is deferred, a resumed partial file keeping its confirmed bytes.
 
-    Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
-    when the downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError`
-    when the destination cannot be read, written or inspected at all (a local copy that cannot be read while the
-    device is gone or the destination itself unreadable included), and the API errors that stop the run
-    (`TokenRejectedError`, `DiskApiError`).
+    Raises `FileDeferred` when the turn failed transiently and a later pass may finish it, `FileQuarantined` when the
+    downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError` when the
+    destination cannot be read, written or inspected at all (a local copy that cannot be read while the device is
+    gone or the destination itself unreadable included), and the API errors that stop the run: `TokenRejectedError`,
+    and `DiskApiError` (for a download link or resume check, only in an outage of the Disk API).
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
@@ -1335,6 +1425,7 @@ async def download_file(
                 mirror=mirror,
                 destination=destination,
                 policy=policy,
+                probe=probe,
                 progress=progress,
             )
             local, moved_aside = await _place_verified(
@@ -1563,6 +1654,7 @@ async def _fetch_verified(
     mirror: Mirror,
     destination: Destination,
     policy: TransferPolicy,
+    probe: ApiProbe,
     progress: ActiveFile,
 ) -> VerifiedBy:
     """Fetch the file into its partial file, keeping the confirmed bytes already there when they can be resumed, give
@@ -1592,6 +1684,7 @@ async def _fetch_verified(
             threads=threads,
             hashing=hashing,
             policy=policy,
+            probe=probe,
             progress=progress,
         )
         if len(streams) > 1:
@@ -1615,7 +1708,7 @@ async def _fetch_verified(
             identity,
             partial,
             journal,
-            client=client,
+            link=_Link(client, entry.resource.path, probe),
             content=content,
             threads=threads,
             retries=policy.retries,
@@ -1688,6 +1781,7 @@ async def _resume(
     threads: DiskThreads,
     hashing: asyncio.Lock,
     policy: TransferPolicy,
+    probe: ApiProbe,
     progress: ActiveFile,
 ) -> list[_Stream]:
     """The streams of this turn, one per segment of the journal, each starting after the bytes of its segment kept,
@@ -1703,7 +1797,9 @@ async def _resume(
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
     check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
-    the changed file.
+    the changed file. A check failing with `DiskApiError` goes to `probe`: while the API still answers for other
+    files, `FileDeferred` (`api_failed`) is raised with the API's failure, the partial file and its record untouched;
+    otherwise the check's error stops the run.
     """
     size = identity.size
     record = mirror.download(entry.entry_id)
@@ -1716,6 +1812,9 @@ async def _resume(
     except api.RemotePathNotFoundError:
         _discard(entry, mirror, destination)
         raise FileFailed('removed from the Disk after the scan') from None
+    except api.DiskApiError as exc:
+        await probe.check(entry.resource.path, exc)
+        raise FileDeferred(exc.reason, retry_after=None, throttled=False, received=False, api_failed=True) from None
     if live.kind != 'file' or RemoteIdentity.of(live) != identity:
         _discard(entry, mirror, destination)
         raise FileFailed(_CHANGED)
@@ -1940,22 +2039,37 @@ class _Journal:
         return stream
 
 
+class _LinkFailed(Exception):
+    """The Disk API kept failing to give the file's download link in this turn, while it still answered for other
+    files; `reason` is the API's failure."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 class _Link:
     """The download link the segments of one file share in one turn: requested on first use, which comes once a
-    segment holds a connection, and replaced once when the download host rejects it."""
+    segment holds a connection, and replaced once when the download host rejects it.
 
-    def __init__(self, client: api.DiskClient, path: str) -> None:
+    A request that fails with `DiskApiError` goes to `probe`: while the API still answers for other files, it raises
+    `_LinkFailed`, and so does every later need of a link in the turn, with no new request."""
+
+    def __init__(self, client: api.DiskClient, path: str, probe: ApiProbe) -> None:
         self._client = client
         self._path = path
+        self._probe = probe
         self._href: str | None = None
         self._generation = 0
+        self._failure: str | None = None
         self._lock = asyncio.Lock()
 
     async def current(self) -> tuple[str, int]:
         """The link and its generation (1 for the first link, 2 for its replacement)."""
         async with self._lock:
+            self._check_failure()
             if self._href is None:
-                self._href = await _download_link(self._client, self._path)
+                self._href = await self._request()
                 self._generation = 1
             return self._href, self._generation
 
@@ -1963,14 +2077,29 @@ class _Link:
         """Replace the link of `generation`, which the host rejected, unless another segment has replaced it already;
         `False` when it was the replacement, which this turn does not replace."""
         async with self._lock:
+            self._check_failure()
             if generation != self._generation:
                 return True
             if generation > 1:
                 return False
             _log.debug('%s: the download host rejected the link; getting a new one', self._path)
-            self._href = await _download_link(self._client, self._path)
+            self._href = await self._request()
             self._generation += 1
             return True
+
+    def _check_failure(self) -> None:
+        if self._failure is not None:
+            raise _LinkFailed(self._failure)
+
+    async def _request(self) -> str:
+        try:
+            href = await _download_link(self._client, self._path)
+        except api.DiskApiError as exc:
+            await self._probe.check(self._path, exc)
+            self._failure = exc.reason
+            raise _LinkFailed(exc.reason) from None
+        self._probe.linked(self._path)
+        return href
 
 
 class _FileFetch:
@@ -1985,7 +2114,7 @@ class _FileFetch:
         partial: PartialFile,
         journal: _Journal,
         *,
-        client: api.DiskClient,
+        link: _Link,
         content: api.ContentClient,
         threads: DiskThreads,
         retries: int,
@@ -1995,7 +2124,7 @@ class _FileFetch:
         self._identity = identity
         self._partial = partial
         self._journal = journal
-        self._link = _Link(client, path)
+        self._link = link
         self._content = content
         self._threads = threads
         self._retries = retries
@@ -2008,9 +2137,10 @@ class _FileFetch:
         The turn ends when every stream is complete or has stopped. A stream that fails cancels the others, which
         take their checkpoints, and the file fails with its error. Streams deferred by a transient failure let the
         others run on; then the file is deferred with the first one's reason, the longest wait the host asked for,
-        whether any of them met a throttling host, and whether any byte of the file was written in the turn. When
-        the host ignores a segment's range, the journal is replaced by one segment holding the whole file, the
-        partial file is cut back to byte 0, and the file is fetched again as one stream.
+        whether any of them met a throttling host, whether every one of them was deferred only for the file's link
+        the Disk API failed to give (otherwise the reason is the first other one's), and whether any byte of the file
+        was written in the turn. When the host ignores a segment's range, the journal is replaced by one segment
+        holding the whole file, the partial file is cut back to byte 0, and the file is fetched again as one stream.
 
         Raises `FileDeferred`, `FileFailed`, or an error that stops the run.
         """
@@ -2032,11 +2162,13 @@ class _FileFetch:
         deferred = [result for result in results if result is not None]
         if deferred:
             waits = [failure.retry_after for failure in deferred if failure.retry_after is not None]
+            transfer = [failure for failure in deferred if not failure.api_failed]
             raise FileDeferred(
-                deferred[0].reason,
+                (transfer or deferred)[0].reason,
                 retry_after=max(waits, default=None),
                 throttled=any(failure.throttled for failure in deferred),
                 received=self._received,
+                api_failed=not transfer,
             )
 
     async def _stream(self, stream: _Stream) -> FileDeferred | None:
@@ -2044,9 +2176,18 @@ class _FileFetch:
 
         A failure after new data is resumed at once from where it stopped, up to `retries` times. An expired link is
         replaced once for the whole file without spending a retry; when the replacement is rejected too, the stream
-        is deferred, and the next pass gets a new link. Raises `FileFailed` for a failure that is not transient, and
-        `RangeNotHonouredError` when the host ignored the range of a fetch of less than the whole file.
+        is deferred, and the next pass gets a new link. A link the Disk API failed to give while it answered for other
+        files (`_LinkFailed`) defers the stream with the API's failure. Raises `FileFailed` for a failure that is not
+        transient, and `RangeNotHonouredError` when the host ignored the range of a fetch of less than the whole file.
         """
+        try:
+            return await self._attempts(stream)
+        except _LinkFailed as failed:
+            return FileDeferred(
+                failed.reason, retry_after=None, throttled=False, received=self._received, api_failed=True
+            )
+
+    async def _attempts(self, stream: _Stream) -> FileDeferred | None:
         size = self._identity.size
         generation = 0
 

@@ -8,7 +8,14 @@ class TokenRejectedError(RescueError):
 
 
 class DiskApiError(RescueError):
-    """Any other failed request: an error status, a transport error or an unexpected response body."""
+    """Any other failed request: an error status, a transport error or an unexpected response body. `reason` is the
+    failure itself, and `context` what the request was for (`Could not download disk:/a.jpg`), if anything; the
+    message is `<context>: <reason>`, or the reason alone."""
+
+    def __init__(self, reason: str, *, context: str | None = None) -> None:
+        super().__init__(f'{context}: {reason}' if context else reason)
+        self.reason = reason
+        self.context = context
 
 
 class DownloadRefusedError(RescueError):
