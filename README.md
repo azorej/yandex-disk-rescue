@@ -1265,6 +1265,10 @@ the retries run out, the error names the last failure and ends with
 The defaults, valid values, flags and environment variables of these
 options are in [Configuration](#configuration).
 
+Every request the tool makes, to the Disk API and to the download host,
+names the tool in its `User-Agent`:
+`yandex-disk-rescue/<version> (+https://github.com/azorej/yandex-disk-rescue)`.
+
 ## Configuration
 
 Every option can be set in three places besides its built-in default. The

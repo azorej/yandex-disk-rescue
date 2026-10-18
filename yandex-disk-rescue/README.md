@@ -237,6 +237,7 @@ yandex-disk-rescue/
 │       ├── models.py # Parsing of account, resource, folder-page and download-link bodies
 │       ├── remote_paths.py # `disk:/` path normalization
 │       ├── errors.py # The RescueError subclasses of failed API requests
+│       ├── user_agent.py # USER_AGENT — the User-Agent every request sends: tool name, version, project URL
 │       └── transfer.py # ContentClient — fetches byte ranges from the download host into an async write
 │                       #   callback, awaited before the next chunk is read, at most `connections` fetches in
 │                       #   flight (waiting for one never counts as a stall), each asking for its link only once

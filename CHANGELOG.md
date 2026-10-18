@@ -7,6 +7,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Changed
+
+- Every HTTP request names the tool in its `User-Agent`:
+  `yandex-disk-rescue/<version> (+https://github.com/azorej/yandex-disk-rescue)`.
+
 ## [1.0.0rc1] - 2026-10-18
 
 ### Added
