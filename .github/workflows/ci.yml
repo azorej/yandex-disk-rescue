@@ -54,6 +54,7 @@ jobs:
               - '**/*.py'
               - '**/*.md'  # ruff formats code blocks in Markdown
               - '**/pyproject.toml'
+              - '**/LICENSE'
               - 'uv.lock'
               - '.python-version'
             package:
