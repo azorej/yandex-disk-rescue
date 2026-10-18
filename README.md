@@ -1297,6 +1297,8 @@ uv run yandex-disk-rescue --help
 | `mise run ci` | Full CI pipeline in Dagger — identical to GitHub Actions |
 | `mise run ci:selftest` | Tests for the Dagger module itself |
 | `mise run ci:package` | Build and `twine check` the sdist and wheel, then install the wheel with `uv tool` and `pipx` in clean containers and run the installed-CLI tests |
+| `mise run release:dist vX.Y.Z` | Rehearse a release up to the upload: the tag and CHANGELOG checks, the build and the install smoke, into `release/` |
+| `mise run release:verify vX.Y.Z` | Check that PyPI serves `release/dist/` and that `uv tool install yandex-disk-rescue==X.Y.Z` works |
 | `mise run lock` | Upgrade every dependency in `uv.lock` |
 | `mise tasks` | List all tasks |
 
@@ -1335,7 +1337,10 @@ diff touches; pushes to `main`, a weekly schedule and manual runs execute
 everything. Require the single **`CI required`** check in branch protection
 (see [docs/github-setup.md](docs/github-setup.md)). The workflows themselves
 are linted by actionlint and zizmor (pre-commit hooks), and every action is
-pinned to a commit SHA that Dependabot keeps current.
+pinned to a commit SHA that Dependabot keeps current. A pushed `vX.Y.Z` tag runs
+[`.github/workflows/release.yml`](.github/workflows/release.yml): build and check, publish to PyPI after a
+manual approval, verify the install, create the GitHub Release (see
+[CONTRIBUTING.md](CONTRIBUTING.md#releasing)).
 
 **AI agents.** [`AGENTS.md`](AGENTS.md) is the one rule file every agent
 reads ([`CLAUDE.md`](CLAUDE.md) imports it). With Claude Code:

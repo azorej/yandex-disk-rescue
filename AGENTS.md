@@ -62,6 +62,8 @@ mise run test           # Pytest; extra args pass through: mise run test -- -k g
 mise run ci             # Full CI pipeline in Dagger — exactly what GitHub Actions runs
 mise run ci:selftest    # Tests for the Dagger module itself
 mise run ci:package     # Build, twine-check and install-smoke the wheel (uv tool, pipx) in Dagger
+mise run release:dist <tag>   # Rehearse a release up to the upload, into release/ (dist/ + notes.md)
+mise run release:verify <tag> # Check that PyPI serves release/dist/ and the version installs by name
 mise run lock           # Upgrade all dependencies in uv.lock
 mise run dagger:develop # Regenerate the Dagger SDK (after a Dagger version bump)
 mise tasks              # List every task
@@ -162,6 +164,13 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
   release tag as a comment (`@<sha> # vX.Y.Z`), and `actions/checkout`
   sets `persist-credentials: false`. Fix a zizmor finding; only a false
   positive gets an inline `# zizmor: ignore[<audit>]` with the reason.
+- Releases: a pushed `v*` tag runs `.github/workflows/release.yml`
+  (`dist` → `publish-pypi` → `verify-pypi` → `github-release`). It is the
+  one exception to "thin caller of mise tasks": publishing uses
+  `pypa/gh-action-pypi-publish` with Trusted Publishing (OIDC, no stored
+  secret), in a job that holds `id-token: write` and runs no repository
+  code, so nothing local can ever publish. Everything else is Dagger behind
+  `mise run release:dist` / `release:verify`.
 
 ### Dockerfiles and the devcontainer
 
@@ -176,6 +185,9 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
   `chore:`, `docs:`, …); squash-merge PRs.
 - Never commit secrets. Local secrets go in `.env` (git-ignored; mise
   loads it — see `.env.example`).
+- A user-visible change adds a line under `## [Unreleased]` in
+  `CHANGELOG.md` in the same PR.
+- Releases: see "Releasing" in [`CONTRIBUTING.md`](CONTRIBUTING.md#releasing).
 
 ## Agent Workflow
 

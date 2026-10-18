@@ -31,6 +31,9 @@ Actions run execute exactly the same steps.
 | `dist --source DIR` | `uv build --no-sources` of `yandex-disk-rescue`, then `twine check --strict`; returns a directory holding exactly the sdist and the wheel named for the project version, and fails on anything else |
 | `smoke --source DIR [--dist DIR]` | Installs the wheel of `--dist` (default: `dist`) with `uv tool install` and with `pipx install` (pip backend), each in a clean `UV_IMAGE` container as a non-root user with no uv cache, dependencies resolved fresh from PyPI at least once per UTC day; asserts `--version` prints the wheel's version, then runs `yandex-disk-rescue/tests/installed/` against the installed command with pytest and pytest-timeout (and pipx) at their `uv.lock` versions |
 | `package --source DIR` | `dist`, then `smoke` on its output — the `Package & install smoke` lane |
+| `release-notes --source DIR --version V` | The body of `CHANGELOG.md`'s `## [V] - YYYY-MM-DD` section, up to the next `## [` heading or the link references; fails when the section is missing, duplicated or empty |
+| `release --source DIR --tag vV` | Fails unless the tag is `v` + the project version, then runs `release-notes`, `dist` and `smoke`; returns `dist/` (the sdist and the wheel) and `notes.md` — `mise run release:dist` |
+| `published --tag vV --dist DIR [--timeout S]` | Never cached. Waits (default 600 s) until PyPI lists both files of `--dist` with their local SHA-256, then `uv tool install yandex-disk-rescue==V` by name in a clean container, retrying while the index lags, and checks `--version` — `mise run release:verify` |
 
 `--source` defaults to the repository root (minus `.venv`, caches and
 generated SDKs), so the usual call is just:
@@ -39,11 +42,14 @@ generated SDKs), so the usual call is just:
 mise run ci                     # = dagger call check
 mise run ci:package             # = dagger call package
 dagger call dist export --path dist  # the distributions, on the host
+mise run release:dist v1.2.3    # = dagger call release --tag=v1.2.3 export --path=release --wipe
 dagger call test                # a single function
 dagger call workspace terminal  # debug shell inside the CI container
 ```
 
-Module tests (`.dagger/tests`) assert the toolchain, the workspace sync and the names `dist` exports:
+Module tests (`.dagger/tests`) assert the toolchain, the workspace sync, the names `dist` exports, the
+CHANGELOG sections `release-notes` returns or refuses, and that `release` refuses a tag that is not the project
+version:
 
 ```bash
 mise run ci:selftest            # = cd .dagger/tests && dagger call all

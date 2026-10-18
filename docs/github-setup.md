@@ -11,6 +11,30 @@ and the **`CI required`** status check (the single aggregate check from
 `.github/workflows/ci.yml`). Repository admins can bypass it; add your
 teams as bypass actors if needed.
 
+## Releases
+
+[`.github/workflows/release.yml`](../.github/workflows/release.yml) publishes to PyPI with Trusted Publishing
+(OIDC), so no token is stored anywhere. It needs this one-time setup before the first tag (the process itself is in
+[CONTRIBUTING.md](../CONTRIBUTING.md#releasing)):
+
+1. **PyPI pending publisher.** On <https://pypi.org> (an account with 2FA): **Your account → Publishing → Add a new
+   pending publisher → GitHub**, with:
+   - PyPI Project Name: `yandex-disk-rescue`
+   - Owner: `azorej`
+   - Repository name: `yandex-disk-rescue`
+   - Workflow name: `release.yml`
+   - Environment name: `pypi`
+
+   The first upload turns it into the project's trusted publisher. It does not reserve the name.
+2. **GitHub environment `pypi`.** **Settings → Environments → New environment** `pypi`:
+   - **Required reviewers:** `azorej`. This is the manual approval before anything reaches PyPI.
+   - **Untick "Prevent self-review"**, so the sole maintainer can approve their own run. Left ticked, every release
+     stops before PyPI.
+   - **Deployment branches and tags:** "Selected branches and tags", with a tag rule `v*`.
+3. **Tag ruleset.** **Settings → Rules → Rulesets → New ruleset → Import a ruleset** and pick
+   [`github-ruleset-tags.json`](github-ruleset-tags.json). It stops anyone but repository admins from creating,
+   moving or deleting a `v*` tag.
+
 ## SHA-pinned actions (optional)
 
 Every `uses:` in `.github/workflows/` is pinned to a full commit SHA, and

@@ -223,3 +223,6 @@ CLAUDE.local.md
 
 # Local scratch space (e.g. symlinks to download targets)
 /tmp/
+
+# Release rehearsal output (`mise run release:dist <tag>`)
+/release/
