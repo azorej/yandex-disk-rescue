@@ -1676,7 +1676,6 @@ class _FileFetch:
         async def link() -> str:
             nonlocal generation
             href, generation = await self._link.current()
-            self._progress.state('downloading')
             return href
 
         async def write(offset: int, chunk: bytes) -> None:
@@ -1716,13 +1715,28 @@ class _FileFetch:
     async def _attempt(
         self, link: Callable[[], Awaitable[str]], stream: _Stream, write: Callable[[int, bytes], Awaitable[None]]
     ) -> None:
-        """One fetch of the rest of `stream` from the link `link()` returns; an attempt that ends with a transfer error
-        or a cancellation takes a checkpoint first."""
+        """One fetch of the rest of `stream` from the link `link()` returns, counted as a connection of the file from
+        when it has its link until it ends; an attempt that ends with a transfer error or a cancellation takes a
+        checkpoint first."""
+        connected = False
+
+        async def connection() -> str:
+            nonlocal connected
+            href = await link()
+            connected = True
+            self._progress.connected()
+            return href
+
         try:
-            await self._content.fetch(link, start=stream.written, end=stream.end, size=self._identity.size, write=write)
+            await self._content.fetch(
+                connection, start=stream.written, end=stream.end, size=self._identity.size, write=write
+            )
         except api.TransferError, asyncio.CancelledError:
             await self._journal.take()
             raise
+        finally:
+            if connected:
+                self._progress.disconnected()
 
 
 async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]:

@@ -553,7 +553,7 @@ def test_a_stalled_transfer_shows_on_the_terminal_and_ctrl_c_clears_the_view_and
     code, _, shown = terminal.finish()
 
     assert code == 130, shown
-    assert re.search(rb'\n  disk:/Docs/readme\.txt +0 B of 7 B \(0\.0%\)  no data for 6 s\r\n', shown)
+    assert re.search(rb'\n  disk:/Docs/readme\.txt +0 B of 7 B \(0\.0%\)  no data for 6 s\r', shown)
     assert b'; 1 active, 1 without data; ' in shown.replace(b'\r\n', b'')
     assert shown.rpartition(b'\x1b[?25l')[2].count(b'\x1b[?25h') == 1
     assert _after_the_view(shown) == 'Interrupted; rerun to continue the download.\n'
@@ -684,6 +684,7 @@ def test_no_speed_shows_before_a_second_of_bytes_was_measured(monkeypatch):
     active = state.begin(1, 'disk:/big.bin', 10 * 2**20)
 
     clock[0] += 0.01
+    active.connected()
     active.wrote(64 * 1024)
     early = state.snapshot()
     clock[0] += 1.0
@@ -701,6 +702,36 @@ def test_no_speed_shows_before_a_second_of_bytes_was_measured(monkeypatch):
         r'Downloading: 0 of 1 file, 1\.1 MiB of 10\.0 MiB \(10\.6%\), 1\.1 MiB/s, ETA 8 s; .*',
         later.status_line(final=False),
     )
+
+
+def test_a_file_with_no_connection_open_waits_for_one_and_is_never_without_data(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(progress.time, 'monotonic', lambda: clock[0])
+    state = progress.MirrorProgress()
+    state.start_transferring(1, 2**30, passes=7)
+    active = state.begin(1, 'disk:/big.bin', 2**30)
+
+    def shown(seconds: float) -> tuple[str, str]:
+        clock[0] += seconds
+        snapshot = state.snapshot()
+        [transfer] = snapshot.active
+        line = snapshot.status_line(final=False)
+        return transfer.state, re.search(r'; 1 active, (\d+) without data;', line)[1]
+
+    active.connected()
+    active.connected()
+    active.wrote(1024)
+    assert shown(1) == ('downloading', '0')
+    active.disconnected()
+    assert shown(1) == ('downloading', '0')
+    # Both segments ended; the rest of the file waits for a free connection, or for a new link.
+    active.disconnected()
+    assert shown(progress.STALL_SECONDS * 2) == ('waiting for a connection', '0')
+    active.connected()
+    assert shown(progress.STALL_SECONDS - 1) == ('downloading', '0')
+    assert shown(1) == ('downloading', '1')
+    active.wrote(1024)
+    assert shown(0) == ('downloading', '0')
 
 
 COMMON_KEYS = {

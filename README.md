@@ -755,8 +755,10 @@ data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
   with its path (shortened from the left to fit), the bytes its partial file
   holds of its size, and its speed over the last 10 s (`…` during its first
   second of data) or its state:
-  `waiting for room` (in the partial folder), `waiting for a connection`,
-  `no data for N s` (a connection with no data for 5 s or more),
+  `waiting for room` (in the partial folder), `waiting for a connection`
+  (none of its connections is open: a segment waits for a free one, or the
+  file for a new download link), `no data for N s` (a connection open but no
+  data for 5 s or more),
   `preallocating`, `hashing` (a local copy), `reading back` (a segmented
   file), `waiting for the copy` (of another file to DEST) and `copying N%`
   (to DEST, with `--partial-dir`). `… and N more` counts the rest.
@@ -803,8 +805,8 @@ writes one line a minute:
   left by the rate over the last 15 minutes (`ETA unknown` while it is 0).
   Both count only the bytes this run moved. During the first second of a
   phase there is no speed yet: the line leaves it out and says `ETA unknown`.
-- `N active, M without data`: the files in progress, and those of them that
-  have had a connection but no data for 5 s or more. `to retry` counts the
+- `N active, M without data`: the files in progress, and those of them with
+  a connection open but no data for 5 s or more. `to retry` counts the
   files deferred to a later pass; between passes the line ends with
   `pass 2 of 7 starts in 4 s`.
 - The last line of a phase gives the time it took and the average speed.

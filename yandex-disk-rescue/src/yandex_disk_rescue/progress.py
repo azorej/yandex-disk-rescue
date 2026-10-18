@@ -16,8 +16,8 @@ from typing import Literal, Protocol
 
 from yandex_disk_rescue.units import format_duration, format_size
 
-# A transfer that has received nothing for this long since it got its connection, or since its last bytes, is shown
-# as without data.
+# A transfer with a connection open that has received nothing for this long since it got a connection, or since its
+# last bytes, is shown as without data.
 STALL_SECONDS = 5.0
 SPEED_SECONDS = 60.0
 TRANSFER_SPEED_SECONDS = 10.0
@@ -243,9 +243,10 @@ class MoveProgress:
 
 @dataclass(frozen=True)
 class ActiveTransfer:
-    """A file in progress: its `held` bytes of `size`, its state, `idle`, the seconds since it last received bytes or
-    got its connection (`None` while it has no connection), `speed`, the bytes a second its connection received over
-    the last `TRANSFER_SPEED_SECONDS` (`None` until measured over `MIN_SPEED_SECONDS`), and `copied`, the bytes of its copy to the destination written so far."""
+    """A file in progress: its `held` bytes of `size`, its state (`downloading` while a connection of it is open),
+    `idle`, the seconds since it last received bytes or got a connection (`None` while it has none open), `speed`, the
+    bytes a second its connections received over the last `TRANSFER_SPEED_SECONDS` (`None` until measured over
+    `MIN_SPEED_SECONDS`), and `copied`, the bytes of its copy to the destination written so far."""
 
     path: str
     size: int
@@ -316,6 +317,7 @@ class _Active:
     state: TransferState
     connected: float | None
     rate: _Rate
+    connections: int = 0
     received: int = 0
     copied: int = 0
 
@@ -430,25 +432,42 @@ class MirrorProgress:
                 speeds=Speeds.of(self._rate, now, self._started, self._received),
             )
 
-    def _update(
-        self, key: int, *, state: TransferState | None = None, held: int = 0, received: int = 0, copied: int = 0
-    ) -> None:
+    def _update(self, key: int, *, state: TransferState | None = None, held: int = 0, copied: int = 0) -> None:
+        with self._lock:
+            active = self._active[key]
+            if state is not None:
+                if active.connections:
+                    raise RuntimeError(f'{active.path}: its state set to {state} with a connection open')
+                active.state = state
+            active.held += held
+            active.copied += copied
+
+    def _connection(self, key: int, change: Literal[1, -1]) -> None:
         with self._lock:
             active = self._active[key]
             now = time.monotonic()
-            if state is not None and state != active.state:
-                active.state = state
-                active.connected = now if state == 'downloading' else None
-                if state == 'downloading':
-                    active.received, active.rate = 0, _Rate(now)
-            active.held += held
-            active.copied += copied
-            if received:
+            active.connections += change
+            if active.connections < 0:
+                raise RuntimeError(f'{active.path}: a connection closed that was never open')
+            if change == 1:
                 active.connected = now
-                active.received += received
-                active.rate.note(now, active.received)
-                self._received += received
-                self._rate.note(now, self._received)
+                if active.connections == 1:
+                    active.state, active.received, active.rate = 'downloading', 0, _Rate(now)
+            elif active.connections == 0:
+                active.state, active.connected = 'waiting for a connection', None
+
+    def _received_bytes(self, key: int, size: int) -> None:
+        with self._lock:
+            active = self._active[key]
+            if not active.connections:
+                raise RuntimeError(f'{active.path}: bytes arrived with no connection open')
+            now = time.monotonic()
+            active.connected = now
+            active.held += size
+            active.received += size
+            active.rate.note(now, active.received)
+            self._received += size
+            self._rate.note(now, self._received)
 
     def _cut(self, key: int) -> None:
         with self._lock:
@@ -464,15 +483,24 @@ class ActiveFile:
         self.path = path
 
     def state(self, state: TransferState) -> None:
+        """The file's state, while none of its connections is open."""
         self._progress._update(self._key, state=state)
+
+    def connected(self) -> None:
+        """One more connection of the file is open: the file is downloading."""
+        self._progress._connection(self._key, 1)
+
+    def disconnected(self) -> None:
+        """A connection of the file closed; once none is open, the file waits for a connection again."""
+        self._progress._connection(self._key, -1)
 
     def kept(self, size: int) -> None:
         """The partial file holds `size` more bytes kept from an earlier turn."""
         self._progress._update(self._key, held=size)
 
     def wrote(self, size: int) -> None:
-        """`size` bytes arrived and were written to the partial file."""
-        self._progress._update(self._key, state='downloading', held=size, received=size)
+        """`size` bytes arrived on an open connection and were written to the partial file."""
+        self._progress._received_bytes(self._key, size)
 
     def cut(self) -> None:
         """The partial file was cut back to byte 0."""

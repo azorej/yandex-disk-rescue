@@ -303,8 +303,9 @@ quarantined in this run (excluding the held files).
       progress: MirrorProgress)`, `VerifyRun(mirror, destination, verify_pass, progress: VerifyProgress)`.
     - **Download events.** `MirrorRun` reports the `lstat` check as it runs. Every file counted in its pending total
       ends exactly once per pass it takes part in. A file deferred to a later pass ends as "to retry" and starts
-      again in that pass. A file under a failed folder ends failed without starting. A stream is "waiting for a
-      connection" until it calls for its link, and "without data" once 5 s pass with no bytes.
+      again in that pass. A file under a failed folder ends failed without starting. A file is "waiting for a
+      connection" while none of its streams holds one with its link, and "without data" once 5 s pass with a
+      connection open and no bytes.
     - **Verify events.** `VerifyRun` counts bytes as chunks are hashed.
   - **`console.Output.progress(state) -> ContextManager[None]`.** It runs the renderer for one phase.
     - **Plain mode.** A daemon thread emits a status record every `progress_interval` s to the log (always) and to
