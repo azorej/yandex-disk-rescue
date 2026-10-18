@@ -9,9 +9,10 @@ scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
-of a partial download (`download_segments`), the reason and count of an entry's failed turns (`failures`), and the copy
-of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
-wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all keyed by `entries.id`.
+of a partial download (`download_segments`), the reason and count of an entry's failed turns with its silent streak
+(`failures`), the copy of a download that failed verification and was moved to quarantine (`quarantined`), and what
+`verify` last found wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all
+keyed by `entries.id`.
 A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
 the manifest deletes its rows.
 A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got, and the
@@ -233,6 +234,16 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         # made before this column are unknown, so it starts at 1.
         'ALTER TABLE failures ADD COLUMN turns INTEGER NOT NULL DEFAULT 1 CHECK (turns >= 1)',
     ),
+    (
+        # The entry's silent streak: its last `silent_turns` failed turns in a row ended with no byte from the
+        # download host, the first of them at `silent_since` (the fixed-width UTC form of `_timestamp`). The streak of
+        # a record made before these columns is unknown, so it starts with none.
+        """
+        ALTER TABLE failures ADD COLUMN silent_turns INTEGER NOT NULL DEFAULT 0
+        CHECK (0 <= silent_turns AND silent_turns <= turns)
+        """,
+        'ALTER TABLE failures ADD COLUMN silent_since TEXT CHECK ((silent_turns = 0) = (silent_since IS NULL))',
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -334,11 +345,15 @@ class Finding:
 
 @dataclass(frozen=True)
 class FailureRecord:
-    """Why an entry's last failed turn in a mirror failed, as reported (`reason`), and how many of its turns there
-    failed since it last succeeded (`turns`, at least 1)."""
+    """Why an entry's last failed turn in a mirror failed, as reported (`reason`), how many of its turns there failed
+    since it last succeeded (`turns`, at least 1), and its silent streak: how many of those, the last ones in a row,
+    ended with no byte from the download host (`silent_turns`, at most `turns`), and when the first of them did
+    (`silent_since`, set exactly when `silent_turns` is above 0)."""
 
     reason: str
     turns: int
+    silent_turns: int
+    silent_since: datetime | None
 
 
 @dataclass(frozen=True)
@@ -801,14 +816,27 @@ class Mirror:
                 'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
 
-    def record_failure(self, entry_id: int, reason: str, *, turns: int) -> None:
-        """Record `reason` as why the entry's last failed turn failed and `turns` as its count of failed turns,
-        replacing any earlier record; the caller owns the count. Raises `ValueError` when `turns` is below 1."""
+    def record_failure(
+        self, entry_id: int, reason: str, *, turns: int, silent_turns: int, silent_since: datetime | None
+    ) -> None:
+        """Record `reason` as why the entry's last failed turn failed, `turns` as its count of failed turns, and
+        `silent_turns` from `silent_since` as its silent streak (see `FailureRecord`), replacing any earlier record;
+        the caller owns the counts. Raises `ValueError`, writing nothing, when `turns` is below 1, `silent_turns` is
+        outside `[0, turns]`, or `silent_since` is not set exactly when `silent_turns` is above 0."""
         if turns < 1:
             raise ValueError(f'a failure record counts at least 1 failed turn, not {turns}')
+        if not 0 <= silent_turns <= turns:
+            raise ValueError(f'a silent streak of {silent_turns} turns does not fit in {turns} failed turns')
+        if silent_turns > 0 and silent_since is None:
+            raise ValueError(f'a silent streak of {silent_turns} turns has no start time')
+        if silent_turns == 0 and silent_since is not None:
+            raise ValueError('an empty silent streak has a start time')
+        since = None if silent_since is None else _timestamp(silent_since)
         with self._manifest._transaction('update'):
             self._check_entry(entry_id)
-            self._manifest._connection.execute(_RECORD_FAILURE_SQL, (self.id, entry_id, reason, turns))
+            self._manifest._connection.execute(
+                _RECORD_FAILURE_SQL, (self.id, entry_id, reason, turns, silent_turns, since)
+            )
 
     def clear_failure(self, entry_id: int) -> None:
         """Delete the entry's failure, if any."""
@@ -932,7 +960,7 @@ class Mirror:
 _MIRROR_ENTRY_COLUMNS = """
     e.id, e.path, e.kind, e.size, e.md5, e.sha256, e.modified, n.local_path,
     d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino,
-    f.reason, f.turns,
+    f.reason, f.turns, f.silent_turns, f.silent_since,
     q.size, q.md5, q.sha256, q.modified, q.copy_path, q.reason,
     v.finding, v.reason
 """
@@ -994,8 +1022,10 @@ _RECORD_DOWNLOAD_SQL = """
         local_mtime_ns = excluded.local_mtime_ns, local_ino = excluded.local_ino
 """
 _RECORD_FAILURE_SQL = """
-    INSERT INTO failures (mirror_id, entry_id, reason, turns) VALUES (?, ?, ?, ?)
-    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET reason = excluded.reason, turns = excluded.turns
+    INSERT INTO failures (mirror_id, entry_id, reason, turns, silent_turns, silent_since) VALUES (?, ?, ?, ?, ?, ?)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET
+        reason = excluded.reason, turns = excluded.turns, silent_turns = excluded.silent_turns,
+        silent_since = excluded.silent_since
 """
 _RECORD_QUARANTINE_SQL = """
     INSERT INTO quarantined (mirror_id, entry_id, size, md5, sha256, modified, copy_path, reason)
@@ -1246,10 +1276,17 @@ def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
         resource=_resource(row[1:7]),
         local_path=None if local_path is None else PurePosixPath(local_path),
         download=None if row[8] is None else _download_record(row[8:17], segments),
-        failure=None if row[17] is None else FailureRecord(reason=row[17], turns=row[18]),
-        quarantine=None if row[19] is None else _quarantine(row[19:25]),
-        finding=None if row[25] is None else Finding(kind=row[25], reason=row[26]),
+        failure=None if row[17] is None else _failure(row[17:21]),
+        quarantine=None if row[21] is None else _quarantine(row[21:27]),
+        finding=None if row[27] is None else Finding(kind=row[27], reason=row[28]),
     )
+
+
+def _failure(row: tuple) -> FailureRecord:
+    """Build a `FailureRecord` from the `failures` columns reason, turns, silent_turns and silent_since."""
+    reason, turns, silent_turns, silent_since = row
+    since = None if silent_since is None else datetime.fromisoformat(silent_since)
+    return FailureRecord(reason=reason, turns=turns, silent_turns=silent_turns, silent_since=since)
 
 
 def _quarantine(row: tuple) -> Quarantine:

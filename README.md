@@ -250,9 +250,11 @@ it stalls and delays no other file.
 
 **Order.** Files with no failure record start first, in path order. Files that
 failed before start after all of them, fewest failed turns first, ties in path
-order, so a restart reaches new and healthy data at once. Each later pass
-follows the same rule over the files still to download. A partial download
-keeps its confirmed bytes whenever its turn comes, and folders are still made
+order, so a restart reaches new and healthy data at once. A file
+[unavailable on Yandex Disk](#downloading) has failed more turns than most, so
+it comes near the end of pass 1, and a plain run gives it no later pass. Each
+later pass follows the same rule over the files still to download. A partial
+download keeps its confirmed bytes whenever its turn comes, and folders are still made
 before anything inside them. With `--partial-dir`, a file that fits only once
 the kept partial file of an earlier failed download is gone may meet `no room
 yet` in pass 1 and get the room in the next pass; with `--download-passes 1`
@@ -473,12 +475,31 @@ stream, never appended to the bytes kept.
   pause (longer when the host sent `Retry-After`, up to 300 s). The other
   segments of such a file finish first, and the next pass fetches only the
   segments still missing. A run makes at most `download_passes` passes
-  (`0`: until every file is done or Ctrl+C); a file still failing after the
-  last one is reported with its last reason and `(after N passes)`. Once a
-  file needed another pass, the summary shows `Passes: <used> of <limit>`. A
+  (`0`: until every file is done or unavailable on Yandex Disk, or Ctrl+C); a
+  file still failing after the last one is reported with its last reason and
+  `(after N passes)`, or as unavailable on Yandex Disk (below). Once a file
+  needed another pass, the summary shows `Passes: <used> of <limit>`. A
   checksum mismatch quarantines the file at once, and a refused download, a
   file changed in the cloud and a local write error fail it at once, stopping
   its other segments; no later pass retries it.
+- **Unavailable on Yandex Disk.** A file whose download host sent no byte of
+  it on its last 7 attempts in a row, the first of them at least a day ago, is
+  reported under `Failed` as `Yandex Disk never started sending this file: no
+  data in its last N attempts since <YYYY-MM-DD HH:MM> UTC, each with a new
+  download link (the last: <reason>)`, or, when part of it is confirmed on
+  disk, as `Yandex Disk stopped sending this file after <size>: …`. The
+  attempts count across passes and runs. A `429` or any answer with
+  `Retry-After` is throttling, which neither counts nor starts over; a byte
+  received, or a failure for any other reason (a refused download, a local
+  error), starts the count over. The summary then adds, after the `Failed`
+  list, `N of them never got data from Yandex Disk for a day or more: open
+  them in the Yandex Disk web interface, and ask Yandex support about those
+  that do not open there either.` A plain `download` gives such a file one
+  attempt per run, in pass 1, and fails it at once when the host sends
+  nothing again, without `(after N passes)`; an attempt the host throttles
+  waits for the next pass as usual. A byte received makes it an ordinary file
+  again, so a file Yandex restores is fetched by the next run.
+  `--retry-failed` gives it every pass.
 - **Expired links.** The segments of a file share one download link per pass,
   requested only once a segment has a free connection, so no link ages while
   it waits for one. A link the host rejects (`401`, `403` or `410`) is
@@ -492,9 +513,11 @@ recorded in the manifest for that DEST, as soon as a turn of it fails: a
 refused download, a file changed or removed in the cloud, a local error, a
 hard link to another file of the mirror, a refused name, a folder that could
 not be made, every entry under such a folder, and a transient transfer failure
-that waits for a later pass. The record holds the reason last shown and the
-count of failed turns since the entry last succeeded; a file still failing
-after the last pass keeps the count and gets the reason it is reported with.
+that waits for a later pass. The record holds the reason last shown, the
+count of failed turns since the entry last succeeded, and how many of the
+last of them in a row got no byte from the download host, since when (what
+makes a file [unavailable on Yandex Disk](#downloading)); a file still failing
+after the last pass keeps the counts and gets the reason it is reported with.
 The record is dropped once the entry succeeds: a file verified or adopted, a
 folder made or found in place. A turn stopped by Ctrl+C, SIGTERM or an error
 that stops the run records nothing: the file keeps any earlier record, and its
@@ -532,7 +555,7 @@ they fail every run, `--retry-failed` included.
 
 ```
 Downloading 120 files (1.2 GiB) to /mnt/backup/Photos
-Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 1 quarantined, 1 failed
+Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 1 quarantined, 2 failed
 Passes: 2 of 7
 Already on disk and verified: 40
   disk:/Photos/2023/beach.jpg
@@ -549,8 +572,10 @@ Moved aside to .yandex-disk-rescue/replaced/2026-10-17T09-30-00Z/: 2
 Quarantined: 1
   disk:/Photos/bad.jpg: MD5 mismatch (expected …, got …); kept at .yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg
 Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).
-Failed: 1
+Failed: 2
   disk:/Photos/gone.jpg: removed from the Disk after the scan
+  disk:/Photos/napkin.jpg: Yandex Disk never started sending this file: no data in its last 8 attempts since 2026-10-16 08:12 UTC, each with a new download link (the last: the download stalled: no data for 15 s)
+1 of them never got data from Yandex Disk for a day or more: open them in the Yandex Disk web interface, and ask Yandex support about those that do not open there either.
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
@@ -764,8 +789,10 @@ Each file of the mirror, as of the last scan, is one of:
 - **Quarantined:** its last download [failed the check](#downloading) and is
   kept in `quarantine/`; listed with the reason and the copy's path.
 - **Not downloaded:** no verified copy of the current Disk version: never
-  downloaded, failed (with the reason), unfinished, changed on the Disk since
-  it was downloaded, or a name that is not valid Unicode.
+  downloaded, failed (with the reason its last failed turn was reported with,
+  such as `Yandex Disk never started sending this file: …`), unfinished,
+  changed on the Disk since it was downloaded, or a name that is not valid
+  Unicode.
 
 A file with a finding (missing, modified or corrupt) is listed under its
 finding even when a later download of it was quarantined: the finding
@@ -1093,7 +1120,9 @@ is `scan`'s `without_checksum.sample`, the 20 smallest paths, with the full
 `download` (`skipped` includes `adopted`, as in the summary's first line;
 `passes` is `null` until a transient failure defers a file; `unreadable`
 lists the copies in DEST found unreadable and downloaded again, each with
-`path` and `reason`, also when that download then failed; `scan` is the
+`path` and `reason`, also when that download then failed; each `failed`
+item has `unavailable`, `true` for a file [unavailable on Yandex
+Disk](#downloading), and `counts.unavailable` counts those; `scan` is the
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
@@ -1109,13 +1138,13 @@ sparse files, without which new downloads are not segmented):
   "scan": {"reused": true, "root": "disk:/Photos", "completed_at": "2026-10-17T09:20:11.004Z"},
   "to_download": {"files": 12, "size": 104857600},
   "counts": {"downloaded": 10, "downloaded_size": 94371840, "skipped": 1191, "adopted": 0, "size_only": 0,
-             "renamed": 0, "unreadable": 0, "moved_aside": 0, "quarantined": 1, "failed": 1},
+             "renamed": 0, "unreadable": 0, "moved_aside": 0, "quarantined": 1, "failed": 1, "unavailable": 0},
   "passes": {"used": 2, "limit": 7},
   "adopted": [], "size_only": [], "renamed": [{"path": "disk:/Photos/a?b.jpg", "local": "a_b~1f2e3d4c.jpg"}],
   "unreadable": [], "moved_aside": [], "replaced_folder": null,
   "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
                    "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
-  "failed": [{"path": "disk:/Photos/gone.jpg", "reason": "removed from the Disk after the scan"}],
+  "failed": [{"path": "disk:/Photos/gone.jpg", "reason": "removed from the Disk after the scan", "unavailable": false}],
   "partials_left": [],
   "partial_dir": "/mnt/fast",
   "partial_move": {"source": "/mnt/old/0a1b2c3d4e5f6a7b", "target": "/mnt/fast/0a1b2c3d4e5f6a7b",
@@ -1373,7 +1402,7 @@ first one that sets it wins:
 | `api_url` | `--api-url` (hidden) | `YANDEX_DISK_RESCUE_API_URL` | `https://cloud-api.yandex.net` | an `http://` or `https://` URL |
 | `download_timeout` | `--download-timeout` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_TIMEOUT` | `15` | 1 to 600 (s); a download with no data from the host for this long has stalled |
 | `download_retries` | `--download-retries` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_RETRIES` | `5` | 0 to 20; immediate resumes of a download that failed after new data |
-| `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until all are done |
+| `download_passes` | `--download-passes` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_PASSES` | `7` | 0 to 1000; passes over the files still to download, `0` until every file is done or unavailable on Yandex Disk |
 | `download_connections` | `--download-connections` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CONNECTIONS` | `20` | 1 to 64; requests to the download host in flight, and so files downloading at once |
 | `download_checkpoint_mib` | `--download-checkpoint-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | `32` | 1 to 1024 (MiB); bytes a segment receives between two checkpoints of a download |
 | `download_segments` | `--download-segments` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | `4` | 1 to 8; segments of a file above the segment threshold, fetched in parallel; `1` never splits |

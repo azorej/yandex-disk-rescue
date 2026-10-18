@@ -11,9 +11,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 - SIGTERM (`kill`, `systemctl stop`, `docker stop`) stops `scan`, `download` and `verify` cleanly, as Ctrl+C does,
   with exit code 143.
+- A file Yandex Disk sends no data for, on 7 attempts in a row over at least a day, is reported as unavailable on
+  Yandex Disk (`Yandex Disk never started sending this file: …`, or `… stopped sending this file after <size>: …`) in
+  the summary, with a hint to check it in the web interface and ask Yandex support, in `--json` (`unavailable`) and
+  in `verify`. The manifest keeps each failure's streak of attempts without data (schema version 11).
 
 ### Changed
 
+- A plain `download` tries a file unavailable on Yandex Disk once per run, at the end of pass 1, instead of on every
+  pass, so `--download-passes 0` ends once only such files are left; `--retry-failed` still gives it every pass.
 - `download` fetches files as one stream, without segments, when the partial folder's filesystem has no sparse files
   (HFS+, exFAT, FAT), instead of writing each segmented file's zeros first. The run says so in one line, and its JSON
   report has `sparse_partials`.

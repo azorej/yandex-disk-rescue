@@ -114,6 +114,10 @@ from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 from yandex_disk_rescue.units import format_size
 
 PASS_PAUSE_SECONDS = 5.0
+# A file whose download host sent no byte on its last `UNAVAILABLE_TURNS` failed turns in a row, the first of them at
+# least `UNAVAILABLE_AGE` ago, is unavailable on Yandex Disk.
+UNAVAILABLE_TURNS = 7
+UNAVAILABLE_AGE = timedelta(hours=24)
 CHECKPOINT_SECONDS = 15.0
 # The bytes of a separate partial folder's filesystem the partial files leave free for everything else.
 PARTIAL_RESERVE = 2**30
@@ -157,11 +161,15 @@ class FileQuarantined(Exception):
 class FileDeferred(FileFailed):
     """The file's transfer failed transiently (a stall, a connection error, 408, 429 or 5xx, the retries spent, a
     refreshed link rejected again); its partial file and record are kept so a later pass resumes it. `retry_after` is
-    the wait the download host asked for, if any."""
+    the wait the download host asked for, if any; `throttled` is set when the host was throttling (429 or a
+    `Retry-After`, on any segment), and `received` when any byte of the file was written in the turn, by any attempt
+    of any segment."""
 
-    def __init__(self, reason: str, *, retry_after: float | None) -> None:
+    def __init__(self, reason: str, *, retry_after: float | None, throttled: bool, received: bool) -> None:
         super().__init__(reason)
         self.retry_after = retry_after
+        self.throttled = throttled
+        self.received = received
 
 
 class NoRoomYet(FileDeferred):
@@ -169,14 +177,47 @@ class NoRoomYet(FileDeferred):
     reason it fails with once no turn of the room can end to free any."""
 
     def __init__(self, reason: str, *, final: str) -> None:
-        super().__init__(reason, retry_after=None)
+        super().__init__(reason, retry_after=None, throttled=False, received=False)
         self.final = final
 
 
 @dataclass(frozen=True)
 class Failure:
+    """An entry that failed for `reason`; `unavailable` when it is a file unavailable on Yandex Disk (see
+    `UNAVAILABLE_TURNS`)."""
+
     path: str
     reason: str
+    unavailable: bool = False
+
+
+@dataclass(frozen=True)
+class _Streak:
+    """An entry's silent streak (see `FailureRecord`): its last `turns` failed turns in a row were silent, the first
+    at `since`; `last` is the reason of the last of them this run, or, with `throttled`, of the last turn this run
+    the host throttled while it saw no silent one."""
+
+    turns: int = 0
+    since: datetime | None = None
+    last: str | None = None
+    throttled: bool = False
+
+    def unavailable(self, now: datetime) -> bool:
+        """Whether the streak makes its file unavailable on Yandex Disk at `now`."""
+        return self.since is not None and self.turns >= UNAVAILABLE_TURNS and now - self.since >= UNAVAILABLE_AGE
+
+
+def _unavailable_reason(streak: _Streak, confirmed: int) -> str:
+    """The reason a file unavailable on Yandex Disk by `streak`, with `confirmed` bytes of it confirmed, fails with."""
+    if streak.since is None:
+        raise ValueError('an empty silent streak makes no file unavailable')
+    if confirmed:
+        head = f'Yandex Disk stopped sending this file after {format_size(confirmed)}'
+    else:
+        head = 'Yandex Disk never started sending this file'
+    since = f'{streak.since.astimezone(UTC):%Y-%m-%d %H:%M} UTC'
+    last = '' if streak.last is None else f' (the last: {streak.last})'
+    return f'{head}: no data in its last {streak.turns} attempts since {since}, each with a new download link{last}'
 
 
 @dataclass(frozen=True)
@@ -660,6 +701,16 @@ class MirrorRun:
     failure then shown as its last retry. Each entry the manifest records as left out of its scan, because its name
     is not valid Unicode, is a failure of the run, and has no record.
 
+    The record also keeps the entry's silent streak, carried across runs. A deferred turn that received no byte of
+    the file, while the host was not throttling, is silent and makes it one turn longer, the first starting it at the
+    turn's end; a throttled deferral and a deferral for room leave it as it is; any other failed turn (a deferral that
+    received a byte, a file or folder that fails, an entry below a failed folder, the one more failed turn counted
+    once the passes end) ends it. While the streak has at least `UNAVAILABLE_TURNS` turns and started
+    `UNAVAILABLE_AGE` or longer ago, the file is unavailable on Yandex Disk: every record written for it carries the
+    unavailable reason instead of the turn's own, and its failure is reported with that reason, flagged
+    `unavailable`. Outside `retry_failed`, a silent turn that leaves the file unavailable fails it at once, with no
+    later pass in the run; a throttled turn defers it as any other file.
+
     A copy found unreadable gets its `corrupt` finding recorded and a notice when it is found, and is listed under
     `unreadable` whatever then happens to the file; a later pass of the run gives the file that finding, so the copy
     is not read again.
@@ -676,6 +727,7 @@ class MirrorRun:
         self._entries = _retry_walk(entries, self._names) if retry_failed else entries
         self._positions = {entry.entry_id: position for position, entry in enumerate(self._entries)}
         self._held = set() if retry_failed else {e.entry_id for e in self._entries if is_held(e)}
+        self._retry_failed = retry_failed
         in_progress = [e for e in entries if e.download is not None and e.download.state == 'partial']
         destination.remove_staged_copies()
         self._in_progress = [e.entry_id for e in in_progress]
@@ -683,6 +735,11 @@ class MirrorRun:
         self._current = self._check(destination)
         self._unreadable: dict[int, Finding] = {}
         self._failed_turns = {e.entry_id: e.failure.turns for e in self._entries if e.failure is not None}
+        self._streaks = {
+            e.entry_id: _Streak(e.failure.silent_turns, e.failure.silent_since)
+            for e in self._entries
+            if e.failure is not None
+        }
         self._counted: set[int] = set()
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
@@ -696,6 +753,9 @@ class MirrorRun:
         ]
         self._pending = {e.entry_id for e in pending}
         self._failed_before = sum(1 for e in pending if e.entry_id in self._failed_turns)
+        now = datetime.now(UTC)
+        unavailable = [] if retry_failed else [e for e in pending if self._streak(e).unavailable(now)]
+        self._unavailable_before = len(unavailable)
         self.pending_files = len(pending)
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
@@ -818,7 +878,8 @@ class MirrorRun:
 
         Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
         most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
-        the download host asked for. Each file is fetched as `policy` says.
+        the download host asked for. Each file is fetched as `policy` says. Outside `retry_failed`, a file unavailable
+        on Yandex Disk after a silent turn is not deferred but fails at once, so it gets no later pass.
 
         In every pass up to `content.connections` files are in progress at once, started as slots free up by their
         failed turns so far in this mirror, fewest first, then in path order: the first pass starts each file with no
@@ -843,7 +904,15 @@ class MirrorRun:
             holds = HashHolds.of(self._destination)
             tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), holds, room, report, policy)
             changes = _changes(room)
-            _log_pass(1, passes, self.pending_files, self.pending_size, pause=None, failed_before=self._failed_before)
+            _log_pass(
+                1,
+                passes,
+                self.pending_files,
+                self.pending_size,
+                pause=None,
+                failed_before=self._failed_before,
+                unavailable=self._unavailable_before,
+            )
             deferred = await self._first_pass(tools)
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes, changes=changes)
@@ -926,9 +995,10 @@ class MirrorRun:
     async def _later_passes(
         self, deferred: list[tuple[MirrorEntry, FileDeferred]], tools: _RunTools, *, passes: int, changes: int
     ) -> None:
-        """Resume the `deferred` files in later passes, at most `passes` in all (0: no limit). When the files a pass
-        deferred all wait for room, and the room is as it was when that pass began (at `changes`), no later pass could
-        fit them: they fail at once with their final reason."""
+        """Resume the `deferred` files in later passes, at most `passes` in all (0: no limit); outside `retry_failed`
+        a silent turn that leaves a file unavailable on Yandex Disk fails it at once instead (see `_turn`). When the
+        files a pass deferred all wait for room, and the room is as it was when that pass began (at `changes`), no
+        later pass could fit them: they fail at once with their final reason."""
         used = 1
         while deferred and not _stuck_for_room(deferred, tools.room, changes) and (passes == 0 or used < passes):
             waits = [failure.retry_after for _, failure in deferred if failure.retry_after is not None]
@@ -954,17 +1024,35 @@ class MirrorRun:
     async def _turn(
         self, entry: MirrorEntry, tools: _RunTools, deferred: list[tuple[MirrorEntry, FileDeferred]]
     ) -> None:
-        """One file's turn in a pass; a deferred file is added to `deferred`."""
-        if (later := await self._download(entry, tools)) is not None:
-            _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
-            if not isinstance(later, NoRoomYet):
-                self._mirror.record_failure(entry.entry_id, later.reason, turns=self._count_failed_turn(entry))
-            self._progress.defer(entry.entry_id)
-            deferred.append((entry, later))
+        """One file's turn in a pass; a deferred file is added to `deferred`. Outside `retry_failed`, a silent turn
+        that leaves the file unavailable on Yandex Disk fails it at once instead."""
+        if (later := await self._download(entry, tools)) is None:
+            return
+        if not isinstance(later, NoRoomYet):
+            turns = self._count_failed_turn(entry)
+            reason, unavailable = self._record(
+                entry, later.reason, turns=turns, streak=self._after_deferral(entry, later)
+            )
+            if unavailable and not later.throttled and not self._retry_failed:
+                self._report_failed(tools.report, entry, reason, unavailable=True)
+                return
+        _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
+        self._progress.defer(entry.entry_id)
+        deferred.append((entry, later))
 
     def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str, *, new_turn: bool = True) -> None:
-        """Report `entry` as failed for `reason` and record it; `new_turn` counts one more failed turn, otherwise the
-        record keeps the count this run already gave it."""
+        """Report `entry` as failed for `reason` and record it; `new_turn` counts one more failed turn and ends its
+        silent streak, otherwise the record keeps the count and the streak this run already gave it. While the streak
+        makes the file unavailable, it is reported and recorded with the unavailable reason instead."""
+        if new_turn:
+            turns, streak = self._count_failed_turn(entry), _Streak()
+        else:
+            turns, streak = self._failed_turns[entry.entry_id], self._streak(entry)
+        reason, unavailable = self._record(entry, reason, turns=turns, streak=streak)
+        self._report_failed(report, entry, reason, unavailable=unavailable)
+
+    def _report_failed(self, report: MirrorReport, entry: MirrorEntry, reason: str, *, unavailable: bool) -> None:
+        """Report `entry`, already recorded, as failed for `reason`, or as quarantined when it is held."""
         path = entry.resource.path
         outcome: Outcome
         if is_held(entry):
@@ -974,11 +1062,45 @@ class MirrorRun:
             outcome = 'quarantined'
         else:
             _log.warning('%s failed: %s', path, reason)
-            report.failed.append(Failure(entry.resource.path, reason))
+            report.failed.append(Failure(entry.resource.path, reason, unavailable))
             outcome = 'failed'
-        turns = self._count_failed_turn(entry) if new_turn else self._failed_turns[entry.entry_id]
-        self._mirror.record_failure(entry.entry_id, reason, turns=turns)
         self._settle(entry, outcome)
+
+    def _record(self, entry: MirrorEntry, reason: str, *, turns: int, streak: _Streak) -> tuple[str, bool]:
+        """Record the failure of `entry`'s last failed turn for `reason`, with `turns` failed turns and `streak` as
+        its silent streak; the reason recorded, which is the unavailable reason while the streak makes the file
+        unavailable, and whether it does."""
+        self._streaks[entry.entry_id] = streak
+        unavailable = streak.unavailable(datetime.now(UTC))
+        if unavailable:
+            reason = _unavailable_reason(streak, self._confirmed_bytes(entry))
+        self._mirror.record_failure(
+            entry.entry_id, reason, turns=turns, silent_turns=streak.turns, silent_since=streak.since
+        )
+        return reason, unavailable
+
+    def _after_deferral(self, entry: MirrorEntry, deferred: FileDeferred) -> _Streak:
+        """The silent streak of `entry` after a turn `deferred`: ended when the turn received a byte, the same when
+        the host was throttling (with the turn's reason as its last while this run saw no silent turn), and one
+        silent turn longer otherwise."""
+        streak = self._streak(entry)
+        if deferred.received:
+            return _Streak()
+        if deferred.throttled:
+            if streak.last is not None and not streak.throttled:
+                return streak
+            return replace(streak, last=deferred.reason, throttled=True)
+        return _Streak(streak.turns + 1, streak.since or datetime.now(UTC), deferred.reason)
+
+    def _streak(self, entry: MirrorEntry) -> _Streak:
+        return self._streaks.get(entry.entry_id, _Streak())
+
+    def _confirmed_bytes(self, entry: MirrorEntry) -> int:
+        """The bytes of `entry` its partial download record confirms; 0 without one."""
+        download = self._mirror.download(entry.entry_id)
+        if download is None or download.state != 'partial':
+            return 0
+        return sum(segment.confirmed - segment.start for segment in download.segments)
 
     def _count_failed_turn(self, entry: MirrorEntry) -> int:
         """Count one more failed turn of `entry`; its failed turns since it last succeeded."""
@@ -1851,15 +1973,17 @@ class _FileFetch:
         self._threads = threads
         self._retries = retries
         self._progress = progress
+        self._received = False
 
     async def run(self) -> None:
         """Fetch every pending stream of the journal.
 
         The turn ends when every stream is complete or has stopped. A stream that fails cancels the others, which
         take their checkpoints, and the file fails with its error. Streams deferred by a transient failure let the
-        others run on; then the file is deferred with the first one's reason and the longest wait the host asked
-        for. When the host ignores a segment's range, the journal is replaced by one segment holding the whole file,
-        the partial file is cut back to byte 0, and the file is fetched again as one stream.
+        others run on; then the file is deferred with the first one's reason, the longest wait the host asked for,
+        whether any of them met a throttling host, and whether any byte of the file was written in the turn. When
+        the host ignores a segment's range, the journal is replaced by one segment holding the whole file, the
+        partial file is cut back to byte 0, and the file is fetched again as one stream.
 
         Raises `FileDeferred`, `FileFailed`, or an error that stops the run.
         """
@@ -1881,7 +2005,12 @@ class _FileFetch:
         deferred = [result for result in results if result is not None]
         if deferred:
             waits = [failure.retry_after for failure in deferred if failure.retry_after is not None]
-            raise FileDeferred(deferred[0].reason, retry_after=max(waits, default=None))
+            raise FileDeferred(
+                deferred[0].reason,
+                retry_after=max(waits, default=None),
+                throttled=any(failure.throttled for failure in deferred),
+                received=self._received,
+            )
 
     async def _stream(self, stream: _Stream) -> FileDeferred | None:
         """Fetch the rest of `stream`; the failure when it is deferred to a later pass.
@@ -1901,6 +2030,7 @@ class _FileFetch:
 
         async def write(offset: int, chunk: bytes) -> None:
             await stream.write(self._partial, self._threads, offset, chunk)
+            self._received = True
             self._progress.wrote(len(chunk))
             await self._journal.written(stream)
 
@@ -1915,7 +2045,7 @@ class _FileFetch:
             except api.LinkExpiredError as exc:
                 if not await self._link.rejected(generation):
                     reason = f'download link rejected again after a refresh (HTTP {exc.status})'
-                    return FileDeferred(reason, retry_after=None)
+                    return FileDeferred(reason, retry_after=None, throttled=False, received=self._received)
             except api.RangeNotHonouredError as exc:
                 if before == 0 and stream.end == size:
                     raise FileFailed(exc.reason) from None
@@ -1925,7 +2055,9 @@ class _FileFetch:
                     return None
                 if stream.written == before or attempt_number > self._retries:
                     reason = exc.reason if attempt_number == 1 else f'{exc.reason} (after {attempt_number} attempts)'
-                    return FileDeferred(reason, retry_after=exc.retry_after)
+                    return FileDeferred(
+                        reason, retry_after=exc.retry_after, throttled=exc.throttled, received=self._received
+                    )
                 _log.debug('%s: %s; resuming at once from byte %d', self._path, exc.reason, stream.written)
                 attempt_number += 1
             except api.TransferError as exc:
@@ -1977,7 +2109,8 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
 def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
     files, renamed entries, the copies found unreadable, what was moved aside, quarantined files with their reasons and
-    copies, and failures with their reasons; each list shows its first `limit` members (`None`: all)."""
+    copies, and failures with their reasons, with a hint when any is unavailable on Yandex Disk; each list shows its
+    first `limit` members (`None`: all)."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
@@ -2013,6 +2146,8 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines.append(f'Failed: {len(report.failed)}')
         shown = [f'{failure.path}: {failure.reason}' for failure in report.failed]
         lines += listed('', shown, len(shown), '', limit=limit)
+        if unavailable := sum(failure.unavailable for failure in report.failed):
+            lines.append(_unavailable_hint(unavailable))
     if report.partials_left:
         lines.append(f'Partial files not deleted: {len(report.partials_left)}')
         shown = [f'{left.path}: {left.reason}' for left in report.partials_left]
@@ -2021,8 +2156,8 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
 
 
 def mirror_document(report: MirrorReport) -> dict[str, object]:
-    """The JSON object of a run: the counts of the summary's head line (`skipped` includes `adopted`), the passes,
-    and every list in full."""
+    """The JSON object of a run: the counts of the summary's head line (`skipped` includes `adopted`; `unavailable`
+    counts the failures unavailable on Yandex Disk, each flagged in `failed`), the passes, and every list in full."""
     passes = None if report.passes is None else {'used': report.passes[0], 'limit': report.passes[1]}
     return {
         'remote_root': report.remote_root,
@@ -2038,6 +2173,7 @@ def mirror_document(report: MirrorReport) -> dict[str, object]:
             'moved_aside': len(report.moved_aside),
             'quarantined': len(report.quarantined),
             'failed': len(report.failed),
+            'unavailable': sum(failure.unavailable for failure in report.failed),
         },
         'passes': passes,
         'adopted': report.adopted,
@@ -2047,9 +2183,19 @@ def mirror_document(report: MirrorReport) -> dict[str, object]:
         'moved_aside': [str(local) for local in report.moved_aside],
         'replaced_folder': None if report.replaced_folder is None else str(report.replaced_folder),
         'quarantined': [quarantined_document(held) for held in report.quarantined],
-        'failed': [{'path': failure.path, 'reason': failure.reason} for failure in report.failed],
+        'failed': [
+            {'path': failure.path, 'reason': failure.reason, 'unavailable': failure.unavailable}
+            for failure in report.failed
+        ],
         'partials_left': [{'path': str(left.path), 'reason': left.reason} for left in report.partials_left],
     }
+
+
+def _unavailable_hint(count: int) -> str:
+    return (
+        f'{count} of them never got data from Yandex Disk for a day or more: open them in the Yandex Disk web interface, and '
+        'ask Yandex support about those that do not open there either.'
+    )
 
 
 def _assign_local_names(mirror: Mirror) -> list[MirrorEntry]:
@@ -2241,11 +2387,23 @@ def _note_moved_aside(report: MirrorReport, destination: Destination, local: Pur
     report.moved_aside.append(local)
 
 
-def _log_pass(number: int, passes: int, files: int, size: int, *, pause: float | None, failed_before: int = 0) -> None:
-    """Log the start of a pass over `files` files of `size` bytes, `failed_before` of which have a failure record."""
+def _log_pass(
+    number: int,
+    passes: int,
+    files: int,
+    size: int,
+    *,
+    pause: float | None,
+    failed_before: int = 0,
+    unavailable: int = 0,
+) -> None:
+    """Log the start of a pass over `files` files of `size` bytes, `failed_before` of which have a failure record and
+    `unavailable` of which are unavailable on Yandex Disk and get one try."""
     start = 'starts' if pause is None else f'starts in {pause:g} s'
     if failed_before:
         start += f'; {failed_before} that failed before'
+    if unavailable:
+        start += f'; {unavailable} unavailable on Yandex Disk get one try'
     limit = passes or 'unlimited'
     noun = 'file' if files == 1 else 'files'
     _log.info('Pass %d of %s over %d %s (%s) %s', number, limit, files, noun, format_size(size), start)

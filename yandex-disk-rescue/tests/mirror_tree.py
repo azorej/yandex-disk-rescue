@@ -4,15 +4,17 @@ to run `download`, run a command in a child process, look at its destination, an
 import hashlib
 import os
 import re
+import sqlite3
 import subprocess
 import time
-from datetime import UTC, datetime
+from contextlib import closing
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
-from yandex_disk_rescue.paths import log_path
+from yandex_disk_rescue.paths import log_path, manifest_path
 
 runner = CliRunner()
 
@@ -64,6 +66,39 @@ def wait_until(condition, child: subprocess.Popen[str], what: str) -> None:
         if time.monotonic() > deadline:
             pytest.fail(f'{_command(child)} never {what}')
         time.sleep(0.01)
+
+
+def failure_records() -> dict[str, tuple[str, int, int, datetime | None]]:
+    """The (reason, failed turns, silent turns, start of the silent streak) of every failure record in the manifest, by
+    remote path in path order, read with a connection of its own."""
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        rows = connection.execute(
+            'SELECT e.path, f.reason, f.turns, f.silent_turns, f.silent_since FROM failures f'
+            ' JOIN entries e ON e.id = f.entry_id ORDER BY e.path'
+        ).fetchall()
+    return {
+        path: (reason, turns, silent_turns, None if since is None else datetime.fromisoformat(since))
+        for path, reason, turns, silent_turns, since in rows
+    }
+
+
+def failure_record(path: str) -> tuple[str, int, int, datetime | None]:
+    """The failure record of `path`, as `failure_records` gives it."""
+    return failure_records()[path]
+
+
+def age_silence(path: str, hours: float) -> datetime:
+    """Move the start of the silent streak in the failure record of `path` back by `hours`, in the manifest, as if
+    that much time had passed since; the new start."""
+    *_, since = failure_record(path)
+    assert since is not None, f'{path} has no silent streak'
+    aged = since - timedelta(hours=hours)
+    with closing(sqlite3.connect(manifest_path())) as connection, connection:
+        connection.execute(
+            'UPDATE failures SET silent_since = ? WHERE entry_id = (SELECT id FROM entries WHERE path = ?)',
+            (aged.astimezone(UTC).isoformat(timespec='microseconds'), path),
+        )
+    return aged
 
 
 def local_file(dest, remote_path: str):

@@ -34,6 +34,9 @@ from yandex_disk_rescue.paths import state_dir
 
 UID = '1'
 MODIFIED = datetime(2024, 5, 1, 12, 30, tzinfo=UTC)
+STALLED = 'the download stalled: no data for 15 s'
+SILENT_SINCE = datetime(2026, 10, 17, 9, 30, 15, 123456, tzinfo=UTC)
+_EMPTY_STREAK = {'silent_turns': 0, 'silent_since': None}
 
 
 def _file(path: str, size: int = 10, md5: str | None = 'aa', modified: datetime = MODIFIED) -> Resource:
@@ -226,9 +229,16 @@ def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_a
     _scan(db, TREE)
     with Manifest.open(db) as manifest:
         mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
-        mirror.record_failure(_entry_ids(mirror)['disk:/A/keep.txt'], 'the download stalled: no data for 15 s', turns=3)
+        mirror.record_failure(
+            _entry_ids(mirror)['disk:/A/keep.txt'],
+            STALLED,
+            turns=3,
+            silent_turns=2,
+            silent_since=MODIFIED,
+        )
     with closing(sqlite3.connect(db)) as connection, connection:
-        connection.execute('ALTER TABLE failures DROP COLUMN turns')
+        connection.execute('ALTER TABLE failures DROP COLUMN silent_since')
+        connection.execute('ALTER TABLE failures DROP COLUMN silent_turns')
         connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 1}')
     with Manifest.open_existing(db) as manifest:
         assert [r.path for r in manifest.entries(UID, 'disk:/')] == sorted(r.path for r in TREE)
@@ -237,7 +247,7 @@ def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_a
         with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
             Manifest.open_existing(db)
         failures = _failures(manifest.mirror(UID, 'disk:/', Path('/dest')))
-    assert failures == {'disk:/A/keep.txt': FailureRecord('the download stalled: no data for 15 s', 1)}
+    assert failures == {'disk:/A/keep.txt': FailureRecord(STALLED, 3, 0, None)}
     with closing(sqlite3.connect(db)) as connection:
         assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
 
@@ -372,7 +382,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 10
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 11
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -396,7 +406,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 10
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 11
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -427,7 +437,7 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 10
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 11
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
@@ -830,12 +840,22 @@ def test_a_failure_is_replaced_kept_by_forget_and_dropped_by_verifying_or_cleari
     placed.write_bytes(b'0123456789')
     with manifest:
         other = manifest.mirror(UID, 'disk:/', Path('/other'))
-        mirror.record_failure(ids['disk:/A'], 'could not write A: Permission denied', turns=1)
-        mirror.record_failure(ids[keep.path], 'the download stalled: no data for 15 s', turns=1)
-        mirror.record_failure(ids[edit.path], 'the download stalled: no data for 15 s', turns=1)
-        mirror.record_failure(ids[edit.path], 'removed from the Disk after the scan', turns=2)
-        with pytest.raises(ValueError, match='at least 1 failed turn, not 0'):
-            mirror.record_failure(ids[keep.path], 'never written', turns=0)
+        mirror.record_failure(ids['disk:/A'], 'could not write A: Permission denied', turns=1, **_EMPTY_STREAK)
+        mirror.record_failure(ids[keep.path], STALLED, turns=1, silent_turns=1, silent_since=MODIFIED)
+        mirror.record_failure(ids[edit.path], STALLED, turns=1, silent_turns=1, silent_since=MODIFIED)
+        mirror.record_failure(ids[edit.path], STALLED, turns=3, silent_turns=2, silent_since=SILENT_SINCE)
+        streak_kept = _failures(mirror)['disk:/A/edit.txt']
+        mirror.record_failure(ids[edit.path], 'removed from the Disk after the scan', turns=4, **_EMPTY_STREAK)
+        before_refused = _failures(mirror)
+        for streak, message in [
+            ({'turns': 0, **_EMPTY_STREAK}, 'at least 1 failed turn, not 0'),
+            ({'turns': 2, 'silent_turns': 3, 'silent_since': MODIFIED}, 'streak of 3 turns does not fit in 2'),
+            ({'turns': 2, 'silent_turns': -1, 'silent_since': None}, 'streak of -1 turns does not fit in 2'),
+            ({'turns': 2, 'silent_turns': 2, 'silent_since': None}, 'streak of 2 turns has no start time'),
+            ({'turns': 2, 'silent_turns': 0, 'silent_since': MODIFIED}, 'empty silent streak has a start time'),
+        ]:
+            with pytest.raises(ValueError, match=message):
+                mirror.record_failure(ids[keep.path], 'never written', **streak)
         recorded = _failures(mirror)
 
         mirror.record_partial(ids[edit.path], RemoteIdentity.of(edit), _unconfirmed(edit))
@@ -847,14 +867,16 @@ def test_a_failure_is_replaced_kept_by_forget_and_dropped_by_verifying_or_cleari
         after = _failures(mirror)
         elsewhere = _failures(other)
         with pytest.raises(ValueError, match='is not a committed entry'):
-            mirror.record_failure(10_000, 'nowhere', turns=1)
+            mirror.record_failure(10_000, 'nowhere', turns=1, **_EMPTY_STREAK)
 
     assert recorded == {
-        'disk:/A': FailureRecord('could not write A: Permission denied', 1),
-        'disk:/A/edit.txt': FailureRecord('removed from the Disk after the scan', 2),
-        'disk:/A/keep.txt': FailureRecord('the download stalled: no data for 15 s', 1),
+        'disk:/A': FailureRecord('could not write A: Permission denied', 1, 0, None),
+        'disk:/A/edit.txt': FailureRecord('removed from the Disk after the scan', 4, 0, None),
+        'disk:/A/keep.txt': FailureRecord(STALLED, 1, 1, MODIFIED),
     }
-    assert after == {'disk:/A/edit.txt': FailureRecord('removed from the Disk after the scan', 2)}
+    assert before_refused == recorded
+    assert streak_kept == FailureRecord(STALLED, 3, 2, SILENT_SINCE)
+    assert after == {'disk:/A/edit.txt': FailureRecord('removed from the Disk after the scan', 4, 0, None)}
     assert elsewhere == {}
 
 
@@ -862,13 +884,13 @@ def test_a_failure_survives_a_rescan_and_goes_with_its_removed_entry(tmp_path):
     db, manifest, mirror, ids = _journaled(tmp_path)
     with manifest:
         for path in ('disk:/A/edit.txt', 'disk:/A/gone.txt'):
-            mirror.record_failure(ids[path], 'the download stalled: no data for 15 s', turns=1)
+            mirror.record_failure(ids[path], STALLED, turns=1, **_EMPTY_STREAK)
 
     _scan(db, [r for r in TREE if r.path != 'disk:/A/gone.txt'])
     with Manifest.open(db) as manifest:
         failures = _failures(manifest.mirror(UID, 'disk:/', Path('/dest')))
 
-    assert failures == {'disk:/A/edit.txt': FailureRecord('the download stalled: no data for 15 s', 1)}
+    assert failures == {'disk:/A/edit.txt': FailureRecord(STALLED, 1, 0, None)}
     with closing(sqlite3.connect(db)) as connection:
         assert connection.execute('SELECT entry_id FROM failures').fetchall() == [(ids['disk:/A/edit.txt'],)]
 
@@ -889,7 +911,7 @@ def test_a_quarantine_drops_the_download_its_journal_and_the_failure_and_verifyi
     with manifest:
         other = manifest.mirror(UID, 'disk:/', Path('/other'))
         mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 10, 6, 'aa')])
-        mirror.record_failure(ids[keep.path], 'the download stalled: no data for 15 s', turns=1)
+        mirror.record_failure(ids[keep.path], STALLED, turns=1, **_EMPTY_STREAK)
         mirror.record_quarantined(ids[keep.path], older, first, 'MD5 mismatch (expected dd, got ff)')
         mirror.record_quarantined(ids[keep.path], RemoteIdentity.of(keep), second, 'size mismatch')
         mirror.record_quarantined(ids[edit.path], RemoteIdentity.of(edit), first.with_name('edit.txt'), 'bad')

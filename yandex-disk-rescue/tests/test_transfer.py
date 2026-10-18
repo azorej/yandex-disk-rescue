@@ -230,13 +230,25 @@ async def test_each_failing_answer_raises_its_own_error(fake_disk_api, remote_fi
     assert 'link=' not in reason
 
 
-async def test_a_retry_after_is_carried_by_the_transient_error(fake_disk_api, remote_file, partial):
-    fake_disk_api.inject('GET', '/download', FakeResponse.error(503, {'Retry-After': '7'}))
+@pytest.mark.parametrize(
+    ('fault', 'retry_after', 'throttled'),
+    [
+        (FakeResponse.error(503, {'Retry-After': '7'}), 7, True),
+        (FakeResponse.error(429), None, True),
+        (FakeResponse.error(503), None, False),
+        (Truncate(after_bytes=0), None, False),
+    ],
+    ids=['503-retry-after', '429', '503', 'closed'],
+)
+async def test_a_transient_error_carries_the_wait_asked_for_and_whether_the_host_was_throttling(
+    fake_disk_api, remote_file, partial, fault, retry_after, throttled
+):
+    fake_disk_api.inject('GET', '/download', fault)
 
     with pytest.raises(api.TransientTransferError) as excinfo:
         await _fetch(fake_disk_api, partial)
 
-    assert excinfo.value.retry_after == 7
+    assert (excinfo.value.retry_after, excinfo.value.throttled) == (retry_after, throttled)
 
 
 async def test_a_host_ignoring_a_range_is_not_appended_to_the_prefix(fake_disk_api, remote_file, partial):
