@@ -2972,6 +2972,25 @@ def test_a_partial_file_is_resumed_by_the_next_run_once_the_cloud_file_is_confir
     assert _partials(dest) == [partials / 'a folder']
 
 
+def test_a_resume_check_failing_for_one_file_waits_for_the_next_pass_and_keeps_its_bytes(big, dest):
+    _leave_partial(big, dest)
+    confirmed = _confirmed()
+    big.inject('GET', '/v1/disk/resources', 500, 500, where={'path': BIG_PATH})
+    earlier = len(big.requests)
+
+    result = run_download('--api-retries', '1', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert '1 downloaded' in result.stdout
+    assert 'Passes: 2 of 7\n' in result.stdout
+    lookups = [r for r in big.requests[earlier:] if r.path == '/v1/disk/resources' and r.params['path'] == BIG_PATH]
+    assert len(lookups) == 3
+    assert sum(1 for r in big.requests[earlier:] if r.path == '/v1/disk/') == 2
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(confirmed)]
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _failure_records() == []
+
+
 def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(disk, dest, partial_root, monkeypatch):
     files = {**FILES, SEGMENTED_PATH: SEGMENTED, BIG_PATH: BIG}
     disk.add_file(SEGMENTED_PATH, SEGMENTED, modified=MODIFIED)

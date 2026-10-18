@@ -470,8 +470,8 @@ stream, never appended to the bytes kept.
   stall before the first byte, a refused connection, `408`, `429` or `5xx`)
   is not retried at once.
 - **Passes.** Files whose download failed that way, or ran out of retries,
-  and files whose download link the Disk API kept failing to give (see
-  "Failures that stop the run"), are resumed in another pass over the files
+  and files whose download link or resume check the Disk API kept failing to
+  answer (see "Failures that stop the run"), are resumed in another pass over the files
   still to download, again up to `download_connections` at once, each with a
   new download link, after a 5 s pause (longer when the host sent
   `Retry-After`, up to 300 s). The other
@@ -492,8 +492,8 @@ stream, never appended to the bytes kept.
   disk, as `Yandex Disk stopped sending this file after <size>: …`. The
   attempts count across passes and runs. A `429` or any answer with
   `Retry-After` is throttling, which neither counts nor starts over; an
-  attempt whose download link the Disk API failed to give, like throttling,
-  neither counts nor starts over; a byte
+  attempt whose download link or resume check the Disk API failed to answer,
+  like throttling, neither counts nor starts over; a byte
   received, or a failure for any other reason (a refused download, a local
   error), starts the count over. The summary then adds, after the `Failed`
   list, `N of them never got data from Yandex Disk for a day or more: open
@@ -517,8 +517,8 @@ recorded in the manifest for that DEST, as soon as a turn of it fails: a
 refused download, a file changed or removed in the cloud, a local error, a
 hard link to another file of the mirror, a refused name, a folder that could
 not be made, every entry under such a folder, a transient transfer failure
-that waits for a later pass, and a download link the Disk API kept failing to
-give. The record holds the reason last shown, the
+that waits for a later pass, and a download link or resume check the Disk API
+kept failing to answer. The record holds the reason last shown, the
 count of failed turns since the entry last succeeded, and how many of the
 last of them in a row got no byte from the download host, since when (what
 makes a file [unavailable on Yandex Disk](#downloading)); a file still failing
@@ -758,14 +758,16 @@ modification time of <path>: <reason>`, and leaves the path as it was.
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run: the files still
 in progress stop too, only the first error is shown, files already verified
-stay verified, and a rerun picks up where it stopped. A download link the Disk
-API keeps failing to give for one file is told apart from an outage first: the
+stay verified, and a rerun picks up where it stopped. A Disk API request for
+one file (its download link, or the check of an unfinished download against
+the Disk) that keeps failing is told apart from an outage first: the
 tool asks the API for the download link of another file of the mirror that got
 one, the last one in this run, or else a verified one (of this mirror, or else
 of another mirror of the same account). When nothing in the mirror ever got a
 link, the tool asks for the account (`GET /v1/disk/`) instead. When that
 answers, only the file's turn fails: it waits for the next pass with the API's
-status as its reason, and the run goes on. When it does not answer, the run
+status as its reason, an unfinished download keeping the bytes it has, and the
+run goes on. When it does not answer, the run
 stops as an outage, with the file's error. The run also stops at the 11th such
 file of a run in a mirror where nothing ever got a link, its error ending with
 `(no file of this mirror got a download link: 10 failed the same way)`.

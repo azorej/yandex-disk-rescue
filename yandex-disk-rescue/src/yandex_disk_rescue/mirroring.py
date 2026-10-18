@@ -166,8 +166,9 @@ class FileQuarantined(Exception):
 
 class FileDeferred(FileFailed):
     """The file's turn failed transiently: its transfer (a stall, a connection error, 408, 429 or 5xx, the retries
-    spent, a refreshed link rejected again), or a Disk API request for its download link that kept failing while the
-    API still answered for other files (`ApiProbe`); its partial file and record are kept so a later pass resumes it.
+    spent, a refreshed link rejected again), or a Disk API request for its download link or resume check that kept
+    failing while the API still answered for other files (`ApiProbe`); its partial file and record are kept so a
+    later pass resumes it.
     `retry_after` is the wait the download host asked for, if any; `throttled` is set when the host was throttling
     (429 or a `Retry-After`, on any segment), `api_failed` when the turn was deferred only for such failed Disk API
     requests, so the download host was not asked for the bytes, and `received` when any byte of the file was written
@@ -980,10 +981,10 @@ class MirrorRun:
         checked, cleared, placed and recorded under one placement lock, so files in progress never race for a path or
         an inode. The report lists everything in path order, whatever the order the files ended in.
 
-        A download link the Disk API keeps failing to give for one file defers only that file while the API still
-        answers for other files (`ApiProbe`). The first error that stops the run (`DestinationError`,
-        `TokenRejectedError`, `DiskApiError`, for a download link only in an outage) cancels the files in progress and
-        is raised as itself once they have ended.
+        A Disk API request for one file (its download link or resume check) that keeps failing defers only that file
+        while the API still answers for other files (`ApiProbe`). The first error that stops the run
+        (`DestinationError`, `TokenRejectedError`, `DiskApiError`, for a download link or resume check only in an
+        outage) cancels the files in progress and is raised as itself once they have ended.
 
         The disk work goes to worker threads of this run's own, shut down when the run ends, also on cancellation,
         once every file's turn has ended."""
@@ -1374,14 +1375,14 @@ async def download_file(
     digest, keeping the segments it was started with; a partial file none of whose segments keeps bytes, and any
     other partial file, is started again from byte 0 with the segments of `policy` (one segment in a partial folder
     without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
-    module. A download link the Disk API keeps failing to give goes to `probe`: while the API still answers for
-    other files, the turn is deferred.
+    module. A download link or resume check the Disk API keeps failing to answer goes to `probe`: while the API still
+    answers for other files, the turn is deferred, a resumed partial file keeping its confirmed bytes.
 
     Raises `FileDeferred` when the turn failed transiently and a later pass may finish it, `FileQuarantined` when the
     downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError` when the
     destination cannot be read, written or inspected at all (a local copy that cannot be read while the device is
     gone or the destination itself unreadable included), and the API errors that stop the run: `TokenRejectedError`,
-    and `DiskApiError` (for a download link, only in an outage of the Disk API).
+    and `DiskApiError` (for a download link or resume check, only in an outage of the Disk API).
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
@@ -1683,6 +1684,7 @@ async def _fetch_verified(
             threads=threads,
             hashing=hashing,
             policy=policy,
+            probe=probe,
             progress=progress,
         )
         if len(streams) > 1:
@@ -1779,6 +1781,7 @@ async def _resume(
     threads: DiskThreads,
     hashing: asyncio.Lock,
     policy: TransferPolicy,
+    probe: ApiProbe,
     progress: ActiveFile,
 ) -> list[_Stream]:
     """The streams of this turn, one per segment of the journal, each starting after the bytes of its segment kept,
@@ -1794,7 +1797,9 @@ async def _resume(
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
     check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
-    the changed file.
+    the changed file. A check failing with `DiskApiError` goes to `probe`: while the API still answers for other
+    files, `FileDeferred` (`api_failed`) is raised with the API's failure, the partial file and its record untouched;
+    otherwise the check's error stops the run.
     """
     size = identity.size
     record = mirror.download(entry.entry_id)
@@ -1807,6 +1812,9 @@ async def _resume(
     except api.RemotePathNotFoundError:
         _discard(entry, mirror, destination)
         raise FileFailed('removed from the Disk after the scan') from None
+    except api.DiskApiError as exc:
+        await probe.check(entry.resource.path, exc)
+        raise FileDeferred(exc.reason, retry_after=None, throttled=False, received=False, api_failed=True) from None
     if live.kind != 'file' or RemoteIdentity.of(live) != identity:
         _discard(entry, mirror, destination)
         raise FileFailed(_CHANGED)
