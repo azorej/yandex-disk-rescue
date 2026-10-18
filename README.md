@@ -1296,6 +1296,7 @@ uv run yandex-disk-rescue --help
 | `mise run test -- -k name` | Pytest, with pass-through args |
 | `mise run ci` | Full CI pipeline in Dagger — identical to GitHub Actions |
 | `mise run ci:selftest` | Tests for the Dagger module itself |
+| `mise run ci:package` | Build and `twine check` the sdist and wheel, then install the wheel with `uv tool` and `pipx` in clean containers and run the installed-CLI tests |
 | `mise run lock` | Upgrade every dependency in `uv.lock` |
 | `mise tasks` | List all tasks |
 
@@ -1328,7 +1329,7 @@ Dependencies: `uv add <pkg> --package <member>` (runtime) or
 Upgrade with `mise outdated` / `mise upgrade --bump` (tools) and `mise run lock` (Python deps).
 
 **CI.** [`.github/workflows/ci.yml`](.github/workflows/ci.yml) is a thin
-wrapper around `mise run ci`, which calls the Dagger module in
+wrapper around `mise run` tasks (`ci`, `ci:selftest`, `ci:package`), which call the Dagger module in
 [`.dagger/`](.dagger/README.md). Pull requests run only the lanes their
 diff touches; pushes to `main`, a weekly schedule and manual runs execute
 everything. Require the single **`CI required`** check in branch protection

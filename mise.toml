@@ -52,6 +52,10 @@ depends = ["lint", "test"]
 description = "Run the full CI pipeline in Dagger — the same thing GitHub Actions runs"
 run = "dagger call check"
 
+[tasks."ci:package"]
+description = "Build, check and install-smoke the distributions in Dagger"
+run = "dagger call package"
+
 [tasks."ci:selftest"]
 description = "Run the Dagger module's own tests (.dagger/tests)"
 dir = ".dagger/tests"

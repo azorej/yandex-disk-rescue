@@ -37,6 +37,7 @@ jobs:
     outputs:
       python: ${{ steps.filter.outputs.python == 'true' || github.event_name != 'pull_request' }}
       dagger: ${{ steps.filter.outputs.dagger == 'true' || github.event_name != 'pull_request' }}
+      package: ${{ steps.filter.outputs.package == 'true' || github.event_name != 'pull_request' }}
     steps:
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
@@ -53,6 +54,13 @@ jobs:
               - '**/*.py'
               - '**/*.md'  # ruff formats code blocks in Markdown
               - '**/pyproject.toml'
+              - 'uv.lock'
+              - '.python-version'
+            package:
+              - *dagger
+              - 'yandex-disk-rescue/**'
+              - 'LICENSE'
+              - 'pyproject.toml'
               - 'uv.lock'
               - '.python-version'
 
@@ -92,6 +100,23 @@ jobs:
         env:
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
 
+  package:
+    name: Package & install smoke
+    needs: changes
+    if: needs.changes.outputs.package == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          install_args: dagger
+      - run: mise run ci:package
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
   hygiene:
     name: Pre-commit hooks
     runs-on: ubuntu-latest
@@ -115,7 +140,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [changes, check, dagger-selftest, hygiene]
+    needs: [changes, check, dagger-selftest, package, hygiene]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

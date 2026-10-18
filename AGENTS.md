@@ -61,6 +61,7 @@ mise run format         # Auto-fix lint issues and format
 mise run test           # Pytest; extra args pass through: mise run test -- -k greet
 mise run ci             # Full CI pipeline in Dagger — exactly what GitHub Actions runs
 mise run ci:selftest    # Tests for the Dagger module itself
+mise run ci:package     # Build, twine-check and install-smoke the wheel (uv tool, pipx) in Dagger
 mise run lock           # Upgrade all dependencies in uv.lock
 mise run dagger:develop # Regenerate the Dagger SDK (after a Dagger version bump)
 mise tasks              # List every task
@@ -146,7 +147,10 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
 
 - Pipeline logic lives in the Dagger module (`.dagger/src/repo_ci/`);
   the workflow (`.github/workflows/ci.yml`) is a thin caller of `mise run`
-  tasks. A green `mise run ci` locally means a green CI run.
+  tasks. Each lane runs the same mise task locally: `Lint & test` is
+  `mise run ci`, `Dagger module tests` is `mise run ci:selftest`,
+  `Package & install smoke` is `mise run ci:package`; `Pre-commit hooks`
+  runs `pre-commit run --all-files`. Green tasks locally mean a green CI run.
 - Pull requests run only the lanes their paths touch; pushes to `main`,
   the weekly schedule and manual dispatch run everything. Branch
   protection requires the single `CI required` check.
