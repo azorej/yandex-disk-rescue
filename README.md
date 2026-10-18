@@ -1126,8 +1126,9 @@ job that a script starts, whose SIGINT is ignored; `kill -INT <pid>` stops
 the run only when it was started from an interactive shell. A SIGTERM sent
 while the run is already stopping, on Ctrl+C or an earlier SIGTERM, is
 ignored, so the last checkpoints are never cut short. A Ctrl+C during a
-SIGTERM stop takes over: the run stops at once, without waiting for the last
-checkpoints, and exits with 130. SIGKILL ends the run at once.
+SIGTERM stop takes over and exits with 130: it cuts the stop short, so some
+last checkpoints may be skipped, and a second Ctrl+C ends the run at once.
+SIGKILL ends the run at once.
 
 ### As a systemd user service
 
