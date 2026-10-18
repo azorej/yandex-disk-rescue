@@ -14,8 +14,9 @@ listed under its finding whose quarantine record is for its current identity has
 says so with the quarantine reason and the copy's path.
 Paths with no manifest entry are never opened, listed or reported.
 
-A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C, a
-kill or an unreadable destination continues where its committed cursor stands, and its report covers the whole pass.
+A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C,
+SIGTERM, SIGKILL or an unreadable destination continues where its committed cursor stands, and its report covers the
+whole pass.
 
 A read error stops the check instead of being recorded when the destination itself has become unreadable, as a
 disconnected disk makes every file unreadable.
@@ -54,8 +55,8 @@ from yandex_disk_rescue.mirroring import (
 from yandex_disk_rescue.progress import VerifyProgress
 from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 
-# The longest a pass keeps its cursor uncommitted while files are checked: a killed pass reads again at most the files
-# checked in this time, and the one in flight.
+# The longest a pass keeps its cursor uncommitted while files are checked: a pass stopped by SIGKILL reads again at most
+# the files checked in this time, and the one in flight.
 CURSOR_SECONDS = 5.0
 
 # A read failing with one of these means the device is gone, whatever the destination's path still answers.

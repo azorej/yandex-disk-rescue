@@ -510,7 +510,8 @@ class _FileTurns:
 
     The first exception a turn raises stops the run: the other turns and the walk are cancelled, and leaving the
     context raises that exception itself, with what the cancelled turns raised meanwhile added as notes. An exception
-    the walk raises stops the turns the same way. A cancellation of the walk from outside (Ctrl+C) wins over both.
+    the walk raises stops the turns the same way. A cancellation of the walk from outside (Ctrl+C, SIGTERM) wins over
+    both.
     """
 
     def __init__(self, limit: int) -> None:

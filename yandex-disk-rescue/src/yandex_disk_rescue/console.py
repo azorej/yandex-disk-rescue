@@ -28,7 +28,7 @@ from typing import Annotated, Literal, TextIO
 
 import typer
 
-from yandex_disk_rescue import __version__, paths
+from yandex_disk_rescue import __version__, interrupts, paths
 from yandex_disk_rescue.display import display_line
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.logs import (
@@ -228,8 +228,10 @@ def command_output(
 ) -> Iterator[Output]:
     """Run `command` with its output: open the log file, attach the log and notice handlers to the
     `yandex_disk_rescue` logger for the run, and log its start (`command`, the version, the pid and `details`) and its
-    end: completed, the error and its exit code, interrupted, or an unexpected exception with its traceback. On Ctrl+C
-    stderr gets `interrupted`. The handlers are detached and closed on every exit.
+    end: completed, the error and its exit code, interrupted (by Ctrl+C or SIGTERM), or an unexpected exception with
+    its traceback. On Ctrl+C or SIGTERM stderr gets `interrupted`. SIGTERM stops the run as Ctrl+C does for the whole
+    context, the end record and the JSON document included (`interrupts.sigterm_stops`). The handlers are detached and
+    closed, and the SIGTERM handler found is restored, on every exit.
 
     With `--json`, stdout gets one JSON document once everything else is written, on every exit: the common keys
     (`schema_version`, the command, the version, the start and end times, the manifest and the log file, whether the
@@ -241,19 +243,20 @@ def command_output(
     started = time.time()
     path = paths.log_path()
     output: Output | None = None
-    try:
-        with _logged_run(command, options, details=details, path=path) as output:
-            try:
-                yield output
-            except KeyboardInterrupt:
-                write_stderr(interrupted)
-                raise
-    except BaseException as exc:
+    with interrupts.sigterm_stops():
+        try:
+            with _logged_run(command, options, details=details, path=path) as output:
+                try:
+                    yield output
+                except KeyboardInterrupt:
+                    write_stderr(interrupted)
+                    raise
+        except BaseException as exc:
+            if options.json:
+                _print_document(command, started, path, output, exc, interrupted=interrupted)
+            raise
         if options.json:
-            _print_document(command, started, path, output, exc, interrupted=interrupted)
-        raise
-    if options.json:
-        _print_document(command, started, path, output, None, interrupted=interrupted)
+            _print_document(command, started, path, output, None, interrupted=interrupted)
 
 
 @contextmanager
@@ -343,6 +346,8 @@ def _result(exc: BaseException | None, interrupted: str) -> tuple[int, str | Non
             return 0, None
         case RescueError():
             return exc.exit_code, str(exc)
+        case interrupts.Terminated():
+            return interrupts.EXIT_CODE, interrupted
         case KeyboardInterrupt():
             return 130, interrupted
         case typer.TyperException():
@@ -357,6 +362,8 @@ def _log_end(command: str, exc: BaseException) -> None:
     match exc:
         case RescueError():
             _log.error('%s failed (exit %d): %s', command, exc.exit_code, exc, extra=FILE_ONLY)
+        case interrupts.Terminated():
+            _log.warning('%s interrupted by SIGTERM (exit %d)', command, interrupts.EXIT_CODE, extra=FILE_ONLY)
         case KeyboardInterrupt():
             _log.warning('%s interrupted (exit 130)', command, extra=FILE_ONLY)
         case typer.TyperException():

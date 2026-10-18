@@ -45,6 +45,21 @@ from yandex_disk_rescue.units import format_size
 TIMESTAMP = r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z'
 
 
+@pytest.mark.parametrize('remote_path', ['disk:/', 'disk:/missing'], ids=['completed', 'failed'])
+def test_a_run_restores_the_sigterm_handler_it_found(disk, remote_path):
+    def found(signum, frame):
+        raise AssertionError('the handler found ran')
+
+    previous = signal.signal(signal.SIGTERM, found)
+    try:
+        result = runner.invoke(app, ['scan', remote_path])
+        assert signal.getsignal(signal.SIGTERM) is found
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+    assert result.exit_code == (0 if remote_path == 'disk:/' else 1), result.output
+
+
 def test_every_run_logs_its_start_and_end_to_a_private_log_file(disk, dest):
     downloaded = run_download(str(dest))
     missing = runner.invoke(app, ['scan', 'disk:/missing'])

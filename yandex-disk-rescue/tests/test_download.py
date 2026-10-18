@@ -2794,7 +2794,7 @@ def test_a_slow_download_takes_a_checkpoint_every_checkpoint_seconds(big, dest, 
     monkeypatch.setattr(mirroring, 'CHECKPOINT_SECONDS', 0.3)
     big.chunk_delay = 0.2
     results = []
-    # `asyncio.run` installs no signal handler outside the main thread, so the command runs as it would there.
+    # The commands install no signal handler outside the main thread, so the command runs as it would there.
     worker = threading.Thread(target=lambda: results.append(run_download('disk:/Big', str(dest))))
     worker.start()
     while_running: set[int] = set()
@@ -2860,20 +2860,30 @@ def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_
     assert len(_partials(dest)) == len(slow) + 1
 
 
-def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_there(big, dest):
+@pytest.mark.parametrize(
+    ('stop', 'exit_code', 'end_record'),
+    [
+        (signal.SIGINT, 130, 'download interrupted (exit 130)'),
+        (signal.SIGTERM, 143, 'download interrupted by SIGTERM (exit 143)'),
+    ],
+    ids=['sigint', 'sigterm'],
+)
+def test_ctrl_c_or_sigterm_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_there(
+    big, dest, stop, exit_code, end_record
+):
     big.chunk_delay = 0.2
     child = start_command('download', 'disk:/Big', str(dest))
     try:
         wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
-        child.send_signal(signal.SIGINT)
+        child.send_signal(stop)
         _, stderr = child.communicate(timeout=60)
     finally:
         child.kill()
         child.communicate()
 
-    assert child.returncode == 130, stderr
+    assert child.returncode == exit_code, stderr
     assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
-    assert log_messages()[-1] == 'download interrupted (exit 130)'
+    assert log_messages()[-1] == end_record
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
     assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
@@ -3004,6 +3014,65 @@ def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error
     assert child.returncode == 130, stderr
     assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, MiB, 0, None)] * len(slow)
+
+
+# Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, once the marker `go` exists
+# there an fsync of a partial file creates a `blocked-<n>` marker and waits for the marker `release`, then runs.
+_HOLDING_FSYNC_GATE = """
+import itertools, os, pathlib, threading, time
+
+_gate = pathlib.Path(os.environ['FSYNC_GATE'])
+_fsync, _calls, _lock = os.fsync, itertools.count(1), threading.Lock()
+
+
+def fsync(fd):
+    if (_gate / 'go').exists() and '/.yandex-disk-rescue/partial/' in os.readlink(f'/proc/self/fd/{fd}'):
+        with _lock:
+            call = next(_calls)
+        (_gate / f'blocked-{call}').touch()
+        while not (_gate / 'release').exists():
+            time.sleep(0.01)
+    return _fsync(fd)
+
+
+os.fsync = fsync
+"""
+
+
+@pytest.mark.parametrize(
+    ('first', 'sigint_ignored', 'exit_code', 'logged'),
+    [
+        (signal.SIGTERM, True, 143, 'download interrupted by SIGTERM (exit 143)'),
+        (signal.SIGINT, False, 130, 'download interrupted (exit 130)'),
+    ],
+    ids=['sigterm-in-a-background-job-ignoring-sigint', 'ctrl-c'],
+)
+def test_a_sigterm_while_the_run_stops_keeps_the_final_checkpoint(
+    big, dest, tmp_path, monkeypatch, first, sigint_ignored, exit_code, logged
+):
+    big.chunk_delay = 0.2
+    gate = _gated(monkeypatch, tmp_path, _HOLDING_FSYNC_GATE)
+    child = start_command('download', 'disk:/Big', str(dest), sigint_ignored=sigint_ignored)
+    try:
+        wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
+        (gate / 'go').touch()
+        child.send_signal(first)
+        wait_until(lambda: any(gate.glob('blocked-*')), child, 'took its final checkpoint')
+        child.send_signal(signal.SIGTERM)
+        time.sleep(0.5)
+        (gate / 'release').touch()
+        _, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+    monkeypatch.delenv('PYTHONPATH')
+
+    assert child.returncode == exit_code, stderr
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
+    assert log_messages()[-1] == logged
+    held = _partial_size(dest)
+    assert 256 * 1024 < held < len(BIG)
+    assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
 
 
 @pytest.mark.parametrize(

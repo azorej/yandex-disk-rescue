@@ -2,7 +2,6 @@
 verified, or retry only the files whose last attempt failed, was quarantined or never finished and those `verify`
 found broken, and summarize the run."""
 
-import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -11,7 +10,7 @@ from typing import Annotated
 
 import typer
 
-from yandex_disk_rescue import api, auth, console, paths, settings
+from yandex_disk_rescue import api, auth, console, interrupts, paths, settings
 from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.logs import timestamp
@@ -146,7 +145,7 @@ def download(
     with console.command_output('download', options, details=details, interrupted=INTERRUPTED) as output:
         token = auth.get_token()
         manifest_path = paths.manifest_path()
-        report, facts = asyncio.run(
+        report, facts = interrupts.run(
             _run(
                 token,
                 root,
