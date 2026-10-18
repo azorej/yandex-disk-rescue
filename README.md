@@ -359,12 +359,22 @@ resume — happens on that disk, not on DEST:
   at the end (for DEST's own `partial/`, only the files in it). A run stopped
   during the move goes on with it on the next run, losing no confirmed byte.
   A confirmed range missing from an old file cut short (by hand, or by a
-  power cut on a disk that lost the end of a write) is fetched again. When
-  the recorded folder is gone and downloads were in progress, the run prints
-  `The partial folder of the last run, <old>, is missing; its downloads in
-  progress start again from their first byte.`, and they do. The recorded
-  folder reached under another path (a bind mount, a link on the way) is
-  the same folder: nothing is moved, and the new path is recorded.
+  power cut on a disk that lost the end of a write) is fetched again. An old
+  file whose confirmed bytes cannot be read (an I/O error, a bad sector) while
+  its folder still can is not carried over: its download starts again from
+  its first byte, with the same notice as a resume (`<path>: could not read
+  its partial file <file>: <reason>; downloading it again from its first
+  byte`), and counts as that file's one drop of the run. The move goes on
+  with the next file, and its last log line gives the bytes actually copied
+  and `, <k> dropped as unreadable`. An old folder that is gone, a
+  permission error, or running out of file descriptors or memory stops the
+  run with `Error: Could not read <path>: <reason>.`, and the next run moves
+  again. When the recorded folder is gone and downloads were in progress, the
+  run prints `The partial folder of the last run, <old>, is missing; its
+  downloads in progress start again from their first byte.`, and they do.
+  The recorded folder reached under another path (a bind mount, a link on
+  the way) is the same folder: nothing is moved, and the new path is
+  recorded.
 - Remounting DEST at another path makes it a new mirror with a new `<key>`;
   the old `PATH/<key>/` can then be deleted.
 
@@ -457,6 +467,22 @@ is downloaded from the start). A partial file left for an older version is
 discarded and the file is downloaded from the start; when the download host
 ignores `Range` for any segment, the whole file is fetched again as one
 stream, never appended to the bytes kept.
+
+A partial file whose bytes cannot be read (an I/O error, a bad sector) while
+its folder still can is emptied, and the file is downloaded again from its
+first byte, with a notice (`<path>: could not read its partial file <file>:
+<reason>; downloading it again from its first byte`); the other downloads go
+on from their checkpoints. This covers re-reading confirmed bytes, reading
+back a segmented file, and copying a finished file to DEST with
+`--partial-dir`; after the last two the file waits for the next pass. A
+partial file that cannot be read while it is moved to a new partial folder
+is not carried over, and its download starts again (see `--partial-dir`). It
+happens at most once per file per run: a second read error on the same
+partial file fails the file with `… (a second time in this run)`, a local
+failure that gets no preview, and so does a file whose partial file could not
+be read once it arrived when no pass is left. A partial folder that is gone,
+a permission error, or running out of file descriptors or memory stops the
+run with `Error: Could not read <path>: <reason>.`
 
 - **Stalls.** A download fails as stalled (`the download stalled: no data for
   15 s`) when the download host sends nothing for `download_timeout` seconds,
@@ -744,11 +770,13 @@ HFS+ do); the run stops at the start otherwise. A full disk or quota, an I/O
 error or a read-only filesystem while writing stops the run with
 `Error: Could not write <path>: <reason>.`, and so does a permission error
 while writing inside `DEST/.yandex-disk-rescue/` or the partial folder below
-`--partial-dir`. An I/O error while reading the work directory or the partial
-folder stops it with `Error: Could not read <path>: <reason>.`, and one while
-looking up a path there or in DEST (its size, type or free space) with
-`Error: Could not inspect <path>: <reason>.` An I/O error while reading a file
-already in DEST does not stop the run; see "Files already in DEST". A permission error on
+`--partial-dir`. An I/O error while reading the work directory, or a partial
+file whose folder is gone, stops it with `Error: Could not read <path>:
+<reason>.`, and one while looking up a path there or in DEST (its size, type
+or free space) with `Error: Could not inspect <path>: <reason>.` An I/O error
+while reading a partial file whose folder is still readable does not stop the
+run; see "Interruptions, stalls and retries". Nor does one while reading a file
+already in DEST; see "Files already in DEST". A permission error on
 a path of the mirror — a file or folder there owned by another user, or
 without the needed read, write or search permission — fails only the entries
 it affects, with `could not read <path>: <reason>`, `could not inspect <path>:
@@ -1101,7 +1129,9 @@ quarantined in this run, each `verify` finding made in this run (`missing`,
 disappeared during a scan, each
 entry left out because its name is not valid Unicode, each partial file
 that could not be deleted once its file's outcome was recorded (`<path>:
-partial file <file> not deleted: <reason>; the outcome stands`), and each
+partial file <file> not deleted: <reason>; the outcome stands`), each partial
+file that could not be read (`<path>: could not read its partial file <file>:
+<reason>; downloading it again from its first byte`), and each
 preview not saved (`<path>: preview not saved: <reason>`). Files `verify` lists
 from the manifest (not downloaded, or held in quarantine) get no notice; the
 summary lists them.
@@ -1233,8 +1263,9 @@ interrupted preview step did not get to; `scan` is the
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
-there is none, `partial_room` the room measured in a separate partial
-folder, `sparse_partials` whether the partial folder's filesystem keeps
+there is none, with `downloads` and `size` the downloads and the confirmed
+bytes the move set out to copy, `partial_room` the room measured in a
+separate partial folder, `sparse_partials` whether the partial folder's filesystem keeps
 sparse files, without which new downloads are not segmented, and `previews`
 the `--previews/--no-previews` value):
 

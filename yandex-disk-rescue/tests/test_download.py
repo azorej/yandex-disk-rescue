@@ -3666,25 +3666,259 @@ def test_a_move_of_partial_files_shows_its_status_lines_then_its_last_one(disk, 
     assert status.index(lines[-1]) < status.index(next(line for line in status if line.startswith('Downloaded: ')))
 
 
-def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file(
-    disk, dest, partial_root, monkeypatch
-):
-    big, segmented = _leave_two_partials(disk, dest, None)
+def _refuse_partial_reads(
+    patch,
+    partials: set[Path],
+    code: int,
+    *,
+    every: bool = True,
+    from_offset: int = 0,
+    before: Callable[[], None] = lambda: None,
+) -> list[int]:
+    """Make the reads (`os.pread`) at `from_offset` or later of the open files at `partials` call `before`, then fail
+    with `code`: every such read, or only the first one; the offsets of the reads refused."""
     pread = os.pread
+    paths = {str(partial) for partial in partials}
+    refused: list[int] = []
 
-    def unreadable(fd, size, offset):
-        if os.readlink(f'/proc/self/fd/{fd}') == str(big):
-            raise OSError(errno.EBADMSG, os.strerror(errno.EBADMSG))
+    def failing(fd, size, offset):
+        if (every or not refused) and offset >= from_offset and os.readlink(f'/proc/self/fd/{fd}') in paths:
+            refused.append(offset)
+            before()
+            raise OSError(code, os.strerror(code))
         return pread(fd, size, offset)
 
-    monkeypatch.setattr(os, 'pread', unreadable)
+    patch.setattr(os, 'pread', failing)
+    return refused
 
-    result = run_download(*_partial_args(partial_root), str(dest))
+
+def _dropped_notice(path: str, partial: Path, code: int) -> str:
+    return (
+        f'{path}: could not read its partial file {partial}: {os.strerror(code)}; '
+        'downloading it again from its first byte'
+    )
+
+
+@pytest.mark.parametrize('read', ['first', 'later'])
+@pytest.mark.parametrize('code', [errno.EIO, errno.EBADMSG], ids=errno.errorcode.get)
+def test_an_unreadable_partial_file_being_moved_is_dropped_and_downloaded_again(
+    disk, dest, partial_root, monkeypatch, code, read
+):
+    big, segmented = _leave_two_partials(disk, dest, None)
+    from_first_byte = {BIG_PATH: [None], SEGMENTED_PATH: sorted(SEGMENT_RANGES)}
+    resumed = {BIG_PATH: [_tail(300_000)], SEGMENTED_PATH: _segment_tails(_SEGMENT_CUTS)}
+    kept = {BIG_PATH: 300_000, SEGMENTED_PATH: sum(_SEGMENT_CUTS)}
+    # The first read of `BIG`'s, or a read past the first segment of `SEGMENTED`'s once that segment is copied.
+    (path, partial, offset), (other, _, _) = [(BIG_PATH, big, 0), (SEGMENTED_PATH, segmented, MiB)][
+        :: 1 if read == 'first' else -1
+    ]
+    earlier = len(disk.requests)
+
+    with monkeypatch.context() as patch:
+        refused = _refuse_partial_reads(patch, {partial}, code, from_offset=offset)
+        result = run_download('--json', *_partial_args(partial_root), *SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 0, result.output
+    notice = _dropped_notice(path, partial, code)
+    assert stderr_lines(result.stderr).count(notice) == 1
+    assert refused == [offset]
+    assert sorted(_fetches(disk, path, earlier), key=str) == from_first_byte[path]
+    assert sorted(_fetches(disk, other, earlier)) == resumed[other]
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert not big.exists()
+    assert not segmented.exists()
+    assert _partials(dest, partial_root) == []
+    move = json.loads(result.stdout)['partial_move']
+    assert (move['downloads'], move['size']) == (2, 300_000 + sum(_SEGMENT_CUTS))
+    messages = log_messages()
+    assert messages.count(notice) == 1
+    [end] = [m for m in messages if m.startswith('Moved the partial files ')]
+    old, new = big.parent, _partial_folder(dest, partial_root)
+    carried = re.escape(format_size(kept[other]))
+    assert re.fullmatch(
+        rf'Moved the partial files of 2 downloads in progress \({carried}\) '
+        + re.escape(f'from {old} to {new} in ')
+        + r'\d+\.\d s, 1 dropped as unreadable',
+        end,
+    )
+    [moved] = [line for line in status_lines(result.stderr) if line.startswith('Moved: ')]
+    assert re.fullmatch(rf'Moved: 2 of 2 files, {carried} in \d+ s, average .+/s', moved)
+
+
+def test_a_partial_file_dropped_in_the_move_and_unreadable_again_fails_that_file(disk, dest, partial_root, monkeypatch):
+    big, _ = _leave_two_partials(disk, dest, None)
+    new = _partial_folder(dest, partial_root) / big.name
+
+    with monkeypatch.context() as patch:
+        _refuse_partial_reads(patch, {big, new}, errno.EIO)
+        result = run_download(*_partial_args(partial_root), *SEGMENTED_ARGS, str(dest))
 
     assert result.exit_code == 1
-    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(errno.EBADMSG)}.']
+    assert stderr_lines(result.stderr).count(_dropped_notice(BIG_PATH, big, errno.EIO)) == 1
+    reason = f'could not read its partial file {new}: {os.strerror(errno.EIO)} (a second time in this run)'
+    assert f'Failed: 1\n  {BIG_PATH}: {reason}\n' in result.stdout
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+
+
+@pytest.mark.parametrize('code', [errno.EIO, errno.ENODEV], ids=errno.errorcode.get)
+def test_an_unreadable_partial_file_being_moved_from_a_folder_that_is_gone_stops_the_run(
+    disk, dest, partial_root, monkeypatch, code
+):
+    big, _ = _leave_two_partials(disk, dest, partial_root)
+    journals = _journals()
+    folder = _separate_folder(dest, partial_root)
+    gone = folder.with_name('gone')
+
+    def unplug() -> None:
+        if code == errno.EIO:
+            folder.rename(gone)
+
+    with monkeypatch.context() as patch:
+        _refuse_partial_reads(patch, {big}, code, before=unplug)
+        result = run_download(*SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(code)}.']
+    assert _journals() == journals
+    assert not [message for message in log_messages() if 'could not read its partial file' in message]
+
+
+@pytest.mark.parametrize('file', ['one stream', 'segmented'])
+@pytest.mark.parametrize('code', [errno.EIO, errno.EBADMSG], ids=errno.errorcode.get)
+@pytest.mark.parametrize('layout', ['in-dest', 'separate'])
+def test_an_unreadable_partial_file_is_emptied_and_downloaded_again_from_its_first_byte(
+    disk, dest, partial_root, monkeypatch, layout, code, file
+):
+    root = partial_root if layout == 'separate' else None
+    big, segmented = _leave_two_partials(disk, dest, root)
+    (path, partial), (other, _) = [(BIG_PATH, big), (SEGMENTED_PATH, segmented)][:: 1 if file == 'one stream' else -1]
+    earlier = len(disk.requests)
+
+    with monkeypatch.context() as patch:
+        refused = _refuse_partial_reads(patch, {partial}, code, every=False)
+        calls = _io_log(patch, ('ftruncate', 'pwrite'))
+        result = run_download(*_partial_args(root), *SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 0, result.output
+    notice = _dropped_notice(path, partial, code)
+    assert stderr_lines(result.stderr).count(notice) == 1
+    assert log_messages().count(notice) == 1
+    from_first_byte = {BIG_PATH: [None], SEGMENTED_PATH: sorted(SEGMENT_RANGES)}
+    resumed = {BIG_PATH: [_tail(300_000)], SEGMENTED_PATH: _segment_tails(_SEGMENT_CUTS)}
+    assert sorted(_fetches(disk, path, earlier), key=str) == from_first_byte[path]
+    assert sorted(_fetches(disk, other, earlier)) == resumed[other]
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert _journals() == {}
+    assert _partials(dest, root) == []
+    assert len(refused) == 1
+    assert next(call for call in calls if call[1] == str(partial)) == ('ftruncate', str(partial), 0, 0)
+
+
+def _scanned_partial(dest, path: str, partial_root) -> Path:
+    """Scan the Disk, so the entry ids are known, and return where the partial file of `path` will be."""
+    assert runner.invoke(app, ['scan']).exit_code == 0
+    return _partial_folder(dest, partial_root) / str(_entry_id(path))
+
+
+# The file whose partial file is read only once it is fetched, its partial folder and its extra arguments: `SEGMENTED`
+# read back in DEST, or `BIG` copied to DEST from a separate partial folder.
+_FETCHED_READERS = pytest.mark.parametrize('reader', ['read back', 'copy'])
+
+
+def _fetched_reader(
+    fake, partial_root, reader: str
+) -> tuple[str, bytes, Path | None, tuple[str, ...], list[str | None]]:
+    """The path, content, partial folder, arguments and one turn's fetches of the file `reader` reads."""
+    if reader == 'read back':
+        fake.add_file(SEGMENTED_PATH, SEGMENTED, modified=MODIFIED)
+        return SEGMENTED_PATH, SEGMENTED, None, SEGMENTED_ARGS, list(SEGMENT_RANGES)
+    fake.add_file(BIG_PATH, BIG, modified=MODIFIED)
+    return BIG_PATH, BIG, partial_root, _partial_args(partial_root), [None]
+
+
+@_FETCHED_READERS
+def test_a_partial_file_unreadable_once_fetched_is_downloaded_again_in_a_later_pass(
+    disk, dest, partial_root, monkeypatch, reader
+):
+    path, content, root, args, fetches = _fetched_reader(disk, partial_root, reader)
+    partial = _scanned_partial(dest, path, root)
+
+    with monkeypatch.context() as patch:
+        refused = _refuse_partial_reads(patch, {partial}, errno.EIO, every=False)
+        result = run_download(*args, str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert stderr_lines(result.stderr).count(_dropped_notice(path, partial, errno.EIO)) == 1
+    assert ', 0 failed\n' in result.stdout
+    assert sorted(_fetches(disk, path), key=str) == sorted(fetches * 2, key=str)
+    assert local_file(dest, path).read_bytes() == content
+    reason = f'could not read its partial file {partial}: {os.strerror(errno.EIO)}'
+    assert f'{path} deferred to a later pass: {reason}' in log_messages()
+    assert refused == [0]
+
+
+def test_a_partial_file_unreadable_once_fetched_with_no_pass_left_is_a_local_failure_with_no_preview(
+    disk, dest, partial_root, monkeypatch
+):
+    path, _, root, args, _ = _fetched_reader(disk, partial_root, 'read back')
+    partial = _scanned_partial(dest, path, root)
+
+    with monkeypatch.context() as patch:
+        _refuse_partial_reads(patch, {partial}, errno.EIO, every=False)
+        result = run_download('--download-passes', '1', '--json', *args, str(dest))
+
+    assert result.exit_code == 1
+    document = json.loads(result.stdout)
+    reason = f'could not read its partial file {partial}: {os.strerror(errno.EIO)}'
+    assert document['failed'] == [{'path': path, 'reason': reason, 'unavailable': False}]
+    assert document['preview_only'] == []
+    assert _preview_requests(disk) == []
+
+
+@_FETCHED_READERS
+def test_a_partial_file_unreadable_twice_in_one_run_fails_that_file(disk, dest, partial_root, monkeypatch, reader):
+    path, _, root, args, fetches = _fetched_reader(disk, partial_root, reader)
+    partial = _scanned_partial(dest, path, root)
+
+    with monkeypatch.context() as patch:
+        _refuse_partial_reads(patch, {partial}, errno.EIO)
+        result = run_download('--download-passes', '0', *args, str(dest))
+
+    assert result.exit_code == 1
+    assert sorted(_fetches(disk, path), key=str) == sorted(fetches * 2, key=str)
+    assert stderr_lines(result.stderr).count(_dropped_notice(path, partial, errno.EIO)) == 1
+    reason = f'could not read its partial file {partial}: {os.strerror(errno.EIO)} (a second time in this run)'
+    assert f'Failed: 1\n  {path}: {reason}\n' in result.stdout
+    assert _preview_requests(disk) == []
+    [journal] = _journals().values()
+    assert journal
+    assert all((confirmed, digest) == (start, None) for start, _, confirmed, digest in journal)
+    assert _others_verified(dest, path)
+
+
+@pytest.mark.parametrize('code', [errno.EIO, errno.ENODEV, errno.EMFILE, errno.EACCES], ids=errno.errorcode.get)
+def test_an_unreadable_partial_file_stops_the_run_when_every_file_would_fail(disk, dest, monkeypatch, code):
+    big, _ = _leave_two_partials(disk, dest, None)
+    journals = _journals()
+    gone = dest.with_name('gone')
+
+    def unplug() -> None:
+        if code == errno.EIO:
+            dest.rename(gone)
+
+    with monkeypatch.context() as patch:
+        _refuse_partial_reads(patch, {big}, code, before=unplug)
+        result = run_download(*SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(code)}.']
+    if code == errno.EIO:
+        gone.rename(dest)
+    assert _journals() == journals
     assert big.read_bytes()[:300_000] == BIG[:300_000]
-    assert segmented.exists()
+    assert not [message for message in log_messages() if 'could not read its partial file' in message]
 
 
 @pytest.mark.parametrize(('before', 'after'), [('.', None), ('a', 'b')], ids=['off', 'moved'])

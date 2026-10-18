@@ -36,13 +36,23 @@ to the recorded digest; other bytes are fetched again, never trusted. A segment 
 is resumed at once, within a retry budget, from the bytes this turn wrote; one that fails transiently otherwise
 waits for the next pass over the files still to download.
 
+A partial file whose bytes cannot be read while its folder still can (re-hashing confirmed bytes, reading back a
+segmented file, copying a finished file to the destination) has its download's bytes dropped: the journal is replaced
+by one confirming nothing, with the plan a new download gets now, and the partial file is cut to 0 bytes. A resume
+then goes on as a new download; a file that could not be read back or copied waits for the next pass
+(`UnreadablePartial`), and fails as a local failure when no pass is left. A second drop of the same download in the
+run fails the file at once. A read failing because the partial folder is gone, the process is out of descriptors or
+memory, or access is refused stops the run instead, dropping nothing.
+
 The manifest records the folder the mirror's partial files are in. A run whose folder differs first moves each
 download in progress there, one at a time: only each segment's confirmed bytes are copied, a segment whose confirmed
 bytes the old file no longer holds is reset in the journal, and the copy is made durable before the old file is
-deleted. Then what is left in the old folder is deleted and the new folder recorded; a run stopped on the way leaves
-the old folder recorded, so the next run moves the files still there. A recorded folder that is gone is reported when
-downloads were in progress, and they start again. The recorded folder reached under another path is this run's
-folder: nothing is moved, and the new path is recorded.
+deleted. An old file that cannot be read while its folder still can has its download dropped, as above: the journal
+confirms nothing, the new file is emptied and the old one deleted, and the move goes on; a read failing as every
+other file's would stops the run. Then what is left in the old folder is deleted and the new folder recorded; a run
+stopped on the way leaves the old folder recorded, so the next run moves the files still there. A recorded folder
+that is gone is reported when downloads were in progress, and they start again. The recorded folder reached under
+another path is this run's folder: nothing is moved, and the new path is recorded.
 
 With separate partials, the partial files take no more than the room of their folder, measured once the move is
 done (`PartialRoom`): a file fetched takes a turn of the room for its full size, in the order files start, and waits,
@@ -95,6 +105,7 @@ from yandex_disk_rescue.destination import (
     DiskAction,
     ExistingFile,
     PartialFile,
+    PartialReadError,
     PreviousPartials,
 )
 from yandex_disk_rescue.disk_threads import DiskThreads
@@ -136,6 +147,9 @@ _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to 
 # reach (a permission, a path changed under the run) or the process is out of descriptors or memory, not that the copy
 # is unreadable.
 _COPY_OUT_OF_REACH_ERRNOS = MISSING_ERRNOS | PROCESS_LIMIT_ERRNOS | {errno.EACCES, errno.EPERM}
+# A read of a partial file failing with one of these stops the run: the device is gone, the process is out of
+# descriptors or memory, or the work directory refuses access, so every other partial file would fail the same way.
+_PARTIAL_READ_STOP_ERRNOS = DEVICE_GONE_ERRNOS | PROCESS_LIMIT_ERRNOS | {errno.EACCES, errno.EPERM}
 _QUARANTINE_HINT = (
     'Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).'
 )
@@ -193,6 +207,14 @@ class NoRoomYet(FileDeferred):
         self.final = final
 
 
+class UnreadablePartial(FileDeferred):
+    """The file arrived in full, but its partial file could not be read back or copied to the destination; its bytes
+    were dropped, so a later pass downloads it again from its first byte. The cause is local, not on Yandex's side."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason, retry_after=None, throttled=False, received=True)
+
+
 @dataclass(frozen=True)
 class Failure:
     """An entry that failed for `reason`; `unavailable` when it is a file unavailable on Yandex Disk (see
@@ -245,8 +267,8 @@ class PartialLeft:
 @dataclass(frozen=True)
 class PartialMove:
     """The partial files of downloads in progress moving from `source`, the folder the last run recorded, to `target`,
-    this run's: `downloads` of them, with `size` confirmed bytes to copy. With `missing`, `source` no longer exists,
-    nothing is moved and `downloads` start again from byte 0."""
+    this run's: `downloads` of them, with `size` confirmed bytes to copy, as planned before the move starts. With
+    `missing`, `source` no longer exists, nothing is moved and `downloads` start again from byte 0."""
 
     source: Path
     target: Path
@@ -671,7 +693,8 @@ class ApiProbe:
 @dataclass(frozen=True)
 class _RunTools:
     """What every turn of a run shares: the clients, the worker threads, the placement lock, the copy lock, the hash
-    holds, the room of a separate partial folder, the report, the transfer policy and the probe of the Disk API."""
+    holds, the room of a separate partial folder, the report, the transfer policy, the probe of the Disk API, and the
+    entry ids of the downloads whose partial file could not be read and was dropped in this run."""
 
     client: api.DiskClient
     content: api.ContentClient
@@ -683,6 +706,7 @@ class _RunTools:
     report: MirrorReport
     policy: TransferPolicy
     probe: ApiProbe
+    dropped: set[int]
 
 
 class _FileTurns:
@@ -832,6 +856,7 @@ class MirrorRun:
             if e.failure is not None
         }
         self._counted: set[int] = set()
+        self._dropped: set[int] = set()
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
         self._moved: list[tuple[MirrorEntry, tuple[Segment, ...], int]] = []
@@ -876,26 +901,34 @@ class MirrorRun:
         """Carry out `partial_move`, reporting it to `progress`: each download's partial file in turn, then the deletion
         of what is left in the recorded folder, then the record of this run's folder. A run stopped on the way keeps the
         recorded folder, so the next run moves the partial files still there, writing their copies in this run's folder
-        again. This run's folder is recorded also when there is nothing to move. `run` starts only once this is done."""
+        again. This run's folder is recorded also when there is nothing to move. `run` starts only once this is done.
+        The log line at the end gives the confirmed bytes actually carried over and the downloads dropped as unreadable
+        (`_move_partial`)."""
         move = self.partial_move
         if move is not None and self._source is not None:
             started = time.monotonic()
             if move.downloads:
                 progress.start(move.downloads, move.size)
+            copied, unreadable = 0, 0
             with DiskThreads(1) as threads:
                 for entry, segments, held in self._moved:
                     with _fatal_errors('write', self._destination.partial_folder):
-                        await self._move_partial(entry, segments, held, self._source, threads, progress)
+                        moved = await self._move_partial(entry, segments, held, self._source, threads, progress)
+                    if moved is None:
+                        unreadable += 1
+                    else:
+                        copied += moved
                     progress.moved()
                 await threads.run(self._source.remove_leftovers)
             if move.downloads:
                 _log.info(
-                    'Moved the partial files of %d downloads in progress (%s) from %s to %s in %.1f s',
+                    'Moved the partial files of %d downloads in progress (%s) from %s to %s in %.1f s%s',
                     move.downloads,
-                    format_size(move.size),
+                    format_size(copied),
                     move.source,
                     move.target,
                     time.monotonic() - started,
+                    f', {unreadable} dropped as unreadable' if unreadable else '',
                 )
         if self._mirror.partial_folder != self._partial_folder:
             self._mirror.record_partial_folder(self._partial_folder)
@@ -909,29 +942,48 @@ class MirrorRun:
         source: PreviousPartials,
         threads: DiskThreads,
         progress: MoveProgress,
-    ) -> None:
+    ) -> int | None:
         """Copy the bytes the journal confirms of the `held`-byte partial file of `entry` in `source` to the same
         offsets of its partial file here, emptied first; a segment whose confirmed bytes are not all held is reset to
-        its start in the journal instead. The copy is made durable before the source is deleted."""
+        its start in the journal instead. The copy is made durable before the source is deleted. The confirmed bytes
+        copied; `None` when the old file could not be read.
+
+        A read of the old file that fails while `source` is still reachable drops the download: a journal confirming
+        nothing is recorded, the new file is cut to 0 bytes, its bytes are taken back from `progress`, and the old file
+        is deleted as a moved one is, so a crash anywhere leaves a journal that trusts nothing; the entry joins the
+        run's drops. A read failing as every other file's would (see `_unreadable_drops`) stops the run, and the
+        recorded folder is moved again by the next run."""
         entry_id = entry.entry_id
         movable = _movable(segments, held)
         kept = [s if s in movable else Segment(s.start, s.end, s.start, None) for s in segments]
         if kept != list(segments):
             self._mirror.checkpoint(entry_id, kept)
+        size = sum(segment.confirmed - segment.start for segment in movable)
+        moved: int | None = size
+        copied = 0
         with source.partial(entry_id) as old, self._destination.partial(entry_id) as new:
 
             def write(offset: int, chunk: bytes) -> None:
+                nonlocal copied
                 new.write(offset, chunk)
+                copied += len(chunk)
                 progress.copied(len(chunk))
 
             await threads.run(new.truncate, 0)
-            for segment in movable:
-                chunks = _read_errors(old.chunks(segment.start, segment.confirmed), source.path / str(entry_id))
-                await _feed(write, chunks, threads, segment.start)
+            try:
+                for segment in movable:
+                    await _feed(write, old.chunks(segment.start, segment.confirmed), threads, segment.start)
+            except PartialReadError as exc:
+                await _unreadable_drops(exc, entry, source.reachable, threads, self._dropped)
+                self._mirror.checkpoint(entry_id, [Segment(s.start, s.end, s.start, None) for s in segments])
+                await threads.run(new.truncate, 0)
+                progress.dropped(size, copied)
+                moved = None
             await threads.run(new.sync)
         await threads.run(self._destination.sync_partial_folder)
         await threads.run(source.remove, entry_id)
-        moved = sum(segment.confirmed - segment.start for segment in movable)
+        if moved is None:
+            return None
         _log.debug(
             '%s: partial file moved from %s to %s (%s confirmed)',
             entry.resource.path,
@@ -939,6 +991,7 @@ class MirrorRun:
             self._destination.partial_folder,
             format_size(moved),
         )
+        return moved
 
     def _check(self, destination: Destination) -> set[int]:
         """The files whose verified copy is still in place, by an `lstat` of each candidate."""
@@ -1008,6 +1061,7 @@ class MirrorRun:
                 report=report,
                 policy=policy,
                 probe=ApiProbe(client, self._mirror),
+                dropped=self._dropped,
             )
             changes = _changes(room)
             _log_pass(
@@ -1124,8 +1178,9 @@ class MirrorRun:
         suffix = f' (after {used} passes)' if used > 1 else ''
         for entry, failure in deferred:
             no_room = isinstance(failure, NoRoomYet)
+            local = no_room or isinstance(failure, UnreadablePartial)
             reason = failure.final if stuck and no_room else failure.reason + suffix
-            self._fail(tools.report, entry, reason, new_turn=entry.entry_id not in self._counted, on_yandex=not no_room)
+            self._fail(tools.report, entry, reason, new_turn=entry.entry_id not in self._counted, on_yandex=not local)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -1284,6 +1339,7 @@ class MirrorRun:
                 policy=tools.policy,
                 room=tools.room,
                 probe=tools.probe,
+                dropped=tools.dropped,
                 progress=self._progress.begin(entry.entry_id, path, size),
                 unreadable=lambda found: self._found_unreadable(report, entry, found),
             )
@@ -1343,6 +1399,7 @@ async def download_file(
     policy: TransferPolicy,
     room: PartialRoom | None,
     probe: ApiProbe,
+    dropped: set[int],
     progress: ActiveFile,
     unreadable: Callable[[Finding], None],
 ) -> FileOutcome:
@@ -1376,12 +1433,15 @@ async def download_file(
     other partial file, is started again from byte 0 with the segments of `policy` (one segment in a partial folder
     without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
     module. A download link or resume check the Disk API keeps failing to answer goes to `probe`: while the API still
-    answers for other files, the turn is deferred, a resumed partial file keeping its confirmed bytes.
+    answers for other files, the turn is deferred, a resumed partial file keeping its confirmed bytes. A partial file
+    that cannot be read while its folder can has its bytes dropped, as the module describes; `dropped` holds the
+    entry ids dropped in this run, and a second drop of the entry fails the file.
 
     Raises `FileDeferred` when the turn failed transiently and a later pass may finish it, `FileQuarantined` when the
     downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError` when the
     destination cannot be read, written or inspected at all (a local copy that cannot be read while the device is
-    gone or the destination itself unreadable included), and the API errors that stop the run: `TokenRejectedError`,
+    gone or the destination itself unreadable included, and a partial file that cannot be read while its folder is
+    gone), and the API errors that stop the run: `TokenRejectedError`,
     and `DiskApiError` (for a download link or resume check, only in an outage of the Disk API).
     """
     local = _local_path(entry)
@@ -1426,6 +1486,7 @@ async def download_file(
                 destination=destination,
                 policy=policy,
                 probe=probe,
+                dropped=dropped,
                 progress=progress,
             )
             local, moved_aside = await _place_verified(
@@ -1655,6 +1716,7 @@ async def _fetch_verified(
     destination: Destination,
     policy: TransferPolicy,
     probe: ApiProbe,
+    dropped: set[int],
     progress: ActiveFile,
 ) -> VerifiedBy:
     """Fetch the file into its partial file, keeping the confirmed bytes already there when they can be resumed, give
@@ -1667,6 +1729,9 @@ async def _fetch_verified(
     run at a time, and verified by the digest of the bytes copied; the cloud mtime goes to the copy. Re-hashing the
     confirmed bytes of a resumed download and reading back a segmented file run under `hashing`, the partial folder's
     hash hold.
+
+    A partial file that cannot be read back or copied, while its folder can, has its bytes dropped
+    (`_drop_unreadable`), and `UnreadablePartial` defers the file to a later pass.
 
     A file that fails verification is moved to the run's quarantine folder under `placement`, then recorded as
     quarantined, which drops its download record, and `FileQuarantined` is raised; a separate partial file is deleted
@@ -1685,6 +1750,7 @@ async def _fetch_verified(
             hashing=hashing,
             policy=policy,
             probe=probe,
+            dropped=dropped,
             progress=progress,
         )
         if len(streams) > 1:
@@ -1715,20 +1781,36 @@ async def _fetch_verified(
             progress=progress,
         )
         await fetch.run()
-        if destination.separate_partials:
+        separate = destination.separate_partials
+        if separate:
             await journal.take()
-            digest = await _copy_to_destination(entry, identity, partial, destination, threads, copying, progress)
-        else:
-            digest = await _file_digest(
-                journal, partial, threads, hashing, entry.resource.path, identity.size, progress
+        try:
+            digest = await (
+                _copy_to_destination(entry, identity, partial, destination, threads, copying, progress)
+                if separate
+                else _file_digest(journal, partial, threads, hashing, entry.resource.path, identity.size, progress)
             )
+        except PartialReadError as exc:
+            await _drop_unreadable(
+                exc,
+                entry,
+                identity,
+                partial,
+                mirror=mirror,
+                destination=destination,
+                policy=policy,
+                threads=threads,
+                progress=progress,
+                dropped=dropped,
+            )
+            raise UnreadablePartial(_unreadable_reason(exc)) from None
+        if not separate:
             await threads.run(partial.finish, _mtime_ns(identity.modified))
     if (reason := digest.mismatch(identity)) is None:
         return _method(identity)
     async with placement:
         copy = await threads.run(destination.quarantine, entry.entry_id, _local_path(entry))
     mirror.record_quarantined(entry.entry_id, identity, copy, reason)
-    separate = destination.separate_partials
     left = await _remove_recorded_partial(entry, destination, threads) if separate else None
     raise FileQuarantined(reason, copy, left)
 
@@ -1743,7 +1825,8 @@ async def _copy_to_destination(
     progress: ActiveFile,
 ) -> Digest:
     """Copy the finished partial file to its staged copy in the destination, in order, one chunk per thread call,
-    under `copying`; then give the copy the cloud mtime, durably. The digest of the bytes copied."""
+    under `copying`; then give the copy the cloud mtime, durably. The digest of the bytes copied. A failed read of the
+    partial file raises `PartialReadError`."""
     path = entry.resource.path
     if copying.locked():
         _log.debug('%s waits for the copy of another file to %s', path, destination.path)
@@ -1782,6 +1865,7 @@ async def _resume(
     hashing: asyncio.Lock,
     policy: TransferPolicy,
     probe: ApiProbe,
+    dropped: set[int],
     progress: ActiveFile,
 ) -> list[_Stream]:
     """The streams of this turn, one per segment of the journal, each starting after the bytes of its segment kept,
@@ -1793,7 +1877,9 @@ async def _resume(
     hold of `hashing`, the partial folder's hash hold, taken after the cloud check. While any segment keeps bytes, the
     record keeps the segments it was started with. When none does, and for any other record, the record is replaced
     by a new `partial` one with the plan a new download gets now: the segments of `policy`'s plan, one segment in a
-    partial folder without sparse files. A record that already is that plan is not written.
+    partial folder without sparse files. A record that already is that plan is not written. A confirmed byte that
+    cannot be read drops every segment's bytes (`_drop_unreadable`), and the turn goes on with the plan of a new
+    download.
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
     check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
@@ -1823,8 +1909,23 @@ async def _resume(
     held = partial.size()
     streams = _streams(record.segments, size)
     if _movable(record.segments, held):
-        async with _hash_turn(hashing, entry.resource.path, progress, 'hashing'):
-            await _rehash_kept(entry.resource.path, record.segments, streams, held, partial, threads, progress)
+        try:
+            async with _hash_turn(hashing, entry.resource.path, progress, 'hashing'):
+                await _rehash_kept(entry.resource.path, record.segments, streams, held, partial, threads, progress)
+        except PartialReadError as exc:
+            plan = await _drop_unreadable(
+                exc,
+                entry,
+                identity,
+                partial,
+                mirror=mirror,
+                destination=destination,
+                policy=policy,
+                threads=threads,
+                progress=progress,
+                dropped=dropped,
+            )
+            return _streams(plan, size)
     if all(stream.written == stream.start for stream in streams):
         plan = _new_plan(size, policy, destination)
         if plan != record.segments:
@@ -1860,6 +1961,63 @@ async def _rehash_kept(
         kept = segment.confirmed - segment.start
         _log.debug('%s: segment at byte %d resumed with %d bytes kept', path, segment.start, kept)
         progress.kept(kept)
+
+
+async def _drop_unreadable(
+    error: PartialReadError,
+    entry: MirrorEntry,
+    identity: RemoteIdentity,
+    partial: PartialFile,
+    *,
+    mirror: Mirror,
+    destination: Destination,
+    policy: TransferPolicy,
+    threads: DiskThreads,
+    progress: ActiveFile,
+    dropped: set[int],
+) -> tuple[Segment, ...]:
+    """Handle `error`, a read of `entry`'s open partial file `partial` that failed; the journal the download goes on
+    with.
+
+    Unless `_unreadable_drops` stops the run, the download's bytes are dropped: a new `partial` record with the plan a
+    new download gets now is written, then the partial file is cut to 0 bytes, so a crash in between leaves a journal
+    that trusts nothing. A drop of an entry already dropped in this run raises `FileFailed`, a local failure.
+    """
+    again = await _unreadable_drops(error, entry, destination.partial_folder_reachable, threads, dropped)
+    plan = _new_plan(identity.size, policy, destination)
+    mirror.record_partial(entry.entry_id, identity, plan)
+    await threads.run(partial.truncate, 0)
+    progress.cut()
+    if again:
+        raise FileFailed(f'{_unreadable_reason(error)} (a second time in this run)')
+    return plan
+
+
+async def _unreadable_drops(
+    error: PartialReadError,
+    entry: MirrorEntry,
+    reachable: Callable[[], bool],
+    threads: DiskThreads,
+    dropped: set[int],
+) -> bool:
+    """Whether `entry`'s bytes were already dropped in this run, now that `error`, a read of its partial file, failed
+    and they are dropped (again).
+
+    When every other partial file would fail too (an errno in `_PARTIAL_READ_STOP_ERRNOS`, or its folder no longer
+    `reachable`), `DestinationError` stops the run and nothing is dropped. The first drop of an entry in the run logs
+    a warning and joins `dropped`.
+    """
+    if error.errno in _PARTIAL_READ_STOP_ERRNOS or not await threads.run(reachable):
+        raise DestinationError('read', error.path, error.reason) from None
+    if entry.entry_id in dropped:
+        return True
+    _log.warning('%s: %s; downloading it again from its first byte', entry.resource.path, _unreadable_reason(error))
+    dropped.add(entry.entry_id)
+    return False
+
+
+def _unreadable_reason(error: PartialReadError) -> str:
+    return f'could not read its partial file {error.path}: {error.reason}'
 
 
 def _new_plan(size: int, policy: TransferPolicy, destination: Destination) -> tuple[Segment, ...]:
@@ -1908,7 +2066,7 @@ async def _file_digest(
 ) -> Digest:
     """The digest of the whole fetched file: the one computed as it arrived when it was fetched as one stream;
     otherwise, after a checkpoint, the digest of the partial file read back in full under `hold`, the partial folder's
-    hash hold."""
+    hash hold. A failed read back raises `PartialReadError`."""
     match journal.streams:
         case [_Stream(hasher=Digest() as digest)]:
             return digest
@@ -2529,14 +2687,6 @@ def _fatal_errors(action: DiskAction, path: Path) -> Iterator[None]:
         yield
     except OSError as exc:
         raise DestinationError.of(action, path, exc) from None
-
-
-def _read_errors(chunks: Iterator[bytes], path: Path) -> Iterator[bytes]:
-    """`chunks`, read from the file at `path`; an error reading them raises `DestinationError` naming it."""
-    try:
-        yield from chunks
-    except OSError as exc:
-        raise DestinationError.of('read', path, exc) from None
 
 
 def _changes(room: PartialRoom | None) -> int:
