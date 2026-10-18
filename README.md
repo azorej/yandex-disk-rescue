@@ -1357,7 +1357,7 @@ uv run yandex-disk-rescue --help
 | `mise run ci:selftest` | Tests for the Dagger module itself |
 | `mise run ci:package` | Build and `twine check` the sdist and wheel, then install the wheel with `uv tool` and `pipx` in clean containers and run the installed-CLI tests |
 | `mise run release:dist vX.Y.Z` | Rehearse a release up to the upload: the tag and CHANGELOG checks, the build and the install smoke, into `release/` |
-| `mise run release:verify vX.Y.Z` | Check that PyPI serves `release/dist/` and that `uv tool install yandex-disk-rescue==X.Y.Z` works |
+| `mise run release:verify vX.Y.Z` | Check that PyPI lists exactly the files of `release/dist/`, with their SHA-256s, and that `uv tool install yandex-disk-rescue==X.Y.Z` works |
 | `mise run lock` | Upgrade every dependency in `uv.lock` |
 | `mise tasks` | List all tasks |
 

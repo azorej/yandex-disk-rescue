@@ -6,14 +6,14 @@ green `dagger call check` locally means a green CI run on GitHub.
 
 import asyncio
 import datetime
+import http.client
 import json
 import re
 import time
-import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from typing import Annotated
+from typing import Annotated, Literal
 
 import dagger
 from dagger import DefaultPath, Doc, Ignore, dag, function, object_type
@@ -52,9 +52,11 @@ PIPX = f'{SMOKE_UV_TOOL_BIN_DIR}/pipx'
 PIPX_BACKEND = 'pip'
 CHANGELOG = 'CHANGELOG.md'
 LINK_REFERENCE = re.compile(r'^\[[^\]]+\]:\s')
-PYPI_RELEASE_JSON = f'https://pypi.org/pypi/{PACKAGE}/{{version}}/json'
+PYPI_INDEX = 'https://pypi.org/pypi'
 PYPI_HTTP_TIMEOUT_SECONDS = 30
 PUBLISHED_RETRY_SECONDS = 15
+# Raised by a dropped connection, an HTTP error status (a version PyPI does not list yet) or a truncated body.
+TRANSIENT_INDEX_ERRORS = (OSError, http.client.HTTPException, json.JSONDecodeError)
 
 
 @dataclass(frozen=True)
@@ -103,12 +105,29 @@ def changelog_section(changelog: str, version: str) -> str:
     return notes
 
 
-def pypi_sha256s(version: str) -> dict[str, str]:
-    """File name to SHA-256 of every file PyPI lists for `version`."""
-    url = PYPI_RELEASE_JSON.format(version=version)
+def release_json_url(index_url: str, version: str) -> str:
+    return f'{index_url}/{PACKAGE}/{version}/json'
+
+
+def pypi_sha256s(url: str) -> dict[str, str]:
+    """File name to SHA-256 of every file the release JSON at `url` lists."""
     with urllib.request.urlopen(url, timeout=PYPI_HTTP_TIMEOUT_SECONDS) as response:
         release = json.load(response)
     return {file['filename']: file['digests']['sha256'] for file in release['urls']}
+
+
+def pypi_state(local: dict[str, str], remote: dict[str, str]) -> Literal['done', 'waiting']:
+    """`done` once `remote` lists exactly the files of `local` with the same SHA-256s, `waiting` while some are missing.
+
+    A file `local` lacks, or a file with another digest, is an error: the index never drops or changes a file.
+    """
+    extra = sorted(remote.keys() - local.keys())
+    if extra:
+        raise ValueError(f'the index lists {extra}, which the local dist lacks')
+    for name, digest in sorted(remote.items()):
+        if digest != local[name]:
+            raise ValueError(f'the index serves {name} with sha256 {digest}, the local file has {local[name]}')
+    return 'done' if remote.keys() == local.keys() else 'waiting'
 
 
 def clean_container() -> dagger.Container:
@@ -272,6 +291,8 @@ class RepoCi:
         program = f'{installer.bin_dir}/{PACKAGE}'
         try:
             installed = (
+                # Changes once per UTC day, so Dagger's cache keeps the install for at most a day and dependencies
+                # resolve fresh from PyPI.
                 clean.with_env_variable('SMOKE_RESOLVE_DATE', datetime.datetime.now(datetime.UTC).date().isoformat())
                 .with_exec(installer.install)
                 .without_env_variable('SMOKE_RESOLVE_DATE')
@@ -335,13 +356,14 @@ class RepoCi:
         return dag.directory().with_directory('dist', dist).with_new_file('notes.md', f'{notes}\n')
 
     @function(cache='never')
-    async def published(
+    async def index_serves(
         self,
         tag: Annotated[str, Doc('The release tag: `v` + the published version')],
         dist: Annotated[dagger.Directory, Doc('The `dist/` that `release` returned, as uploaded')],
-        timeout: Annotated[int, Doc('Seconds to wait for PyPI to serve the files and the version')] = 600,
+        timeout: Annotated[int, Doc('Seconds to wait for the index to serve the files')] = 600,
+        index_url: Annotated[str, Doc('Base URL of the JSON API of the index')] = PYPI_INDEX,
     ) -> str:
-        """Wait until PyPI serves exactly the files of `dist`, then `uv tool install` the version by name and check it."""
+        """Wait until the index lists exactly the files of `dist`, with their SHA-256s."""
         if not tag.startswith('v'):
             raise ValueError(f'tag {tag} must be `v` + the version')
         version = tag.removeprefix('v')
@@ -349,9 +371,34 @@ class RepoCi:
         found = sorted(await dist.entries())
         if found != names:
             raise ValueError(f'dist must hold exactly {names} for tag {tag}, found {found}')
+        local = await self._sha256s(dist, names)
+        url = release_json_url(index_url, version)
         deadline = time.monotonic() + timeout
-        await self._wait_for_pypi_files(version, await self._sha256s(dist, names), deadline, timeout)
-        return await self._install_published(version, deadline, timeout)
+        while True:
+            try:
+                remote = await asyncio.to_thread(pypi_sha256s, url)
+            except TRANSIENT_INDEX_ERRORS as error:
+                last_seen = f'{type(error).__name__}: {error}'
+            else:
+                if pypi_state(local, remote) == 'done':
+                    return f'{url} lists exactly {names} with the local sha256s'
+                last_seen = f'the index lists {sorted(remote)}'
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f'{url} did not list exactly {names} within {timeout}s; last seen: {last_seen}')
+            await asyncio.sleep(PUBLISHED_RETRY_SECONDS)
+
+    @function(cache='never')
+    async def published(
+        self,
+        tag: Annotated[str, Doc('The release tag: `v` + the published version')],
+        dist: Annotated[dagger.Directory, Doc('The `dist/` that `release` returned, as uploaded')],
+        timeout: Annotated[int, Doc('Seconds to wait for PyPI to serve the files and the version')] = 600,
+    ) -> str:
+        """Wait until PyPI serves exactly the files of `dist`, then `uv tool install` the version by name and check it."""
+        deadline = time.monotonic() + timeout
+        files = await self.index_serves(tag, dist, timeout)
+        installed = await self._install_published(tag.removeprefix('v'), deadline, timeout)
+        return f'{files}\n{installed}'
 
     async def _sha256s(self, dist: dagger.Directory, names: list[str]) -> dict[str, str]:
         listing = await (
@@ -363,25 +410,6 @@ class RepoCi:
             .stdout()
         )
         return {name: digest for digest, name in (line.split() for line in listing.splitlines())}
-
-    async def _wait_for_pypi_files(self, version: str, local: dict[str, str], deadline: float, timeout: int) -> None:
-        while True:
-            try:
-                remote = await asyncio.to_thread(pypi_sha256s, version)
-            except (urllib.error.URLError, TimeoutError) as error:
-                last_seen = f'{PYPI_RELEASE_JSON.format(version=version)}: {error}'
-            else:
-                for name, digest in local.items():
-                    if name in remote and remote[name] != digest:
-                        raise ValueError(f'PyPI serves {name} with sha256 {remote[name]}, the local file has {digest}')
-                if local.keys() <= remote.keys():
-                    return
-                last_seen = f'PyPI lists {sorted(remote)}'
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f'PyPI did not list {sorted(local)} for {version} within {timeout}s; last seen: {last_seen}'
-                )
-            await asyncio.sleep(PUBLISHED_RETRY_SECONDS)
 
     async def _install_published(self, version: str, deadline: float, timeout: int) -> str:
         requirement = f'{PACKAGE}=={version}'
@@ -403,4 +431,4 @@ class RepoCi:
         printed = await installed.with_exec([program, '--version']).stdout()
         if printed != f'{PACKAGE} {version}\n':
             raise ValueError(f'`{PACKAGE} --version` printed {printed!r}, expected {PACKAGE} {version}')
-        return f'PyPI serves {PACKAGE} {version} with the local sha256s; `uv tool install {requirement}`: {printed.strip()}'
+        return f'`uv tool install {requirement}`: {printed.strip()}'

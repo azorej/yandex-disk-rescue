@@ -20,7 +20,8 @@ A pushed tag `vX.Y.Z` on a commit of `main` releases version `X.Y.Z` through
    install-smokes the wheel with `uv tool` and `pipx`.
 2. `publish-pypi` waits for your approval of the `pypi` deployment, then uploads those exact files with Trusted
    Publishing.
-3. `verify-pypi` waits until PyPI serves both files with the same SHA-256, then installs the version by name.
+3. `verify-pypi` waits until PyPI lists exactly those two files with the same SHA-256s, then installs the version by
+   name.
 4. `github-release` creates the GitHub Release with the CHANGELOG notes and the two files (a pre-release for an
    `a`, `b` or `rc` version).
 
@@ -48,10 +49,10 @@ A user-visible change adds a line under `## [Unreleased]` in [`CHANGELOG.md`](CH
    (`## [1.0.0rc1] - …` becomes `## [1.0.0] - <date>`).
 2. Optionally rehearse everything up to the upload: `mise run release:dist vX.Y.Z` leaves the checked files in
    `release/dist/` and the notes in `release/notes.md`.
-3. After the merge, tag the merge commit and push the tag:
+3. After the merge, tag the release PR's squash commit on `main` and push the tag:
 
    ```bash
-   git tag -a vX.Y.Z -m "yandex-disk-rescue X.Y.Z" <merge sha>
+   git tag -a vX.Y.Z -m "yandex-disk-rescue X.Y.Z" <squash commit sha>
    git push origin vX.Y.Z
    ```
 
