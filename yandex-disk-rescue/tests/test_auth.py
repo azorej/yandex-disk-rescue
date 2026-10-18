@@ -2,6 +2,7 @@
 
 import stat
 import urllib.parse
+from importlib.metadata import version
 from pathlib import Path
 
 import pytest
@@ -240,8 +241,15 @@ def test_status_with_a_stored_token_shows_the_account(fake_disk_api):
         'Account: rescue.tester',
         'Disk usage: 1.5 GiB of 10.0 GiB used (15.0%)',
     ]
-    assert [(r.method, r.path, r.headers['authorization']) for r in fake_disk_api.requests] == [
-        ('GET', '/v1/disk/', f'OAuth {TOKEN}')
+    assert [
+        (r.method, r.path, r.headers['authorization'], r.headers['user-agent']) for r in fake_disk_api.requests
+    ] == [
+        (
+            'GET',
+            '/v1/disk/',
+            f'OAuth {TOKEN}',
+            f'yandex-disk-rescue/{version("yandex-disk-rescue")} (+https://github.com/azorej/yandex-disk-rescue)',
+        )
     ]
 
 

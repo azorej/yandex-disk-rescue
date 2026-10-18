@@ -15,6 +15,7 @@ import httpx
 
 from yandex_disk_rescue.api.client import describe_transport_error
 from yandex_disk_rescue.api.limiter import parse_retry_after
+from yandex_disk_rescue.api.user_agent import USER_AGENT
 
 _CONTENT_RANGE = re.compile(r'bytes (\d+)-(\d+)/(\d+)')
 
@@ -75,7 +76,7 @@ class ContentClient:
             follow_redirects=True,
             timeout=timeout,
             limits=httpx.Limits(max_connections=None, max_keepalive_connections=connections),
-            headers={'Accept-Encoding': 'identity'},
+            headers={'Accept-Encoding': 'identity', 'User-Agent': USER_AGENT},
         )
 
     @property

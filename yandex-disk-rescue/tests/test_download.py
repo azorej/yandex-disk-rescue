@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
+from importlib.metadata import version
 from pathlib import Path, PurePosixPath
 
 import pytest
@@ -271,6 +272,11 @@ def test_a_fresh_mirror_holds_every_file_with_its_bytes_and_cloud_mtime(disk, de
     assert lines[0].startswith('Scanned disk:/: 6 files, 4 folders')
     if redirect:
         assert len([r for r in disk.requests if r.path == '/storage']) == len(FILES)
+    request_kinds = {'/v1/disk/', '/v1/disk/resources', '/v1/disk/resources/download', '/download'}
+    assert {r.path for r in disk.requests} >= request_kinds | ({'/storage'} if redirect else set())
+    assert {r.headers['user-agent'] for r in disk.requests} == {
+        f'yandex-disk-rescue/{version("yandex-disk-rescue")} (+https://github.com/azorej/yandex-disk-rescue)'
+    }
 
 
 def test_a_rerun_skips_verified_files_without_reading_them(disk, dest):

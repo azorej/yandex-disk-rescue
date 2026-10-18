@@ -22,10 +22,12 @@ from yandex_disk_rescue.api.transfer import (
     TransferRefusedError,
     TransientTransferError,
 )
+from yandex_disk_rescue.api.user_agent import USER_AGENT
 
 __all__ = [
     'MAX_PAUSE_SECONDS',
     'ROOT',
+    'USER_AGENT',
     'Account',
     'AdaptiveLimiter',
     'ApiLimits',

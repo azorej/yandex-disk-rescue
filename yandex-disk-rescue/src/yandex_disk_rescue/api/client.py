@@ -36,6 +36,7 @@ from yandex_disk_rescue.api.models import (
     parse_resource,
 )
 from yandex_disk_rescue.api.remote_paths import ROOT, normalize_remote_path
+from yandex_disk_rescue.api.user_agent import USER_AGENT
 from yandex_disk_rescue.auth import validate_token
 
 ACCOUNT_PATH = '/v1/disk/'
@@ -98,7 +99,7 @@ class DiskClient:
         )
         self._http = httpx.AsyncClient(
             base_url=base_url.rstrip('/'),
-            headers={'Authorization': f'OAuth {validate_token(token)}'},
+            headers={'Authorization': f'OAuth {validate_token(token)}', 'User-Agent': USER_AGENT},
             timeout=limits.timeout,
         )
 
