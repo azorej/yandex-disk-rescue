@@ -14,6 +14,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- `download` starts the files that failed before only after all the others, fewest failures first, in every pass,
+  so a restart reaches new data at once.
 - A file whose transfer failed is recorded as failed at once, before its later passes, so a run stopped between
   passes still lists it for `download --retry-failed` and `verify`. The manifest counts each entry's failed turns
   (schema version 10).

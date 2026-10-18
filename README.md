@@ -238,15 +238,25 @@ yandex-disk-rescue download disk:/Photos ~/Photos    # one folder
 exactly as [`scan`](#scanning-a-folder) does and prints the scan summary,
 unless a recent scan covers it (below). It then mirrors that folder into
 DEST, with up to `download_connections` files (default 20) downloading at
-once, started in path order: the folder structure is kept, each folder is
-created before anything inside it, empty folders are created, and every file
-gets the modification time it has on the Disk. It takes the `--api-*`
+once, started in the order below: the folder structure is kept, each folder
+is created before anything inside it, empty folders are created, and every
+file gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
 `--download-connections`, `--download-checkpoint-mib`, `--download-segments`,
 `--download-segment-threshold-mib`, `--partial-dir` and `--scan-max-age` (see
 [Configuration](#configuration)), `--no-scan` and `--retry-failed`
 (below). A file whose download host never answers holds one connection until
 it stalls and delays no other file.
+
+**Order.** Files with no failure record start first, in path order. Files that
+failed before start after all of them, fewest failed turns first, ties in path
+order, so a restart reaches new and healthy data at once. Each later pass
+follows the same rule over the files still to download. A partial download
+keeps its confirmed bytes whenever its turn comes, and folders are still made
+before anything inside them. With `--partial-dir`, a file that fits only once
+the kept partial file of an earlier failed download is gone may meet `no room
+yet` in pass 1 and get the room in the next pass; with `--download-passes 1`
+it fails with that reason, and the next run or `--retry-failed` fetches it.
 
 **Segmented files.** A file larger than `download_segment_threshold_mib` MiB
 (default 256) is downloaded as `download_segments` segments (default 4): equal
@@ -304,7 +314,7 @@ resume — happens on that disk, not on DEST:
   partial file kept for a later pass or run counts the disk space it
   actually takes, which for a segmented file is only what was written so
   far, until it is deleted (also when its file is found already in DEST
-  and adopted). Files take their room in path order, a file that does not
+  and adopted). Files take their room in the order they start, a file that does not
   fit yet waits for one in progress to end, and when none is left in
   progress it is deferred to the next pass with `no room yet in the partial
   folder <folder> (<size> needed, <size> available)`. When a pass starts no
@@ -489,7 +499,8 @@ copy in DEST that `download` could not read — and the folders with a failure
 record. Files never started are not in it; a
 plain `download` gets them. The scan step runs as usual; the retry set is
 fixed once it is done. The run then visits only the retry set and the
-folders above its members, in path order, with the usual passes and rules,
+folders above its members, in the [order](#downloading) of every run, with
+the usual passes and rules,
 and never looks at any other path of DEST: those files are neither checked
 nor counted. It starts with
 

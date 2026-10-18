@@ -1720,6 +1720,92 @@ def test_dead_files_do_not_hold_up_the_healthy_ones(disk, dest):
     assert max(started[path] for path in healthy) - first_dead < float(STALL_TIMEOUT)
 
 
+def _content_order(fake, since: int = 0) -> list[str]:
+    """The remote path of each content request after the first `since` requests, in the order they started."""
+    return [r.params['path'] for r in fake.requests[since:] if r.path == '/download']
+
+
+def test_files_failing_in_a_pass_are_tried_again_only_after_every_healthy_file_finished(disk, dest):
+    failing = [f'disk:/Mixed/a-bad{n}.bin' for n in range(3)]
+    healthy = [f'disk:/Mixed/b-good{n}.bin' for n in range(8)]
+    for path in failing + healthy:
+        disk.add_file(path, random.Random(path).randbytes(4 * 64 * 1024))
+    for path in failing:
+        disk.inject('GET', '/download', 503, 503, where={'path': path})
+    disk.chunk_delay = 0.01
+
+    result = run_download('--download-connections', '4', '--download-passes', '2', 'disk:/Mixed', str(dest))
+
+    assert result.exit_code == 1
+    assert 'Passes: 2 of 2\nFailed: 3\n' in result.stdout
+    content = [r for r in disk.requests if r.path == '/download']
+    assert all(_fetches(disk, path) == [None, None] for path in failing)
+    second_tries = [[r for r in content if r.params['path'] == path][1].started for path in failing]
+    healthy_ends = [r.finished for r in content if r.params['path'] in healthy]
+    assert len(healthy_ends) == 8
+    assert max(healthy_ends) < min(second_tries)
+
+
+def test_a_rerun_starts_files_never_failed_first_then_the_failed_ones_fewest_failures_first(disk, dest):
+    args = ('--download-connections', '1', '--download-passes', '1', '--scan-max-age', '0', 'disk:/M', str(dest))
+    disk.add_file('disk:/M/a-x.bin', b'x' * 1000)
+    disk.inject('GET', '/download', 503, where={'path': 'disk:/M/a-x.bin'})
+    assert run_download(*args).exit_code == 1
+    first_log = log_messages()
+    disk.add_file('disk:/M/c-y.bin', b'y' * 1000)
+    for path in ('disk:/M/a-x.bin', 'disk:/M/c-y.bin'):
+        disk.inject('GET', '/download', 503, 503, where={'path': path})
+    assert run_download(*args).exit_code == 1
+    disk.add_file('disk:/M/d-z.bin', b'z' * 1000)
+    logged = len(log_messages())
+    earlier = len(disk.requests)
+
+    result = run_download(*args)
+
+    assert result.exit_code == 1
+    assert _content_order(disk, earlier) == ['disk:/M/d-z.bin', 'disk:/M/c-y.bin', 'disk:/M/a-x.bin']
+    assert [(path, turns) for path, _, turns in _failure_records()] == [('disk:/M/a-x.bin', 3), ('disk:/M/c-y.bin', 2)]
+    assert (dest / 'd-z.bin').read_bytes() == b'z' * 1000
+    assert (
+        f'Pass 1 of 1 over 3 files ({format_size(3000)}) starts; 2 that failed before start last'
+        in (log_messages()[logged:])
+    )
+    assert f'Pass 1 of 1 over 1 file ({format_size(1000)}) starts' in first_log
+
+
+def test_a_failed_partial_download_resumes_from_its_journal_after_the_untried_files(big, dest):
+    _leave_partial(big, dest)
+    big.add_file('disk:/Big/c-new.bin', b'new' * 1000, modified=MODIFIED)
+    earlier = len(big.requests)
+
+    result = run_download('--download-connections', '1', '--scan-max-age', '0', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _content_order(big, earlier) == ['disk:/Big/c-new.bin', BIG_PATH]
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'c-new.bin').read_bytes() == b'new' * 1000
+    assert _failure_records() == []
+
+
+def test_retry_failed_starts_the_files_with_no_failure_record_first(disk, dest):
+    failed, missing = 'disk:/Docs/readme.txt', 'disk:/Photos/2024/a.jpg'
+    disk.inject('GET', '/download', 503, where={'path': failed})
+    assert run_download('--download-passes', '1', str(dest)).exit_code == 1
+    local_file(dest, missing).unlink()
+    checked = runner.invoke(app, ['verify', str(dest)])
+    assert checked.exit_code == 1
+    assert [path for path, *_ in _failure_records()] == [failed]
+    earlier = len(disk.requests)
+
+    retry = run_download('--retry-failed', '--download-connections', '1', str(dest))
+
+    assert retry.exit_code == 0, retry.output
+    assert _content_order(disk, earlier) == [missing, failed]
+    assert local_file(dest, missing).read_bytes() == FILES[missing]
+    assert local_file(dest, failed).read_bytes() == FILES[failed]
+
+
 def test_throughput_scales_with_the_connection_cap_and_never_passes_it(disk, tmp_path):
     for n in range(8):
         disk.add_file(f'disk:/Load/f{n}.bin', random.Random(n).randbytes(10 * 64 * 1024))
@@ -2693,6 +2779,38 @@ def test_a_file_failed_once_and_then_only_waiting_for_room_counts_one_failed_tur
     assert waited.endswith(' (after 2 passes)')
     assert stalled == f'the download stalled: no data for {STALL_TIMEOUT} s (after 2 passes)'
     assert f'Failed: 2\n  {BIG_PATH}: {waited}\n  {BIG2_PATH}: {stalled}\n' in result.stdout
+
+
+def test_with_a_partial_folder_an_untried_file_waits_for_the_room_a_failed_files_kept_partial_frees(
+    big, dest, partial_root, monkeypatch
+):
+    kept = _leave_partial(big, dest, partial_root=partial_root)
+    allocated = kept.stat().st_blocks * 512
+    untried = 'disk:/Big/c-untried.bin'
+    big.add_file(untried, BIG2, modified=MODIFIED)
+    # big.bin fits next to its own kept partial file; c-untried.bin fits only once that partial file is gone.
+    free = MiB - allocated // 2
+    _free(monkeypatch, free)
+    logged = len(log_messages())
+    earlier = len(big.requests)
+
+    result = run_download(
+        '--download-connections', '1', '--scan-max-age', '0', *_partial_args(partial_root), 'disk:/Big', str(dest)
+    )
+
+    assert result.exit_code == 0, result.output
+    assert ', 0 failed\nPasses: 2 of 7\n' in result.stdout
+    assert _content_order(big, earlier) == [BIG_PATH, untried]
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    folder = _separate_folder(dest, partial_root)
+    waited = f'no room yet in the partial folder {folder} (1.0 MiB needed, {format_size(free)} available)'
+    messages = log_messages()[logged:]
+    deferred = messages.index(f'{untried} deferred to a later pass: {waited}')
+    assert deferred < next(i for i, m in enumerate(messages) if m.startswith(f'{BIG_PATH} downloaded: '))
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'c-untried.bin').read_bytes() == BIG2
+    assert _failure_records() == []
+    assert _partials(dest, partial_root) == []
 
 
 def test_a_kept_sparse_partial_file_takes_only_the_room_it_allocates(segmented, dest, partial_root, monkeypatch):
