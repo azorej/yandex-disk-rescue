@@ -269,7 +269,8 @@ resume — happens on that disk, not on DEST:
   When a run's folder differs from it — the option turned on or off, or
   `PATH` changed — the run first moves the downloads in progress there,
   printing `Moving the confirmed bytes (<size>) of N downloads in progress
-  from <old> to <new>`. Only the bytes the journals confirm are copied, one
+  from <old> to <new>` and `Moving:` status lines (see
+  [Output and logs](#output-and-logs)). Only the bytes the journals confirm are copied, one
   file at a time; the rest (bytes past the last checkpoint, a segmented
   file's zero-fill) is never read and is fetched again. Each copy is flushed
   to the disk before its old file is deleted, and the old folder is deleted
@@ -734,6 +735,8 @@ writes one line a minute:
 2026-10-17T09:44:05.310Z Scanned disk:/: 133521 files, 9800 folders (2.1 TiB) listed in 14 min 5 s
 2026-10-17T09:45:05.311Z Checking 133521 files already in /mnt/backup: 40210 checked
 2026-10-17T09:50:17.020Z Checked 133521 files already in /mnt/backup in 6 min 12 s
+2026-10-17T09:51:17.021Z Moving: 1 of 3 files, 1.2 GiB of 3.5 GiB (34.3%), 210.0 MiB/s, ETA 11 s
+2026-10-17T09:51:28.402Z Moved: 3 of 3 files, 3.5 GiB in 17 s, average 210.8 MiB/s
 2026-10-17T10:50:17.021Z Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
 2026-10-23T18:01:40.512Z Downloaded: 133521 of 133521 files, 2.1 TiB in 6 d 9 h, average 4.0 MiB/s; 0 to retry, 3 failed, 0 quarantined; 2 of 7 passes
 2026-10-24T09:00:01.733Z Verifying: 1234 of 98000 files, 120.5 GiB of 2.0 TiB (5.9%), 110.2 MiB/s, ETA 5 h 2 min; 2 problems; reading disk:/big.mkv (1.2 GiB of 4.0 GiB)
@@ -742,7 +745,10 @@ writes one line a minute:
 
 - The phases are the scan's listing (in `scan`, and in `download` when it
   scans), `download`'s check of the files already verified in DEST (only
-  when there are any), the passes of `download`, and `verify`.
+  when there are any), its move of the downloads in progress to a new
+  partial folder (only when the folder changed and some hold confirmed
+  bytes; `Moving` counts those files and their confirmed bytes), the passes
+  of `download`, and `verify`.
 - `Downloading` and `Verifying` count the files of the start line
   (`Downloading N files`, `Verifying N files`, or the files `left` of a
   continued pass). A file is done once it is downloaded or adopted, failed or
@@ -772,16 +778,19 @@ A notice is one line, `<UTC time> <message>`:
 
 By default stderr shows a notice for each file or folder that fails or is
 quarantined in this run, each `verify` finding made in this run (`missing`,
-`modified` or `corrupt`), each folder that disappeared during a scan and each
-entry left out because its name is not valid Unicode. Files `verify` lists
+`modified` or `corrupt`), each folder that disappeared during a scan, each
+entry left out because its name is not valid Unicode, and each partial file
+that could not be deleted once its file's outcome was recorded (`<path>:
+partial file <file> not deleted: <reason>; the outcome stands`). Files `verify` lists
 from the manifest (not downloaded, or held in quarantine) get no notice; the
 summary lists them.
 
 - `-v` / `--verbose` also shows each file downloaded (size, time, average
   speed, how it was verified), adopted, renamed or moved aside, each
-  deferral to a later pass, each pass starting, the start and commit of a
-  scan, and each Disk API throttling response and retry. It also logs DEBUG
-  records to the log file.
+  deferral to a later pass (also for room in the partial folder), each pass
+  starting, the end of a move of partial files to a new partial folder, the
+  start and commit of a scan, and each Disk API throttling response and
+  retry. It also logs DEBUG records to the log file.
 - `-q` / `--quiet` leaves only the final `Error: …` or `Interrupted; …` line
   on stderr (and the log-file warning described below): no status lines and
   no notices.
@@ -802,8 +811,10 @@ summary lists them.
 - Each line starts with the UTC time, the level, the command and its pid; a
   multi-line record (a summary, a traceback) gets that prefix on every line,
   so `grep` always shows when and which run wrote a line.
-- A run logs its start (the version and every argument and option value),
-  its full summary with every list complete (no `… and N more`), and its
+- A run logs its start (the version and every argument and option value,
+  `partial_dir` included), its start lines (`Downloading N files …`,
+  `Moving the confirmed bytes …`, `The partial folder of the last run … is
+  missing …`, `Partial files in …`), its full summary with every list complete (no `… and N more`), and its
   end: `completed (exit 0)`, `failed (exit N): <error>`,
   `interrupted (exit 130)`, or an unexpected error with its traceback.
 - In between it logs every notice, every `-v` record and every status line,
@@ -812,7 +823,10 @@ summary lists them.
   in quarantine, each file `verify` found intact or listed from the
   manifest, each transfer attempt and immediate retry, each link refresh,
   each resumed segment with the bytes kept, the fallback to one stream, each
-  checkpoint, and each folder listed.
+  checkpoint, each folder listed, and with `--partial-dir` each partial file
+  moved to the new partial folder, each file waiting for room there (or for
+  its turn behind files that wait for room), each file waiting for the copy
+  of another to DEST, and each copy to DEST with its time.
 - The file is rotated at 10 MiB, keeping five older files (`.1` is the most
   recent, `.5` the oldest). Every file is mode 0600 in the 0700 state
   directory.

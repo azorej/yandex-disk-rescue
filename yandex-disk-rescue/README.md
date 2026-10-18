@@ -122,9 +122,8 @@ yandex-disk-rescue/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
 │   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
-│   │   │             #   retry set (`--retry-failed`), its start line, the move line, the partial-folder line
-│   │   │             #   with its room once measured, summary,
-│   │   │             #   exit code
+│   │   │             #   retry set (`--retry-failed`), its start line, the move line and the move's status
+│   │   │             #   lines, the partial-folder line with its room once measured, summary, exit code
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, exit code
 │   │                 #   and Ctrl+C message; no token, no network
@@ -193,9 +192,11 @@ yandex-disk-rescue/
 │   │                 #   one phase (to the log file always, to stderr unless `--no-progress` or `-q`); the engines
 │   │                 #   and the API client log their own records (failures, findings, per-file outcomes, passes,
 │   │                 #   throttling) through `logging.getLogger`
-│   ├── progress.py   # Thread-safe progress states the engines update (ScanProgress, MirrorProgress with one
-│   │                 #   ActiveFile per file in progress, VerifyProgress), their snapshots and status lines; speed
-│   │                 #   over the last minute, ETA over the last 15 minutes; no I/O
+│   ├── progress.py   # Thread-safe progress states the engines update (ScanProgress, MoveProgress for the move of
+│   │                 #   partial files to a new partial folder, MirrorProgress with one ActiveFile per file in
+│   │                 #   progress and its state, from waiting for room to copying to DEST, VerifyProgress), their
+│   │                 #   snapshots and status lines; speed over the last minute, ETA over the last 15 minutes;
+│   │                 #   no I/O
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the timestamped notices on stderr
 │   ├── units.py      # format_size and format_duration — binary-unit byte counts and durations for command output

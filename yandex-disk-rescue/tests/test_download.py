@@ -35,6 +35,7 @@ from mirror_tree import (
     run_download,
     runner,
     start_command,
+    status_lines,
     stderr_lines,
     wait_until,
 )
@@ -45,7 +46,7 @@ from yandex_disk_rescue.destination import Destination, PartialFile
 from yandex_disk_rescue.manifest import Manifest, Mirror, Segment
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
 from yandex_disk_rescue.paths import log_path, manifest_path
-from yandex_disk_rescue.progress import MirrorProgress, ScanProgress
+from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -1707,7 +1708,9 @@ def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(dis
     disk.add_file(BIG_PATH, BIG, modified=MODIFIED)
     log = _io_log(monkeypatch, ('pwrite', 'write', 'ftruncate'))
 
-    result = run_download('--partial-dir', str(partial_root), '--download-segments', '4', *SEGMENTED_ARGS, str(dest))
+    result = run_download(
+        '-v', '--partial-dir', str(partial_root), '--download-segments', '4', *SEGMENTED_ARGS, str(dest)
+    )
     calls = list(log)
 
     assert result.exit_code == 0, result.output
@@ -1715,6 +1718,11 @@ def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(dis
     total = format_size(sum(map(len, files.values())))
     room = rf'Partial files in {re.escape(str(folder))} \([0-9.]+ MiB available\)'
     assert re.search(rf'^{re.escape(f"Downloading 8 files ({total}) to {dest}")}\n{room}$', result.stdout, re.M)
+    messages = log_messages()
+    assert any(re.fullmatch(room, message) for message in messages)
+    assert any(f', partial_dir={partial_root}, ' in m for m in messages if m.startswith('download started: '))
+    copied = [m.partition(' copied to ')[0] for m in messages if re.search(f' copied to {dest} in [0-9.]+ s$', m)]
+    assert sorted(copied) == sorted(files)
     assert f'8 downloaded ({total}), 0 skipped, 0 quarantined, 0 failed\n' in result.stdout
     for path, content in files.items():
         local = local_file(dest, path)
@@ -2049,13 +2057,25 @@ def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download
     durability = _durability_log(monkeypatch)
     earlier = len(disk.requests)
 
-    result = run_download(*_partial_args(new_root), *SEGMENTED_ARGS, str(dest))
+    result = run_download('-v', *_partial_args(new_root), *SEGMENTED_ARGS, str(dest))
     calls = list(log)
 
     assert result.exit_code == 0, result.output
     old, new = _partial_folder(dest, old_root), _partial_folder(dest, new_root)
+    size = format_size(300_000 + sum(_SEGMENT_CUTS))
     moving = _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', old, new)
     assert moving in result.stdout
+    messages = log_messages()
+    assert moving.rstrip('\n') in messages
+    moved = [m for m in messages if ': partial file moved ' in m or m.startswith('Moved the partial files ')]
+    assert moved[:2] == [
+        f'{BIG_PATH}: partial file moved from {old} to {new} ({format_size(300_000)} confirmed)',
+        f'{SEGMENTED_PATH}: partial file moved from {old} to {new} ({format_size(sum(_SEGMENT_CUTS))} confirmed)',
+    ]
+    [end] = moved[2:]
+    assert end.startswith(f'Moved the partial files of 2 downloads in progress ({size}) from {old} to {new} in ')
+    [final] = [line for line in status_lines(result.stderr) if line.startswith('Mov')]
+    assert re.fullmatch(rf'Moved: 2 of 2 files, {re.escape(size)} in \d+ s, average .+/s', final)
     if new_root is not None:
         assert result.stdout.index(moving) < result.stdout.index(f'Partial files in {new} (')
     for source in sources:
@@ -2080,6 +2100,7 @@ def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download
     again = run_download(*_partial_args(new_root), str(dest))
     assert again.exit_code == 0, again.output
     assert 'Moving' not in again.stdout
+    assert not [line for line in status_lines(again.stderr) if line.startswith('Mov')]
 
 
 @_PARTIAL_FOLDER_CHANGES
@@ -2118,6 +2139,34 @@ def test_a_move_of_partial_files_stopped_after_the_first_file_goes_on_in_the_rer
     assert _partials(dest, new_root) == []
 
 
+def test_a_move_of_partial_files_shows_its_status_lines_then_its_last_one(disk, dest, partial_root, monkeypatch):
+    big, _ = _leave_two_partials(disk, dest, None)
+    pread = os.pread
+    slowed: list[int] = []
+
+    def slow_first_read(fd, size, offset):
+        if not slowed and os.readlink(f'/proc/self/fd/{fd}') == str(big):
+            slowed.append(fd)
+            time.sleep(1.5)
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', slow_first_read)
+
+    result = run_download('--progress-interval', '1', *_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    size = re.escape(format_size(300_000 + sum(_SEGMENT_CUTS)))
+    lines = [line for line in status_lines(result.stderr) if line.startswith('Mov')]
+    assert lines[:-1]
+    assert all(
+        re.fullmatch(rf'Moving: [01] of 2 files, .+ of {size} \(\d+\.\d%\), .+/s, ETA .+', line) for line in lines[:-1]
+    )
+    assert lines[:-1]
+    assert re.fullmatch(rf'Moved: 2 of 2 files, {size} in \d+ s, average .+/s', lines[-1])
+    status = status_lines(result.stderr)
+    assert status.index(lines[-1]) < status.index(next(line for line in status if line.startswith('Downloaded: ')))
+
+
 def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file(
     disk, dest, partial_root, monkeypatch
 ):
@@ -2151,10 +2200,13 @@ def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_by
     result = run_download(*_partial_args(new_root), str(dest))
 
     assert result.exit_code == 0, result.output
-    assert (
+    missing = (
         f'The partial folder of the last run, {big.parent}, is missing; its downloads in progress start again from '
-        'their first byte.\n'
-    ) in result.stdout
+        'their first byte.'
+    )
+    assert f'{missing}\n' in result.stdout
+    assert missing in log_messages()
+    assert not [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert _fetches(disk, BIG_PATH, earlier) == [None]
     assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == sorted(SEGMENT_RANGES)
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
@@ -2258,10 +2310,18 @@ def test_a_partial_folder_with_room_for_one_large_file_fetches_the_large_files_o
 
     monkeypatch.setattr(Destination, 'remove_partial', recording_remove_partial)
 
-    result = run_download(*_partial_args(partial_root), str(dest))
+    result = run_download('-v', *_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 0, result.output
     assert _room_line(dest, partial_root, MiB + MiB // 2) in result.stdout
+    folder = _separate_folder(dest, partial_root)
+    messages = log_messages()
+    waits = [m for m in messages if ' waits for room ' in m]
+    assert waits == [f'{BIG2_PATH} waits for room in the partial folder {folder} (1.0 MiB needed, 512.0 KiB available)']
+    turn = re.compile(rf'(.+) waits for its turn of the partial folder {re.escape(str(folder))} behind \d+ files? .+')
+    assert sorted(match[1] for m in messages if (match := turn.fullmatch(m))) == sorted(
+        p for p, c in FILES.items() if c
+    )
     assert _others_verified(dest, failed='')
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
     assert local_file(dest, BIG2_PATH).read_bytes() == BIG2
@@ -2438,6 +2498,46 @@ def test_a_run_stopped_while_a_file_waits_for_room_ends_at_once_and_the_rerun_go
     assert (dest / 'big2.bin').read_bytes() == BIG2
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('free', 'waiting'), [(4 * MiB, 'waiting for the copy'), (MiB + MiB // 2, 'waiting for room')], ids=['copy', 'room']
+)
+async def test_with_a_partial_folder_a_file_in_progress_shows_its_copy_to_dest_and_what_it_waits_for(
+    big, dest, partial_root, monkeypatch, free, waiting
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    _free(monkeypatch, free)
+    held, release = threading.Event(), threading.Event()
+    copied = mirroring._copied
+
+    def held_after_the_first_chunk(chunks, target):
+        hold = not held.is_set()
+        for chunk in copied(chunks, target):
+            yield chunk
+            if hold:
+                held.set()
+                release.wait(10)
+                hold = False
+
+    monkeypatch.setattr(mirroring, '_copied', held_after_the_first_chunk)
+    progress = MirrorProgress()
+
+    def states() -> list[str]:
+        return sorted(transfer.state for transfer in progress.snapshot().active)
+
+    async with _mirror_run(big, 'disk:/Big', dest, partial_dir=partial_root, progress=progress) as run:
+        task = asyncio.create_task(run())
+        try:
+            await _until(lambda: states() == ['copying', waiting], f'one file copying and the other {waiting}')
+        finally:
+            release.set()
+        report = await task
+
+    assert report.downloaded == 2
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'big2.bin').read_bytes() == BIG2
+
+
 @pytest.mark.parametrize(
     ('way', 'partials'),
     [('downloaded', 'separate'), ('quarantined', 'separate'), ('adopted', 'in-dest'), ('adopted', 'separate')],
@@ -2472,6 +2572,9 @@ def test_a_partial_file_that_cannot_be_deleted_once_its_file_is_recorded_is_repo
 
     [obstacle] = in_the_way
     assert f'Partial files not deleted: 1\n  {obstacle}: {os.strerror(errno.EISDIR)}\n' in result.stdout
+    notice = f'{path}: partial file {obstacle} not deleted: {os.strerror(errno.EISDIR)}; the outcome stands'
+    assert notice in stderr_lines(result.stderr)
+    assert notice in log_messages()
     assert 'Failed' not in result.stdout
     if way == 'quarantined':
         assert result.exit_code == 1
@@ -3033,25 +3136,37 @@ POLICY = mirroring.TransferPolicy(retries=0, checkpoint_bytes=32 * 2**20, segmen
 
 @asynccontextmanager
 async def _mirror_run(
-    fake, root: str, dest, policy: mirroring.TransferPolicy = POLICY
+    fake,
+    root: str,
+    dest,
+    policy: mirroring.TransferPolicy = POLICY,
+    *,
+    partial_dir: Path | None = None,
+    progress: MirrorProgress | None = None,
 ) -> AsyncIterator[Callable[[], Awaitable[MirrorReport]]]:
-    """Scan `root` in this event loop, then yield a call running the mirror run of `root` into `dest` here too, with
-    real clients, the real manifest and a real destination, fetching as `policy` says."""
+    """Scan `root` in this event loop, then yield a call running the mirror run of `root` into `dest` here too, its
+    partial files below `partial_dir` when given, with real clients, the real manifest and a real destination, fetching
+    as `policy` says and reporting to `progress`."""
     async with (
         api.DiskClient(TOKEN, base_url=fake.base_url, limits=FAST_API) as client,
         api.ContentClient(timeout=5, connections=20) as content,
     ):
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
-        with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=None) as destination:
+        with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=partial_dir) as destination:
             await scan_tree(client, manifest, account, scan_root, ScanProgress())
             run = MirrorRun(
                 manifest.mirror(account.uid, scan_root.path, destination.path),
                 destination,
                 retry_failed=False,
-                progress=MirrorProgress(),
+                progress=progress or MirrorProgress(),
             )
-            yield lambda: run.run(client, content, policy, passes=1, room_measured=lambda _: None)
+
+            async def mirrored() -> MirrorReport:
+                await run.move_partials(MoveProgress())
+                return await run.run(client, content, policy, passes=1, room_measured=lambda _: None)
+
+            yield mirrored
 
 
 async def _until(condition: Callable[[], bool], what: str) -> None:

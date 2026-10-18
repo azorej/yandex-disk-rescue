@@ -16,7 +16,7 @@ from yandex_disk_rescue.destination import Destination, check_destination, check
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ScanTime
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, PartialRoom, TransferPolicy, mirror_summary
-from yandex_disk_rescue.progress import MirrorProgress, ScanProgress
+from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -112,6 +112,7 @@ def download(
         'dest': destination,
         'no_scan': no_scan,
         'retry_failed': retry_failed,
+        'partial_dir': partial_folder,
         'scan_max_age': scan_max_age,
         'download_timeout': download_timeout,
         'download_retries': download_retries,
@@ -268,16 +269,19 @@ async def _mirror(
         output.headline(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
     if (move := run.partial_move) is not None and move.downloads:
         if move.missing:
-            output.line(
+            output.headline(
                 f'The partial folder of the last run, {move.source}, is missing; its downloads in progress start '
                 'again from their first byte.'
             )
         else:
             downloads = 'download' if move.downloads == 1 else 'downloads'
-            output.line(
+            output.headline(
                 f'Moving the confirmed bytes ({format_size(move.size)}) of {move.downloads} {downloads} in progress '
                 f'from {move.source} to {move.target}'
             )
+    move_progress = MoveProgress()
+    with output.progress(move_progress):
+        await run.move_partials(move_progress)
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
         policy = TransferPolicy(
             retries=transfers.retries,
@@ -286,8 +290,10 @@ async def _mirror(
             segment_threshold=transfers.segment_threshold_mib * 2**20,
         )
         with output.progress(progress):
-            return await run.run(client, content, policy, passes=transfers.passes, room_measured=_show_room)
+            return await run.run(
+                client, content, policy, passes=transfers.passes, room_measured=partial(_show_room, output)
+            )
 
 
-def _show_room(room: PartialRoom) -> None:
-    typer.echo(f'Partial files in {room.folder} ({format_size(max(room.capacity, 0))} available)')
+def _show_room(output: console.Output, room: PartialRoom) -> None:
+    output.headline(f'Partial files in {room.folder} ({format_size(max(room.capacity, 0))} available)')

@@ -22,7 +22,16 @@ SPEED_SECONDS = 60.0
 ETA_SECONDS = 15 * 60.0
 _SAMPLE_SECONDS = 1.0
 
-type TransferState = Literal['waiting for a connection', 'downloading', 'preallocating', 'hashing', 'reading back']
+type TransferState = Literal[
+    'waiting for room',
+    'waiting for a connection',
+    'downloading',
+    'preallocating',
+    'hashing',
+    'reading back',
+    'waiting for the copy',
+    'copying',
+]
 type Outcome = Literal['downloaded', 'failed', 'quarantined']
 type MirrorPhase = Literal['idle', 'checking', 'transferring', 'pausing']
 
@@ -151,6 +160,74 @@ class ScanProgress:
         with self._lock:
             elapsed = time.monotonic() - self._started
             return ScanSnapshot(self._root, self._files, self._folders, self._size, self._to_list, elapsed)
+
+
+@dataclass(frozen=True)
+class MoveSnapshot:
+    started: bool
+    files: int
+    size: int
+    moved: int
+    moved_size: int
+    elapsed: float
+    speeds: Speeds
+
+    def status_line(self, *, final: bool) -> str | None:
+        if not self.started:
+            return None
+        if final:
+            return (
+                f'Moved: {_of(self.moved, self.files, "file")}, {format_size(self.moved_size)} in '
+                f'{format_duration(self.elapsed)}, average {_speed(self.speeds.average)}'
+            )
+        return (
+            f'Moving: {_of(self.moved, self.files, "file")}, {_share(self.moved_size, self.size)}, '
+            f'{_speed(self.speeds.current)}, {_eta(self.size - self.moved_size, self.speeds.for_eta)}'
+        )
+
+
+class MoveProgress:
+    """The move of the partial files of downloads in progress to this run's partial folder: the files moved so far
+    and the confirmed bytes copied."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        now = time.monotonic()
+        self._started_at = now
+        self._started = False
+        self._files = self._size = self._moved = self._moved_size = 0
+        self._rate = _Rate(now)
+
+    def start(self, files: int, size: int) -> None:
+        """The move of `files` partial files holding `size` confirmed bytes starts."""
+        with self._lock:
+            now = time.monotonic()
+            self._started, self._started_at, self._rate = True, now, _Rate(now)
+            self._files, self._size = files, size
+
+    def copied(self, size: int) -> None:
+        """`size` more confirmed bytes were copied to this run's partial folder."""
+        with self._lock:
+            self._moved_size += size
+            self._rate.note(time.monotonic(), self._moved_size)
+
+    def moved(self) -> None:
+        """One more partial file was moved."""
+        with self._lock:
+            self._moved += 1
+
+    def snapshot(self) -> MoveSnapshot:
+        with self._lock:
+            now = time.monotonic()
+            return MoveSnapshot(
+                started=self._started,
+                files=self._files,
+                size=self._size,
+                moved=self._moved,
+                moved_size=self._moved_size,
+                elapsed=now - self._started_at,
+                speeds=Speeds.of(self._rate, now, self._started_at, self._moved_size),
+            )
 
 
 @dataclass(frozen=True)
@@ -286,7 +363,7 @@ class MirrorProgress:
         with self._lock:
             self._retry.pop(key, None)
             self._active[key] = _Active(path, size, 0, 'waiting for a connection', None)
-        return ActiveFile(self, key)
+        return ActiveFile(self, key, path)
 
     def defer(self, key: int) -> None:
         """File `key`'s turn ended with the file deferred to a later pass; its bytes stay counted."""
@@ -351,9 +428,10 @@ class MirrorProgress:
 class ActiveFile:
     """The progress of one file's turn in a `MirrorProgress`."""
 
-    def __init__(self, progress: MirrorProgress, key: int) -> None:
+    def __init__(self, progress: MirrorProgress, key: int, path: str) -> None:
         self._progress = progress
         self._key = key
+        self.path = path
 
     def state(self, state: TransferState) -> None:
         self._progress._update(self._key, state=state)
