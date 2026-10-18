@@ -252,10 +252,11 @@ yandex-disk-rescue/
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
 │   └── api/
 │       ├── client.py # DiskClient — every Disk API request: the account check, one resource, paged folder listing,
-│       │             #   download links; error mapping (401/403, other statuses, transport errors, malformed
-│       │             #   bodies) and bounded retries
+│       │             #   download links, a file's preview link and the preview itself (the token only to the
+│       │             #   API's origin and `downloader.disk.yandex.ru`, no redirects); error mapping (401/403,
+│       │             #   other statuses, transport errors, malformed bodies) and bounded retries
 │       ├── limiter.py # The AdaptiveLimiter every DiskClient request shares: pacing, concurrency cap, Retry-After
-│       ├── models.py # Parsing of account, resource, folder-page and download-link bodies
+│       ├── models.py # Parsing of account, resource, folder-page, preview-link and download-link bodies
 │       ├── remote_paths.py # `disk:/` path normalization
 │       ├── errors.py # The RescueError subclasses of failed API requests
 │       ├── user_agent.py # USER_AGENT — the User-Agent every request sends: tool name, version, project URL
@@ -284,7 +285,8 @@ yandex-disk-rescue/
     ├── fake_disk_server.py # Real-socket fake Disk API and download host (stdlib only), started by `serve()` for
     │                       #   the length of a `with` block: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
-    │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
+    │                       #   download-link endpoint; `page_cap`, `account`, `token`; previews (`/preview`,
+    │                       #   which needs the token; `redirect_previews`); the download host
     │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
     │                       #   (`corrupt` and `repair`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
     │                       #   `inject`ed faults (statuses, delays, `Truncate`), matched by query parameters and

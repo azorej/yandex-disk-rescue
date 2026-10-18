@@ -1,7 +1,7 @@
 """The account and resource records the client returns, parsed from Disk API response bodies."""
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -24,6 +24,28 @@ class Resource:
     md5: str | None
     sha256: str | None
     modified: datetime
+
+
+@dataclass(frozen=True)
+class PreviewLink:
+    """The signed link to a file's preview at the size `size_name` (a Disk API `preview_size` value)."""
+
+    url: str = field(repr=False)
+    size_name: str
+
+
+@dataclass(frozen=True)
+class FilePreview:
+    """A file's metadata as of the request that returned its preview link."""
+
+    resource: Resource
+    link: PreviewLink
+
+
+@dataclass(frozen=True)
+class Preview:
+    content: bytes = field(repr=False)
+    content_type: str
 
 
 @dataclass(frozen=True)
@@ -71,6 +93,21 @@ def parse_folder_page(content: bytes) -> FolderPage:
 def parse_resource(content: bytes) -> Resource:
     """Parse the `GET /v1/disk/resources` body of one file or folder below the root."""
     return _resource(_json_object(content), '')
+
+
+def parse_file_preview(content: bytes, *, size_name: str) -> FilePreview | None:
+    """Parse a `GET /v1/disk/resources` body asked for with `preview_size=<size_name>`; None when it has no `preview`.
+
+    The reasons never quote the link, which is signed.
+    """
+    body = _json_object(content)
+    resource = _resource(body, '')
+    url = _optional_string(body, 'preview', 'preview')
+    if url is None:
+        return None
+    if not url.startswith(('https://', 'http://')):
+        raise MalformedBodyError('preview is not an http(s) URL')
+    return FilePreview(resource=resource, link=PreviewLink(url=url, size_name=size_name))
 
 
 def parse_download_link(content: bytes) -> str:

@@ -4,8 +4,9 @@ import dataclasses
 from datetime import UTC, datetime, timedelta, timezone
 
 import anyio
+import httpx
 import pytest
-from fake_disk_server import Delay, FakeResponse
+from fake_disk_server import Delay, FakeResponse, serve
 from yandex_disk_rescue import api
 
 pytestmark = pytest.mark.anyio
@@ -238,6 +239,174 @@ async def test_download_link_rejects_an_unexpected_body_without_quoting_the_href
         f'GET /v1/disk/resources/download: {reason}.'
     )
     assert 's3cr3t' not in str(excinfo.value)
+
+
+_JPEG = b'\xff\xd8\xff\xe0 a reduced photo'
+
+
+async def test_preview_of_a_photo_is_fetched_with_the_token_and_a_file_without_one_has_none(fake_disk_api):
+    fake_disk_api.token = TOKEN
+    modified = datetime(2024, 1, 2, 3, 4, 5, tzinfo=UTC)
+    fake_disk_api.add_file('disk:/Photos/a.jpg', b'the original', modified=modified, preview=_JPEG)
+    fake_disk_api.add_file('disk:/Photos/b.zip', b'an archive')
+
+    async with _client(fake_disk_api) as client:
+        photo = await client.preview('/Photos/a.jpg')
+        archive = await client.preview('disk:/Photos/b.zip')
+        assert photo is not None
+        preview = await client.fetch_preview(photo.link)
+        with pytest.raises(api.RemotePathNotFoundError, match=r"^Remote path 'disk:/gone\.jpg' does not exist\.$"):
+            await client.preview('disk:/gone.jpg')
+
+    assert archive is None
+    node = fake_disk_api.tree['/Photos/a.jpg']
+    assert photo.resource == api.Resource('disk:/Photos/a.jpg', 'file', 12, node.md5, node.sha256, modified)
+    assert photo.link.size_name == 'XXXL'
+    assert photo.link.url not in repr(photo)
+    assert preview == api.Preview(content=_JPEG, content_type='image/jpeg')
+    resource_requests = [r.params for r in fake_disk_api.requests if r.path == '/v1/disk/resources']
+    assert resource_requests[0] == {
+        'path': 'disk:/Photos/a.jpg',
+        'fields': 'path,type,size,md5,sha256,modified,preview',
+        'preview_size': 'XXXL',
+    }
+    (fetch,) = [r for r in fake_disk_api.requests if r.path == '/preview']
+    assert fetch.headers['authorization'] == f'OAuth {TOKEN}'
+    async with httpx.AsyncClient() as plain:
+        without_token = await plain.get(photo.link.url)
+    assert (without_token.status_code, without_token.headers['content-type']) == (403, 'text/html')
+
+
+@pytest.mark.parametrize(
+    ('url', 'allowed'),
+    [
+        ('https://downloader.disk.yandex.ru/preview/s3cr3t?size=XXXL', True),
+        ('https://downloader.disk.yandex.ru:443/preview/s3cr3t', True),
+        ('API_ORIGIN/preview?path=disk%3A%2Fa.jpg&size=XXXL', True),
+        ('http://downloader.disk.yandex.ru/preview/s3cr3t', False),
+        ('https://downloader.disk.yandex.ru:8443/preview/s3cr3t', False),
+        ('https://s1klg.storage.yandex.net/preview/s3cr3t', False),
+        ('https://yandex.ru/preview/s3cr3t', False),
+        ('https://evil-downloader.disk.yandex.ru.example/preview/s3cr3t', False),
+        ('https://example.com/preview/s3cr3t', False),
+        ('OTHER_ORIGIN/preview?path=disk%3A%2Fa.jpg&size=XXXL', False),
+    ],
+)
+async def test_the_token_goes_only_to_the_preview_host_and_the_api_origin(fake_disk_api, url, allowed):
+    fake_disk_api.add_file('disk:/a.jpg', b'the original', preview=_JPEG)
+
+    with serve() as other:
+        other.add_file('disk:/a.jpg', b'the original', preview=_JPEG)
+        url = url.replace('API_ORIGIN', fake_disk_api.base_url).replace('OTHER_ORIGIN', other.base_url)
+        async with _client(fake_disk_api) as client:
+            assert client.may_send_token_to(url) is allowed
+            if not allowed:
+                with pytest.raises(api.PreviewRefusedError) as excinfo:
+                    await client.fetch_preview(api.PreviewLink(url=url, size_name='XXXL'))
+            elif url.startswith(fake_disk_api.base_url):
+                assert (await client.fetch_preview(api.PreviewLink(url=url, size_name='XXXL'))).content == _JPEG
+
+    assert other.requests == []
+    if not allowed:
+        origin = str(httpx.URL(url).copy_with(path='/', query=None)).removesuffix('/')
+        assert str(excinfo.value) == (
+            f'the preview link points to {origin}, not to the Yandex Disk preview host '
+            'https://downloader.disk.yandex.ru; the token is not sent there'
+        )
+        assert 's3cr3t' not in str(excinfo.value)
+        assert fake_disk_api.requests == []
+
+
+async def test_a_redirecting_preview_host_is_not_followed_and_the_token_never_leaves(fake_disk_api):
+    fake_disk_api.add_file('disk:/a.jpg', b'the original', preview=_JPEG)
+
+    with serve() as other:
+        other.add_file('disk:/a.jpg', b'the original', preview=_JPEG)
+        fake_disk_api.redirect_previews = other.base_url
+        async with _client(fake_disk_api) as client:
+            found = await client.preview('disk:/a.jpg')
+            assert found is not None
+            with pytest.raises(api.PreviewRefusedError) as excinfo:
+                await client.fetch_preview(found.link)
+
+    assert str(excinfo.value) == 'the preview host redirected (HTTP 302); not followed'
+    assert other.requests == []
+    assert [r.path for r in fake_disk_api.requests] == ['/v1/disk/resources', '/preview']
+
+
+@pytest.mark.parametrize(
+    ('preview', 'preview_type', 'reason'),
+    [
+        (_JPEG, 'text/html', 'not an image (text/html)'),
+        (_JPEG, 'image/png; charset=binary', None),
+        (b'p' * 5000, 'image/jpeg', 'larger than 1000 B'),
+        (b'p' * 1000, 'image/jpeg', None),
+        (None, 'image/jpeg', 'the preview host returned HTTP 404'),
+    ],
+)
+async def test_a_preview_that_is_not_an_image_or_too_large_is_refused(
+    fake_disk_api, monkeypatch, preview, preview_type, reason
+):
+    monkeypatch.setattr('yandex_disk_rescue.api.client.PREVIEW_MAX_BYTES', 1000)
+    fake_disk_api.add_file('disk:/a.jpg', b'the original', preview=preview, preview_type=preview_type)
+    link = api.PreviewLink(url=f'{fake_disk_api.base_url}/preview?path=disk%3A%2Fa.jpg&size=XXXL', size_name='XXXL')
+
+    async with _client(fake_disk_api) as client:
+        if reason is None:
+            assert await client.fetch_preview(link) == api.Preview(preview, preview_type.partition(';')[0])
+        else:
+            with pytest.raises(api.PreviewRefusedError) as excinfo:
+                await client.fetch_preview(link)
+            assert str(excinfo.value) == reason
+
+    assert len(fake_disk_api.requests) == 1
+
+
+async def test_a_failing_preview_request_is_retried_like_an_api_request(fake_disk_api):
+    fake_disk_api.add_file('disk:/a.jpg', b'the original', preview=_JPEG)
+    fake_disk_api.inject('GET', '/preview', 503)
+    link = api.PreviewLink(url=f'{fake_disk_api.base_url}/preview?path=disk%3A%2Fa.jpg&size=XXXL', size_name='XXXL')
+
+    async with _client(fake_disk_api, retries=2, timeout=0.2) as client:
+        assert (await client.fetch_preview(link)).content == _JPEG
+        fake_disk_api.inject('GET', '/preview', 503, 503, 503)
+        with pytest.raises(api.DiskApiError) as throttled:
+            await client.fetch_preview(link)
+        fake_disk_api.inject('GET', '/preview', Delay(0.6), Delay(0.6), Delay(0.6))
+        with pytest.raises(api.DiskApiError) as timed_out:
+            await client.fetch_preview(link)
+
+    assert str(throttled.value) == 'Could not fetch the preview: the preview host returned HTTP 503 (after 3 attempts)'
+    assert str(timed_out.value) == (
+        f'Could not fetch the preview: Could not reach the Yandex Disk preview host {fake_disk_api.base_url}: '
+        'the request timed out after 0.2 s (ReadTimeout) (after 3 attempts)'
+    )
+    assert TOKEN not in str(timed_out.value)
+    assert len(fake_disk_api.requests) == 8
+
+
+async def test_a_preview_link_that_is_not_an_http_url_is_an_unexpected_response(fake_disk_api):
+    fake_disk_api.route_json(
+        'GET',
+        '/v1/disk/resources',
+        200,
+        {
+            'path': 'disk:/a.jpg',
+            'type': 'file',
+            'size': 3,
+            'modified': '2024-01-02T03:04:05+00:00',
+            'preview': 'ftp://downloader.example/s3cr3t',
+        },
+    )
+
+    async with _client(fake_disk_api) as client:
+        with pytest.raises(api.DiskApiError) as excinfo:
+            await client.preview('disk:/a.jpg')
+
+    assert str(excinfo.value) == (
+        'Could not read the preview of disk:/a.jpg: Yandex Disk API returned an unexpected response to '
+        'GET /v1/disk/resources: preview is not an http(s) URL.'
+    )
 
 
 async def test_list_folder_reports_a_status_error_with_the_path(fake_disk_api):
