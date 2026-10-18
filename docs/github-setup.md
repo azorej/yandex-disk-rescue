@@ -11,6 +11,13 @@ and the **`CI required`** status check (the single aggregate check from
 `.github/workflows/ci.yml`). Repository admins can bypass it; add your
 teams as bypass actors if needed.
 
+## SHA-pinned actions (optional)
+
+Every `uses:` in `.github/workflows/` is pinned to a full commit SHA, and
+Dependabot (`.github/dependabot.yml`) proposes updates weekly. To make
+GitHub enforce it: **Settings → Actions → General → Require actions to be
+pinned to a full-length commit SHA**.
+
 ## Dagger Cloud (optional)
 
 For pipeline traces, add a `DAGGER_CLOUD_TOKEN` repository secret

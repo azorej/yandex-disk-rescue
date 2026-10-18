@@ -75,7 +75,7 @@ commands — never a raw `python`, `pip`, or `.venv/bin/...`.
 ├── yandex-disk-rescue/   # Workspace member: the CLI and its internals (Typer)
 ├── .dagger/              # Dagger module `repo-ci` (CI pipeline) + tests/ (its own tests)
 ├── .devcontainer/        # Ubuntu devcontainer: mise, Claude Code, Docker-in-Docker
-├── .github/              # CI workflow, PR template
+├── .github/              # Workflows, PR template, Dependabot config
 ├── .agents/skills/       # Agent skills (canonical); .claude/skills/ symlinks to them
 ├── .claude/              # Claude Code: shared settings, hooks, subagents
 ├── docs/                 # Guides; docs/plans/ holds implementation plans
@@ -135,7 +135,9 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
 | Dagger engine | `dagger.json` + `.dagger/tests/dagger.json` (must equal the CLI) |
 | uv/Python image for CI | `UV_IMAGE` in `.dagger/src/repo_ci/main.py` |
 | ruff, pytest, pre-commit, libraries | `uv.lock` |
+| zizmor, actionlint, shellcheck | `uv.lock` |
 | pre-commit hook repos | `.pre-commit-config.yaml` |
+| GitHub Actions | full commit SHA in `.github/workflows/*.yml` (updated by Dependabot) |
 | mise, base OS | `.devcontainer/Dockerfile` |
 
 ### CI (Dagger + GitHub Actions)
@@ -148,6 +150,12 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
   protection requires the single `CI required` check.
 - When adding a lane: add a Dagger function, a mise task, a job in
   `ci.yml`, its path filter, and add the job to `required.needs`.
+- Workflows are linted by actionlint (with shellcheck) and `zizmor
+  --offline` as pre-commit hooks, so in the `hygiene` lane and on every
+  local commit. A new `uses:` is pinned to a full commit SHA with its
+  release tag as a comment (`@<sha> # vX.Y.Z`), and `actions/checkout`
+  sets `persist-credentials: false`. Fix a zizmor finding; only a false
+  positive gets an inline `# zizmor: ignore[<audit>]` with the reason.
 
 ### Dockerfiles and the devcontainer
 

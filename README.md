@@ -1309,7 +1309,7 @@ Dependencies: `uv add <pkg> --package <member>` (runtime) or
 ├── yandex-disk-rescue/   # The CLI package — workspace member
 ├── .dagger/              # Dagger CI module (+ its own tests in .dagger/tests)
 ├── .devcontainer/        # Devcontainer: mise, Claude Code, Docker-in-Docker
-├── .github/              # CI workflow, PR template
+├── .github/              # Workflows, PR template, Dependabot config
 ├── .agents/skills/       # Agent skills (symlinked into .claude/skills/)
 ├── .claude/              # Claude Code settings, hooks, subagents
 ├── docs/                 # Guides (GitHub setup) and implementation plans
@@ -1331,7 +1331,9 @@ wrapper around `mise run ci`, which calls the Dagger module in
 [`.dagger/`](.dagger/README.md). Pull requests run only the lanes their
 diff touches; pushes to `main`, a weekly schedule and manual runs execute
 everything. Require the single **`CI required`** check in branch protection
-(see [docs/github-setup.md](docs/github-setup.md)).
+(see [docs/github-setup.md](docs/github-setup.md)). The workflows themselves
+are linted by actionlint and zizmor (pre-commit hooks), and every action is
+pinned to a commit SHA that Dependabot keeps current.
 
 **AI agents.** [`AGENTS.md`](AGENTS.md) is the one rule file every agent
 reads ([`CLAUDE.md`](CLAUDE.md) imports it). With Claude Code:
