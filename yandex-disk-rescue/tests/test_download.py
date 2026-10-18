@@ -1498,7 +1498,8 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
         _refuse(monkeypatch, 'lstat', errno.EACCES, lambda name: name in {'a.jpg', 'b.jpg'})
         denied = os.strerror(errno.EACCES)
         failed = [
-            (f'disk:/Photos/2024/{name}', f'could not read Photos/2024/{name}: {denied}') for name in ('a.jpg', 'b.jpg')
+            (f'disk:/Photos/2024/{name}', f'could not inspect Photos/2024/{name}: {denied}')
+            for name in ('a.jpg', 'b.jpg')
         ]
     else:
         local.parent.mkdir(parents=True)
@@ -1524,6 +1525,21 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
     if obstacle != 'untraversable':
         assert local.stat().st_mtime_ns != _mtime_ns(MODIFIED)
+
+
+def test_an_io_error_inspecting_a_path_of_the_mirror_stops_the_run_naming_it(disk, dest, monkeypatch):
+    local = dest / 'Docs' / 'readme.txt'
+    local.parent.mkdir(parents=True)
+    local.write_bytes(FILES['disk:/Docs/readme.txt'])
+    _refuse(monkeypatch, 'lstat', errno.EIO, lambda name: name == 'readme.txt')
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not inspect {local}: {os.strerror(errno.EIO)}.']
+    assert 'Mirrored' not in result.stdout
+    assert local.read_bytes() == FILES['disk:/Docs/readme.txt']
+    assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
 
 
 def test_a_stall_before_the_first_byte_ends_the_files_turn_after_one_attempt(disk, dest):
@@ -2290,7 +2306,7 @@ def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_f
     result = run_download(*_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 1
-    assert stderr_lines(result.stderr) == [f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.']
+    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(errno.EBADMSG)}.']
     assert big.read_bytes()[:300_000] == BIG[:300_000]
     assert segmented.exists()
 

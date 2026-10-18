@@ -79,6 +79,7 @@ from yandex_disk_rescue.destination import (
     NAME_ERRNOS,
     Destination,
     DestinationError,
+    DiskAction,
     PartialFile,
     PreviousPartials,
 )
@@ -617,9 +618,9 @@ class MirrorRun:
         self._held = set() if retry_failed else {e.entry_id for e in self._entries if is_held(e)}
         in_progress = [e for e in entries if e.download is not None and e.download.state == 'partial']
         destination.remove_staged_copies()
-        with _fatal_errors(destination.path):
-            self._in_progress = [e.entry_id for e in in_progress]
-            destination.keep_partials(self._in_progress)
+        self._in_progress = [e.entry_id for e in in_progress]
+        destination.keep_partials(self._in_progress)
+        with _fatal_errors('inspect', destination.path):
             self._current = self._check(destination)
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
@@ -669,7 +670,7 @@ class MirrorRun:
                 progress.start(move.downloads, move.size)
             with DiskThreads(1) as threads:
                 for entry, segments, held in self._moved:
-                    with _fatal_errors(self._destination.partial_folder):
+                    with _fatal_errors('write', self._destination.partial_folder):
                         await self._move_partial(entry, segments, held, self._source, threads, progress)
                     progress.moved()
                 await threads.run(self._source.remove_leftovers)
@@ -1029,13 +1030,13 @@ async def download_file(
 
     Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
     when the downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError`
-    when the destination cannot be written at all, and the API errors that stop the run (`TokenRejectedError`,
-    `DiskApiError`).
+    when the destination cannot be read, written or inspected at all, and the API errors that stop the run
+    (`TokenRejectedError`, `DiskApiError`).
     """
     local = _local_path(entry)
     identity = RemoteIdentity.of(entry.resource)
     with _local_errors(destination, local, 'write'):
-        with _local_errors(destination, local, 'read'):
+        with _local_errors(destination, local, 'inspect'):
             existing = destination.lstat(local)
         if existing is not None:
             if reason := _alias(entry, local, existing, mirror, destination):
@@ -1165,12 +1166,13 @@ async def _adopt(
         if digest.mismatch(identity) is not None:
             return None
         async with placement:
-            now = destination.lstat(local)
+            with _local_errors(destination, local, 'inspect'):
+                now = destination.lstat(local)
             if now is None or LocalFingerprint.of(now) != LocalFingerprint.of(opened):
                 return None
             if reason := _alias(entry, local, now, mirror, destination):
                 raise FileFailed(reason)
-            with _local_errors(destination, local, 'set the modification time of'):
+            with _local_errors(destination, local, 'write', failing='set the modification time of'):
                 await threads.run(file.set_mtime, _mtime_ns(identity.modified))
             verified_by = _method(identity)
             mirror.record_verified(entry.entry_id, identity, verified_by, file.stat())
@@ -1182,7 +1184,8 @@ async def _clear_the_way(
 ) -> bool:
     """Move whatever stands at `local` aside so the verified partial file can be placed; `True` when something was
     moved."""
-    existing = destination.lstat(local)
+    with _local_errors(destination, local, 'inspect'):
+        existing = destination.lstat(local)
     if existing is None:
         return False
     if reason := _alias(entry, local, existing, mirror, destination):
@@ -1912,7 +1915,8 @@ def _alias(
     owner = mirror.verified_owner(existing.st_ino)
     if owner is None or owner.entry_id == entry.entry_id or owner.local_path is None:
         return None
-    owner_copy = destination.lstat(owner.local_path)
+    with _local_errors(destination, owner.local_path, 'inspect'):
+        owner_copy = destination.lstat(owner.local_path)
     if owner_copy is None or owner_copy.st_ino != existing.st_ino:
         return None
     return f'{local} is the same file as {owner.resource.path} on this filesystem; it was left untouched'
@@ -1953,23 +1957,25 @@ def _discard(entry: MirrorEntry, mirror: Mirror, destination: Destination) -> No
 
 
 @contextmanager
-def _local_errors(destination: Destination, local: PurePosixPath, action: str) -> Iterator[None]:
-    """Turn an `OSError` about `local` into a failure of that entry, `could not <action> <local>: <reason>`, or of the
-    run when no entry could escape it."""
+def _local_errors(
+    destination: Destination, local: PurePosixPath, action: DiskAction, *, failing: str | None = None
+) -> Iterator[None]:
+    """Turn an `OSError` about `local` into a failure of that entry, `could not <failing or action> <local>:
+    <reason>`, or of the run, `DestinationError` with `action`, when no entry could escape it."""
     try:
         yield
     except OSError as exc:
         if exc.errno in FATAL_ERRNOS:
-            raise DestinationError.of(destination.path / local, exc) from None
-        raise FileFailed(f'could not {action} {local}: {exc.strerror}') from None
+            raise DestinationError.of(action, destination.path / local, exc) from None
+        raise FileFailed(f'could not {failing or action} {local}: {exc.strerror}') from None
 
 
 @contextmanager
-def _fatal_errors(path: Path) -> Iterator[None]:
+def _fatal_errors(action: DiskAction, path: Path) -> Iterator[None]:
     try:
         yield
     except OSError as exc:
-        raise DestinationError.of(path, exc) from None
+        raise DestinationError.of(action, path, exc) from None
 
 
 def _read_errors(chunks: Iterator[bytes], path: Path) -> Iterator[bytes]:
@@ -1977,7 +1983,7 @@ def _read_errors(chunks: Iterator[bytes], path: Path) -> Iterator[bytes]:
     try:
         yield from chunks
     except OSError as exc:
-        raise DestinationError.of(path, exc) from None
+        raise DestinationError.of('read', path, exc) from None
 
 
 def _changes(room: PartialRoom | None) -> int:

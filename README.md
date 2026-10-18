@@ -587,15 +587,18 @@ folders and a lock, so only one run at a time can use a destination
 manifests. The destination's filesystem must support
 renaming without replacing (`RENAME_NOREPLACE`; ext4, xfs, btrfs, tmpfs and
 HFS+ do); the run stops at the start otherwise. A full disk or quota, an I/O
-error or a read-only filesystem stops the run with
+error or a read-only filesystem while writing stops the run with
 `Error: Could not write <path>: <reason>.`, and so does a permission error
-inside `DEST/.yandex-disk-rescue/` or the partial folder below
-`--partial-dir`. A permission error on a path of the
-mirror — a file or folder there owned by another user, or without the needed
-read, write or search permission — fails only the entries it affects, with
-`could not read <path>: <reason>`, `could not write <path>: <reason>` or
-`could not set the modification time of <path>: <reason>`, and leaves the path
-as it was.
+while writing inside `DEST/.yandex-disk-rescue/` or the partial folder below
+`--partial-dir`. An I/O error while reading the work directory, the partial
+folder or a file in DEST stops it with `Error: Could not read <path>:
+<reason>.`, and one while looking up a path there (its size, type or free
+space) with `Error: Could not inspect <path>: <reason>.` A permission error on
+a path of the mirror — a file or folder there owned by another user, or
+without the needed read, write or search permission — fails only the entries
+it affects, with `could not read <path>: <reason>`, `could not inspect <path>:
+<reason>`, `could not write <path>: <reason>` or `could not set the
+modification time of <path>: <reason>`, and leaves the path as it was.
 
 **Failures that stop the run.** A token Yandex rejects, and a Disk API error
 that persists past the API retries (an outage), stop the run: the files still
@@ -1246,7 +1249,7 @@ systemctl --user stop yandex-disk-rescue.service
 | Code | Meaning |
 |---|---|
 | `0` | Success; for `download`, every file of the folder is verified at its final path; for `verify`, every file of the mirror is verified and intact |
-| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be read or written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
 | `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers; for `verify` a DEST that is not an existing folder or is not a mirror recorded in the manifest |
 | `130` | Interrupted with Ctrl+C |
 | `143` | Stopped with SIGTERM (`kill`, `systemctl stop`, `docker stop`): the same clean stop as Ctrl+C |

@@ -17,6 +17,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - Every HTTP request names the tool in its `User-Agent`:
   `yandex-disk-rescue/<version> (+https://github.com/azorej/yandex-disk-rescue)`.
 
+### Fixed
+
+- A `download` stopped by a destination error says what failed (`Could not read`, `Could not write` or
+  `Could not inspect`), no longer `Could not write` for reads.
+
 ## [1.0.0rc1] - 2026-10-18
 
 ### Added
