@@ -11,8 +11,9 @@ A `Mirror` is one destination directory holding one remote folder of one account
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
 of a partial download (`download_segments`), the reason the last turn of an entry failed (`failures`), and the copy
 of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
-wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all keyed by `entries.id`. A rescan never rewrites them: a
-record keeps the remote identity it was made for, and only an entry's removal from the manifest deletes its rows.
+wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all keyed by `entries.id`.
+A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
+the manifest deletes its rows.
 A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got, and the
 folder its partial files were last in (`mirrors.partial_folder`).
 

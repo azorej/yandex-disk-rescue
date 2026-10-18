@@ -553,8 +553,12 @@ summary lists it under `Unreadable in DEST, downloaded again`, as a sign that
 the disk may be failing, and the run still exits `0` when everything is
 mirrored. A repair that fails keeps the finding, so `verify` lists the copy
 under `Corrupt` until a later run repairs it. A permission error on the file
-fails only that file (see "The destination"), and a DEST that can no longer
-be read at all (a disk unplugged, a device gone) stops the run with
+fails only that file (see "The destination"), and so does the tool running
+out of file descriptors or memory while opening or reading it (`could not
+read <local>: <reason>`, such as `Too many open files`): neither says anything
+about the copy, so nothing is recorded and the next run reads it again. A DEST
+that can no longer be read at all (a disk unplugged, a device gone) stops the
+run with
 `Error: Could not read <path>: <reason>.` Anything else at a path the
 mirror needs — a file with other content, a folder where a file must go, a
 file where a folder must go, or a symbolic link — is *moved aside*. Where a
@@ -752,7 +756,11 @@ A read error usually means that one file is damaged, and the file is reported
 as corrupt. When DEST itself cannot be read any more, such as a disk unplugged
 mid-check, `verify` stops instead of reporting every remaining file:
 `Error: Could not read DEST: <reason>; verify stopped. Rerun it once the disk
-is back.` (exit `1`); what it found before then stays recorded.
+is back.` (exit `1`); what it found before then stays recorded. When the tool
+runs out of file descriptors or memory while opening or reading a file, which
+says nothing about the file, `verify` stops with `Error: Could not read
+<path>: <reason>.` (exit `1`) and records nothing for that file; a rerun
+continues from it.
 
 ```
 Verifying 1120 files (1.2 GiB) in /mnt/backup/Photos

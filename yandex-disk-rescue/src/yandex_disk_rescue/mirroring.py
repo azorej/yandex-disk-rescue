@@ -69,7 +69,7 @@ import stat
 import time
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Iterable, Iterator, Sequence
-from contextlib import asynccontextmanager, contextmanager, nullcontext
+from contextlib import ExitStack, asynccontextmanager, contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
@@ -82,6 +82,7 @@ from yandex_disk_rescue.destination import (
     FATAL_ERRNOS,
     MISSING_ERRNOS,
     NAME_ERRNOS,
+    PROCESS_LIMIT_ERRNOS,
     Destination,
     DestinationError,
     DiskAction,
@@ -116,8 +117,10 @@ _SPARE_THREADS = 4
 _PREALLOCATION_STEP = 64 * 2**20
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to fetch the new version'
-# A copy in DEST whose read fails with one of these fails only its entry: it is not unreadable, it is out of reach.
-_COPY_OUT_OF_REACH_ERRNOS = MISSING_ERRNOS | {errno.EACCES, errno.EPERM}
+# A copy in DEST whose open or read fails with one of these fails only its entry: the error says the copy is out of
+# reach (a permission, a path changed under the run) or the process is out of descriptors or memory, not that the copy
+# is unreadable.
+_COPY_OUT_OF_REACH_ERRNOS = MISSING_ERRNOS | PROCESS_LIMIT_ERRNOS | {errno.EACCES, errno.EPERM}
 _QUARANTINE_HINT = (
     'Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).'
 )
@@ -1189,21 +1192,21 @@ async def _adopt(
     if not stat.S_ISREG(existing.st_mode) or existing.st_size != identity.size:
         return None
     digest = Digest()
-    try:
-        with destination.existing_file(local) as file:
+    with ExitStack() as stack:
+        try:
+            file = stack.enter_context(destination.existing_file(local))
             opened = file.stat()
             if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
                 return None
             progress.state('hashing')
             await _feed(digest.update, file.chunks(), threads, 0)
-            progress.state('waiting for a connection')
-            if digest.mismatch(identity) is not None:
-                return None
-            return await _record_adopted(entry, local, identity, file, opened, mirror, destination, threads, placement)
-    except OSError as exc:
-        # `_record_adopted` turns the errors of its own calls into failures, so this one is from reading the copy.
-        unreadable(await _unreadable_copy(local, exc, destination, threads))
-        return None
+        except OSError as exc:
+            unreadable(await _unreadable_copy(local, exc, destination, threads))
+            return None
+        progress.state('waiting for a connection')
+        if digest.mismatch(identity) is not None:
+            return None
+        return await _record_adopted(entry, local, identity, file, opened, mirror, destination, threads, placement)
 
 
 async def _record_adopted(
@@ -1241,7 +1244,8 @@ async def _unreadable_copy(
     """The finding about the copy at `local` whose read failed with `exc`: corrupt, as it cannot be read.
 
     Raises `FileFailed` when the copy is out of reach rather than unreadable (a permission error, a path changed under
-    the run), and `DestinationError` when the device is gone or the destination itself can no longer be read.
+    the run, the process out of descriptors or memory), and `DestinationError` when the device is gone or the
+    destination itself can no longer be read.
     """
     reason = f'could not read {local}: {exc.strerror}'
     if exc.errno in _COPY_OUT_OF_REACH_ERRNOS:
@@ -1832,8 +1836,8 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
 
 def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
-    files, renamed entries, the copies found unreadable, what was moved aside, quarantined files with their reasons and copies, and failures with
-    their reasons; each list shows its first `limit` members (`None`: all)."""
+    files, renamed entries, the copies found unreadable, what was moved aside, quarantined files with their reasons and
+    copies, and failures with their reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '

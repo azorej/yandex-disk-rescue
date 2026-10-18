@@ -82,8 +82,8 @@ mirror up by its destination without creating one.
   and its failure; verifying the file (`record_verified`) deletes it, while `forget` keeps it.
   `MirrorEntry.quarantine` reads it.
 - A finding (`verify_findings`) is what was found wrong with the file at the entry's final path, with the reason:
-  by `verify` (`missing`, `modified` or `corrupt`), or by `download` (`corrupt`, a copy it could not read). It belongs to the entry, not to its download record, so `record_partial`,
-  `checkpoint`, `forget` and `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there),
+  by `verify` (`missing`, `modified` or `corrupt`), or by `download` (`corrupt`, a copy it could not read). It
+  belongs to the entry, not to its download record, so `record_partial`, `checkpoint`, `forget` and `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there),
   `Mirror.clear_finding` and removing the entry drop it. `Mirror.record_finding` replaces any earlier one, and
   `MirrorEntry.finding` reads it.
 - A rescan never touches names, records, failures, quarantine records or findings; removing an entry from the

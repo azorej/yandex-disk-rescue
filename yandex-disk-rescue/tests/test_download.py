@@ -1623,8 +1623,10 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
     assert 'Mirrored' not in result.stdout
 
 
-@pytest.mark.parametrize('obstacle', ['mtime-not-permitted', 'unreadable', 'untraversable'])
-def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, dest, monkeypatch, obstacle):
+@pytest.mark.parametrize(
+    'obstacle', ['mtime-not-permitted', 'unreadable', 'untraversable', 'EMFILE', 'ENFILE', 'ENOMEM']
+)
+def test_a_copy_out_of_reach_fails_that_file_only(disk, dest, monkeypatch, obstacle):
     readme, local = 'disk:/Docs/readme.txt', dest / 'Docs' / 'readme.txt'
     if obstacle == 'untraversable':
         assert run_download(str(dest)).exit_code == 0
@@ -1637,9 +1639,10 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
     else:
         local.parent.mkdir(parents=True)
         local.write_bytes(FILES[readme])
-        if obstacle == 'unreadable':
-            _refuse(monkeypatch, 'open_file', errno.EACCES, lambda name: name == 'readme.txt')
-            failed = [(readme, f'could not read Docs/readme.txt: {os.strerror(errno.EACCES)}')]
+        if obstacle != 'mtime-not-permitted':
+            code = errno.EACCES if obstacle == 'unreadable' else getattr(errno, obstacle)
+            _refuse(monkeypatch, 'open_file', code, lambda name: name == 'readme.txt')
+            failed = [(readme, f'could not read Docs/readme.txt: {os.strerror(code)}')]
         else:
             inode = local.stat().st_ino
             _refuse(monkeypatch, 'set_times', errno.EPERM, lambda fd: os.fstat(fd).st_ino == inode)
@@ -1656,6 +1659,7 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
     assert result_line == f'Error: {len(failed)} failed; see the list above.'
     assert _others_verified(dest, failed='')
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
+    assert _findings() == []
     if obstacle != 'untraversable':
         assert local.stat().st_mtime_ns != _mtime_ns(MODIFIED)
 

@@ -51,6 +51,8 @@ NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
 MISSING_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ELOOP})
 # A read failing with one of these means the device is gone, whatever the destination's path still answers.
 DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
+# The process ran out of descriptors or memory: the error says nothing about the path it was opening or reading.
+PROCESS_LIMIT_ERRNOS = frozenset({errno.EMFILE, errno.ENFILE, errno.ENOMEM})
 
 
 class DestinationUsageError(RescueError):
@@ -64,12 +66,11 @@ type DiskAction = Literal['read', 'write', 'inspect']
 
 
 class DestinationError(RescueError):
-    """Reading, writing or inspecting the destination failed in a way that stops the run; `action` says which."""
+    """Reading, writing or inspecting the destination failed in a way that stops the run; the message names the
+    action and the path."""
 
     def __init__(self, action: DiskAction, path: Path | str, reason: str) -> None:
         super().__init__(f'Could not {action} {path}: {reason}.')
-        self.action = action
-        self.path = path
 
     @classmethod
     def of(cls, action: DiskAction, path: Path | str, exc: OSError) -> Self:

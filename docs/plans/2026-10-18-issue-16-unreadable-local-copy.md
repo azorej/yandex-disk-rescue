@@ -64,7 +64,7 @@ An `EIO` (or any non-permission read error) while reading one existing local cop
 
 Permission errors on a path of the mirror (`EACCES`, `EPERM`) keep failing only that entry and leaving the path as it
 was, under every option (README "The destination", locked by
-`test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only`).
+`test_a_copy_out_of_reach_fails_that_file_only`).
 
 ## Non-goals
 
@@ -113,7 +113,7 @@ was, under every option (README "The destination", locked by
 - **Behaviour to lock** (all in `yandex-disk-rescue/tests/test_download.py`, extending existing tests):
   - `test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file`: the assertion becomes
     `Error: Could not read {big}: Bad message.`
-  - `test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only[untraversable]`: the failure reason becomes
+  - `test_a_copy_out_of_reach_fails_that_file_only[untraversable]`: the failure reason becomes
     `could not inspect Photos/2024/{name}: Permission denied`.
   - New parametrization next to `test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on` (or a new test
     beside it using `_refuse(monkeypatch, 'lstat', errno.EIO, lambda name: name == 'readme.txt')` with an untracked

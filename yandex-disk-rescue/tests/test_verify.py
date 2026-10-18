@@ -307,6 +307,37 @@ def test_a_destination_gone_mid_check_stops_it_with_nothing_recorded(disk, dest,
     assert _verify_pass() is None
 
 
+@pytest.mark.parametrize('code', [errno.EMFILE, errno.ENFILE, errno.ENOMEM], ids=errno.errorcode.get)
+def test_a_process_out_of_descriptors_or_memory_stops_the_check_with_the_copy_not_recorded(
+    disk, dest, monkeypatch, code
+):
+    assert run_download(str(dest)).exit_code == 0
+    readme = local_file(dest, README)
+    original = localfs.open_file
+
+    def refusing(name, *args, **kwargs):
+        if name == readme.name:
+            raise OSError(code, os.strerror(code))
+        return original(name, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(localfs, 'open_file', refusing)
+        stopped = _verify(str(dest))
+
+    assert stopped.exit_code == 1
+    assert stderr_lines(stopped.stderr) == [f'Error: Could not read {readme}: {os.strerror(code)}.']
+    assert 'Verified' not in stopped.stdout
+    assert _findings() == []
+    _, through = _verify_pass()
+    assert through is None or through < README
+
+    rerun = _verify(str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _intact_lines(dest, 6) in rerun.stdout
+    assert _verify_pass() is None
+
+
 def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk, dest, monkeypatch):
     disk.corrupt(CORRUPT, offset=0)
     _, quarantine_reason = corrupted_bytes(FILES[CORRUPT], 0)
