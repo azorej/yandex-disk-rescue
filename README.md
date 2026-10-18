@@ -551,11 +551,62 @@ failed, quarantined, unfinished or broken files (0 B)`, downloads nothing
 and exits `0`. Entries whose names are not valid Unicode have no record;
 they fail every run, `--retry-failed` included.
 
+**Previews of files that cannot be downloaded.** For a photo, a video or a
+PDF that Yandex Disk will not send, Yandex often still serves a reduced
+image, and a rescue is better with it than with nothing. At the end of every
+run whose transfers ended normally, plain and `--retry-failed` alike, each
+file that failed on Yandex's side gets the largest preview Yandex offers of
+it: a file out of passes after transient transfer failures, a file
+[unavailable on Yandex Disk](#downloading), a download the Disk refuses, and
+a file the download host refuses or sends wrong. Files that failed for a
+local cause (a permission error, a refused name, a folder that could not be
+made and everything below it, no room in the partial folder, a hard link to
+another file, a file changed or removed on the Disk) and quarantined files,
+which have a full-size copy in `quarantine/`, get none. The run prints
+`Saving the previews of N failed files to DEST/.yandex-disk-rescue/previews`
+first.
+
+- The preview is saved at the file's local path below
+  `DEST/.yandex-disk-rescue/previews/`, named `<local name>.preview<ext>`
+  (`napkin.jpg` gives `napkin.jpg.preview.jpg`), shortened to fit like a
+  long name; the extension comes from the image's type (`.jpg`, `.png`,
+  `.webp`, `.gif`, `.heic`, else `.img`). It is never at a mirror path.
+- It is a reduced image, Yandex's `XXXL` size (at most 1280 px on its longer
+  side), not the original, and never verified: Yandex publishes no checksum
+  of it. The manifest records its path, size, type, the size asked for and
+  the version of the file it was taken for. Images, videos (a JPEG frame)
+  and PDFs (a PNG of the first page) have one; archives and most other
+  files do not. A file with no preview is asked again on every run.
+- A preview already saved for the file's current version is not fetched
+  again; the summary lists it all the same. When a newer version of the
+  file fails too, its preview replaces the older version's.
+- Once the original is downloaded and verified, its preview and its record
+  are deleted, so `previews/` holds exactly the files you have only as a
+  preview. A preview of a file later removed from the Disk stays in
+  `previews/`, untracked, until you delete it.
+- A preview that cannot be fetched or saved is listed under `Previews not
+  saved` with the reason. A token Yandex rejects, or a full disk, an I/O
+  error or a read-only filesystem in `previews/`, ends the preview step, and
+  every file not handled yet is listed with that reason. Previews never
+  change the run's outcome or exit code, and never stop the run.
+- Ctrl+C or SIGTERM during the preview step stops only that step: the
+  fetches in flight are dropped, a preview being written is finished and
+  recorded first, the summary is printed with `Previews interrupted: P of N
+  files not handled; the next run saves them.`, and the exit code is the
+  transfers' (`1` when files failed), not 130 or 143. A second Ctrl+C stops
+  the tool at once. An interrupt or an error that stops the transfers
+  fetches no preview at all.
+- The preview host requires the OAuth token. The tool sends it there only
+  over https to `downloader.disk.yandex.ru` (and to the API itself), and
+  follows no redirect from it; a preview link anywhere else is refused
+  without a request, as a preview error naming the host.
+
 **Summary.**
 
 ```
 Downloading 120 files (1.2 GiB) to /mnt/backup/Photos
-Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 1 quarantined, 2 failed
+Saving the previews of 2 failed files to /mnt/backup/Photos/.yandex-disk-rescue/previews
+Mirrored disk:/Photos to /mnt/backup/Photos: 120 downloaded (1.2 GiB), 1000 skipped, 1 quarantined, 3 failed
 Passes: 2 of 7
 Already on disk and verified: 40
   disk:/Photos/2023/beach.jpg
@@ -572,10 +623,15 @@ Moved aside to .yandex-disk-rescue/replaced/2026-10-17T09-30-00Z/: 2
 Quarantined: 1
   disk:/Photos/bad.jpg: MD5 mismatch (expected …, got …); kept at .yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg
 Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).
-Failed: 2
+Failed: 3
   disk:/Photos/gone.jpg: removed from the Disk after the scan
   disk:/Photos/napkin.jpg: Yandex Disk never started sending this file: no data in its last 8 attempts since 2026-10-16 08:12 UTC, each with a new download link (the last: the download stalled: no data for 15 s)
+  disk:/Photos/scan.pdf: the download host s123klg.storage.yandex.net returned HTTP 500 (after 7 passes)
 1 of them never got data from Yandex Disk for a day or more: open them in the Yandex Disk web interface, and ask Yandex support about those that do not open there either.
+Saved only as a preview (a reduced image, not verified): 1
+  disk:/Photos/napkin.jpg -> .yandex-disk-rescue/previews/napkin.jpg.preview.jpg
+Previews not saved: 1
+  disk:/Photos/scan.pdf: Could not fetch the preview: the preview host returned HTTP 500 (after 6 attempts)
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
@@ -583,7 +639,10 @@ Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 Every list is in path order, whatever the order the files finished in, and
 shows at most 20 entries, then `… and N more`. `Unreadable in DEST,
 downloaded again` lists each copy already in DEST that could not be read
-(see "Files already in DEST"); it does not change the exit code. When anything
+(see "Files already in DEST"); it does not change the exit code. `Saved only
+as a preview` lists the failed files whose preview is saved, and `Previews not
+saved` those whose preview could not be (see "Previews of files that cannot be
+downloaded"); neither changes the exit code. When anything
 failed or is quarantined, the run ends with exit code `1` and
 `Error: F failed; see the list above.`, `Error: Q quarantined; see the list
 above.` or `Error: F failed and Q quarantined; see the lists above.` A plain
@@ -625,9 +684,13 @@ symbolic link is moved as the link itself; the tool never follows one inside
 DEST and never writes to its target. DEST itself may be a link.
 
 **Nothing is deleted.** The tool never deletes or truncates anything outside
-`DEST/.yandex-disk-rescue/partial/` and, with `--partial-dir PATH`, DEST's
-folder `PATH/<key>/`, or the `<key>/` folder below the `PATH` an earlier run
-used. At the start of every run it deletes the staged copies
+`DEST/.yandex-disk-rescue/partial/`, `DEST/.yandex-disk-rescue/previews/` and,
+with `--partial-dir PATH`, DEST's folder `PATH/<key>/`, or the `<key>/` folder
+below the `PATH` an earlier run used. In `previews/` it deletes a file's
+preview once the file is verified, with the folders that left empty (never
+`previews/` itself), and replaces it with the preview of a newer version of
+the same file that failed too, which may have been the last trace of the
+older version. At the start of every run it deletes the staged copies
 (`<id>.copy` files) in `DEST/.yandex-disk-rescue/partial/`, and in the partial
 folder of the run every file that is not the partial file of a download in
 progress (folders and links there are left alone). After moving the
@@ -657,7 +720,7 @@ starting with `disk:` (swapped arguments), is a usage error (exit `2`). A
 destination mirrors exactly one remote folder of one account; downloading
 another folder into it is refused. `DEST/.yandex-disk-rescue/` is the tool's
 work directory: it holds partial files (or, with `--partial-dir`, the copies
-of finished ones), the `replaced/` and `quarantine/`
+of finished ones), the `replaced/`, `quarantine/` and `previews/`
 folders and a lock, so only one run at a time can use a destination
 (`Another yandex-disk-rescue run is using DEST`), even runs with different
 manifests. The destination's filesystem must support
@@ -684,7 +747,8 @@ stay verified, and a rerun picks up where it stopped. Ctrl+C or SIGTERM
 (`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; rerun to
 continue the download.` and exits with 130 (Ctrl+C) or 143 (SIGTERM); every
 file in progress takes a checkpoint first, and the next run resumes it from
-there.
+there. During the preview step at the end of a run, Ctrl+C or SIGTERM stops
+only that step (see "Previews of files that cannot be downloaded").
 
 ### Local file names
 
@@ -902,8 +966,9 @@ data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
 ```
 
 - The first lines are the phase's status line (described below); then comes a
-  bar of its bytes (of the files checked, in `download`'s check), or a spinner
-  in front of the status line while a scan lists folders.
+  bar of its bytes (of the files checked, in `download`'s check; of the files
+  handled, in its preview step), or a spinner in front of the status line
+  while a scan lists folders.
 - During the passes of `download`, up to 10 files in progress follow, each
   with its path (shortened from the left to fit), the bytes its partial file
   holds of its size, and its speed over the last 10 s (`…` during its first
@@ -940,6 +1005,7 @@ the run stops with an error, Ctrl+C or SIGTERM. A multi-day run under
 2026-10-17T09:51:28.402Z Moved: 3 of 3 files, 3.5 GiB in 17 s, average 210.8 MiB/s
 2026-10-17T10:50:17.021Z Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
 2026-10-23T18:01:40.512Z Downloaded: 133521 of 133521 files, 2.1 TiB in 6 d 9 h, average 4.0 MiB/s; 0 to retry, 3 failed, 0 quarantined; 2 of 7 passes
+2026-10-23T18:01:41.020Z Previews: 3 of 3 files, 2 saved
 2026-10-24T09:00:01.733Z Verifying: 1234 of 98000 files, 120.5 GiB of 2.0 TiB (5.9%), 110.2 MiB/s, ETA 5 h 2 min; 2 problems; reading disk:/big.mkv (1.2 GiB of 4.0 GiB)
 2026-10-24T14:10:03.004Z Verified: 98000 of 98000 files, 2.0 TiB in 5 h 10 min, average 112.4 MiB/s; 2 problems
 ```
@@ -949,7 +1015,9 @@ the run stops with an error, Ctrl+C or SIGTERM. A multi-day run under
   when there are any), its move of the downloads in progress to a new
   partial folder (only when the folder changed and some hold confirmed
   bytes; `Moving` counts those files and their confirmed bytes), the passes
-  of `download`, and `verify`.
+  of `download`, its preview step (only when files failed on Yandex's side;
+  `Previews: <done> of <n> files, <k> saved`, after the start line `Saving
+  the previews of N failed files to …`), and `verify`.
 - `Downloading` and `Verifying` count the files of the start line
   (`Downloading N files`, `Verifying N files`, or the files `left` of a
   continued pass). A file is done once it is downloaded or adopted, failed or
@@ -997,9 +1065,10 @@ quarantined in this run, each `verify` finding made in this run (`missing`,
 `modified` or `corrupt`), each copy in DEST that `download` found unreadable
 (`<path> corrupt: could not read <local>: <reason>`), each folder that
 disappeared during a scan, each
-entry left out because its name is not valid Unicode, and each partial file
+entry left out because its name is not valid Unicode, each partial file
 that could not be deleted once its file's outcome was recorded (`<path>:
-partial file <file> not deleted: <reason>; the outcome stands`). Files `verify` lists
+partial file <file> not deleted: <reason>; the outcome stands`), and each
+preview not saved (`<path>: preview not saved: <reason>`). Files `verify` lists
 from the manifest (not downloaded, or held in quarantine) get no notice; the
 summary lists them.
 
@@ -1122,7 +1191,11 @@ is `scan`'s `without_checksum.sample`, the 20 smallest paths, with the full
 lists the copies in DEST found unreadable and downloaded again, each with
 `path` and `reason`, also when that download then failed; each `failed`
 item has `unavailable`, `true` for a file [unavailable on Yandex
-Disk](#downloading), and `counts.unavailable` counts those; `scan` is the
+Disk](#downloading), and `counts.unavailable` counts those; `preview_only`
+lists the failed files saved only as a preview, each with `path`, `preview`
+(relative to DEST) and `bytes`, `preview_errors` the previews not saved, each
+with `path` and `reason`, and `counts.previews_pending` the failed files an
+interrupted preview step did not get to; `scan` is the
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
@@ -1138,13 +1211,15 @@ sparse files, without which new downloads are not segmented):
   "scan": {"reused": true, "root": "disk:/Photos", "completed_at": "2026-10-17T09:20:11.004Z"},
   "to_download": {"files": 12, "size": 104857600},
   "counts": {"downloaded": 10, "downloaded_size": 94371840, "skipped": 1191, "adopted": 0, "size_only": 0,
-             "renamed": 0, "unreadable": 0, "moved_aside": 0, "quarantined": 1, "failed": 1, "unavailable": 0},
+             "renamed": 0, "unreadable": 0, "moved_aside": 0, "quarantined": 1, "failed": 1, "unavailable": 0,
+             "preview_only": 0, "preview_errors": 0, "previews_pending": 0},
   "passes": {"used": 2, "limit": 7},
   "adopted": [], "size_only": [], "renamed": [{"path": "disk:/Photos/a?b.jpg", "local": "a_b~1f2e3d4c.jpg"}],
   "unreadable": [], "moved_aside": [], "replaced_folder": null,
   "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
                    "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
   "failed": [{"path": "disk:/Photos/gone.jpg", "reason": "removed from the Disk after the scan", "unavailable": false}],
+  "preview_only": [], "preview_errors": [],
   "partials_left": [],
   "partial_dir": "/mnt/fast",
   "partial_move": {"source": "/mnt/old/0a1b2c3d4e5f6a7b", "target": "/mnt/fast/0a1b2c3d4e5f6a7b",

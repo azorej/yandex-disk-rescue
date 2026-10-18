@@ -140,9 +140,10 @@ yandex-disk-rescue/
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
 │   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
 │   │   │             #   retry set (`--retry-failed`), its start line, the move line and the move's status
-│   │   │             #   lines, the partial-folder line with its room once measured, summary, JSON object
-│   │   │             #   (the report's, with the scan, the files to download, the move and the room), exit code
-│   │   │             #   and interrupt message
+│   │   │             #   lines, the partial-folder line with its room once measured, the preview step once the
+│   │   │             #   transfers ended normally (its `Saving the previews …` line and status lines), summary,
+│   │   │             #   JSON object (the report's, with the scan, the files to download, the move and the room),
+│   │   │             #   exit code and interrupt message
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, JSON
 │   │                 #   object with the pass, exit code and interrupt message; no token, no network
@@ -181,11 +182,18 @@ yandex-disk-rescue/
 │   │                 #   failure records written and counted as each turn fails (also one deferred to a
 │   │                 #   later pass) and dropped as entries succeed, with the silent streak of turns that got
 │   │                 #   no byte (throttling neither counts nor breaks it) and the unavailable-on-Yandex-Disk
-│   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, the summary
-│   │                 #   lines (with the partial files that could not be deleted once their file was
-│   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
+│   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, each failure
+│   │                 #   flagged `on_yandex` when its cause is on Yandex's side, the summary lines (with the
+│   │                 #   previews saved and not saved, and the partial files that could not be deleted once
+│   │                 #   their file was recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
 │   │                 #   stay on the event loop; `mirror_document`, the run's JSON object
+│   ├── previews.py   # The preview step at the end of a download run: the previews of files now verified
+│   │                 #   deleted with their records, then Yandex's XXXL preview of each file failed on Yandex's
+│   │                 #   side fetched (unless one for its current version is saved), saved in a worker thread
+│   │                 #   and recorded, up to `api_concurrency` files at once; per-file preview errors, a step
+│   │                 #   that a rejected token or a full or failing disk ends, and Ctrl+C or SIGTERM ending only
+│   │                 #   the step (a save in progress finished and recorded first)
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
 │   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each
 │   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded;
@@ -228,13 +236,14 @@ yandex-disk-rescue/
 │   │                 #   (a tty, `TERM` neither dumb nor unknown); the engines and the API client log their own
 │   │                 #   records (failures, findings, per-file outcomes, passes, throttling) through
 │   │                 #   `logging.getLogger`
-│   ├── view.py       # The live view of one phase, drawn with rich `Live` on stderr: the status line, a bar (a
-│   │                 #   spinner for a scan), up to 10 files in progress with their speed or state, the file
+│   ├── view.py       # The live view of one phase, drawn with rich `Live` on stderr: the status line, a bar (of
+│   │                 #   the files handled in the preview step, a spinner for a scan), up to 10 files in progress with their speed or state, the file
 │   │                 #   `verify` reads; notices and report lines printed above it; cleared when the phase ends
 │   ├── progress.py   # Thread-safe progress states the engines update (ScanProgress, MoveProgress for the move of
 │   │                 #   partial files to a new partial folder, MirrorProgress with one ActiveFile per file in
 │   │                 #   progress, its state from waiting for room to copying to DEST, its speed over the last
-│   │                 #   10 s and how far its copy to DEST got, VerifyProgress), their snapshots and status lines;
+│   │                 #   10 s and how far its copy to DEST got, PreviewProgress for the preview step,
+│   │                 #   VerifyProgress), their snapshots and status lines;
 │   │                 #   speed over the last minute, ETA over the last 15 minutes; no I/O
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the notices on stderr (timestamped off a terminal),

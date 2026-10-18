@@ -1,6 +1,6 @@
 """`download`: scan a remote folder (unless a recent scan covers it), mirror it into a local folder with every file
 verified, or retry only the files whose last attempt failed, was quarantined or never finished and those `verify`
-found broken, and summarize the run."""
+found broken, save the preview of each file that failed on Yandex's side, and summarize the run."""
 
 import logging
 from dataclasses import dataclass
@@ -12,10 +12,11 @@ from typing import Annotated
 import typer
 
 from yandex_disk_rescue import api, auth, console, interrupts, paths, settings
-from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
+from yandex_disk_rescue.destination import PREVIEWS_DIR_NAME, Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
+from yandex_disk_rescue.local_names import WORK_DIR_NAME
 from yandex_disk_rescue.logs import timestamp
-from yandex_disk_rescue.manifest import Manifest, ScanTime
+from yandex_disk_rescue.manifest import Manifest, Mirror, ScanTime
 from yandex_disk_rescue.mirroring import (
     MirrorReport,
     MirrorRun,
@@ -25,7 +26,8 @@ from yandex_disk_rescue.mirroring import (
     mirror_document,
     mirror_summary,
 )
-from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, ScanProgress
+from yandex_disk_rescue.previews import preview_candidates, save_previews
+from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, PreviewProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_document, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -251,7 +253,9 @@ async def _run(
     manifest_path: Path,
 ) -> tuple[MirrorReport, dict[str, object]]:
     """The report of the run, and the JSON members it does not hold: the scan, the files to download, the move of
-    the partial files, the room measured in the partial folder and whether that folder keeps sparse files."""
+    the partial files, the room measured in the partial folder and whether that folder keeps sparse files. The preview
+    step runs once the transfers have ended normally; an interrupt or an error that stops the transfers propagates
+    before it."""
     async with api.DiskClient(token, base_url=base_url, limits=limits) as client:
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
@@ -278,7 +282,22 @@ async def _run(
                 report, facts = await _mirror(
                     client, run, destination, output, progress, transfers, retry_failed=retry_failed
                 )
+                await _previews(report, mirror, destination, client, output)
                 return report, {'scan': scan, **facts}
+
+
+async def _previews(
+    report: MirrorReport, mirror: Mirror, destination: Destination, client: api.DiskClient, output: console.Output
+) -> None:
+    progress = PreviewProgress()
+    if not (candidates := len(preview_candidates(report))):
+        await save_previews(report, mirror, destination, client, progress)
+        return
+    files = 'file' if candidates == 1 else 'files'
+    folder = destination.path / WORK_DIR_NAME / PREVIEWS_DIR_NAME
+    output.headline(f'Saving the previews of {candidates} failed {files} to {folder}')
+    with output.progress(progress):
+        await save_previews(report, mirror, destination, client, progress)
 
 
 async def _mirror(

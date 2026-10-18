@@ -1,5 +1,6 @@
 """The live view of a slow phase on a terminal, drawn with rich `Live` on stderr: the phase's status line, a bar of
-its bytes (a spinner for a scan), and the files in progress with their state. The view is cleared when the phase ends.
+its bytes (of its files for the preview step, a spinner for a scan), and the files in progress with their state. The
+view is cleared when the phase ends.
 
 While a view is shown, every other write to the terminal goes through it, so it lands above the view: a notice is
 printed through the view's console with markup, emoji and highlighting off, and a report line is written to stdout
@@ -24,6 +25,7 @@ from yandex_disk_rescue.progress import (
     ActiveTransfer,
     MirrorSnapshot,
     MoveSnapshot,
+    PreviewSnapshot,
     ProgressState,
     ScanSnapshot,
     Snapshot,
@@ -124,6 +126,9 @@ class _View:
             case MoveSnapshot() as move:
                 yield Text(line)
                 yield from _bar(move.moved_size, move.size, width)
+            case PreviewSnapshot() as previews:
+                yield Text(line)
+                yield from _bar(previews.done, previews.files, width)
             case VerifySnapshot() as verify:
                 yield Text(line)
                 yield from _bar(verify.done_size, verify.size, width)

@@ -244,6 +244,43 @@ class MoveProgress:
 
 
 @dataclass(frozen=True)
+class PreviewSnapshot:
+    started: bool
+    files: int
+    done: int
+    saved: int
+
+    def status_line(self, *, final: bool) -> str | None:
+        if not self.started:
+            return None
+        return f'Previews: {_of(self.done, self.files, "file")}, {self.saved} saved'
+
+
+class PreviewProgress:
+    """The preview step at the end of a run: the failed files it handled so far, and those with a preview saved."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._started = False
+        self._files = self._done = self._saved = 0
+
+    def start(self, files: int) -> None:
+        """The preview step over `files` failed files starts."""
+        with self._lock:
+            self._started, self._files = True, files
+
+    def handled(self, *, saved: bool) -> None:
+        """One more failed file was handled; `saved` when it has a preview saved."""
+        with self._lock:
+            self._done += 1
+            self._saved += saved
+
+    def snapshot(self) -> PreviewSnapshot:
+        with self._lock:
+            return PreviewSnapshot(started=self._started, files=self._files, done=self._done, saved=self._saved)
+
+
+@dataclass(frozen=True)
 class ActiveTransfer:
     """A file in progress: its `held` bytes of `size`, its state (`downloading` while a connection of it is open),
     `idle`, the seconds since it last received bytes or got a connection (`None` while it has none open), `speed`, the

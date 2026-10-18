@@ -15,6 +15,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
   Yandex Disk (`Yandex Disk never started sending this file: …`, or `… stopped sending this file after <size>: …`) in
   the summary, with a hint to check it in the web interface and ask Yandex support, in `--json` (`unavailable`) and
   in `verify`. The manifest keeps each failure's streak of attempts without data (schema version 11).
+- `download` saves Yandex's preview (a reduced image, at most 1280 px) of each file it could not download because of
+  Yandex's side in `DEST/.yandex-disk-rescue/previews/`, at the end of a run whose transfers ended normally, and
+  deletes it once the file is downloaded. The summary lists the files saved only as a preview and the previews not
+  saved, as does `--json` (`preview_only`, `preview_errors`, `counts.previews_pending`); Ctrl+C or SIGTERM during the
+  preview step stops only that step. The manifest records each saved preview (schema version 12).
 
 ### Changed
 
