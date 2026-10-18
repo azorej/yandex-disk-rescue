@@ -1,6 +1,7 @@
 """Tests for the config file layer: real TOML files feeding the registry options of `scan` and `auth`."""
 
 import itertools
+import re
 import sqlite3
 import urllib.parse
 from contextlib import closing
@@ -231,6 +232,8 @@ def test_download_reads_the_partial_folder_from_the_config_file_and_an_empty_fla
         assert list(partial_root.iterdir()) == []
     else:
         [folder] = partial_root.iterdir()
-        assert f'Partial files in {folder}\n' in result.stdout
+        assert re.search(
+            rf'^Partial files in {re.escape(str(folder))} \([0-9.]+ [KMG]iB available\)$', result.stdout, re.M
+        )
         assert list(folder.iterdir()) == []
     assert (dest / 'A' / 'file.txt').read_bytes() == b'A'

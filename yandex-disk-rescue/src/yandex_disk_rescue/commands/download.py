@@ -14,7 +14,7 @@ from yandex_disk_rescue import api, auth, paths, settings
 from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ScanTime
-from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, TransferPolicy, mirror_summary
+from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, PartialRoom, TransferPolicy, mirror_summary
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -224,8 +224,6 @@ async def _mirror(
         )
     else:
         typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
-    if destination.separate_partials:
-        typer.echo(f'Partial files in {destination.partial_folder}')
     if (move := run.partial_move) is not None:
         if move.missing:
             typer.echo(
@@ -245,4 +243,8 @@ async def _mirror(
             segments=transfers.segments,
             segment_threshold=transfers.segment_threshold_mib * 2**20,
         )
-        return await run.run(client, content, policy, passes=transfers.passes)
+        return await run.run(client, content, policy, passes=transfers.passes, room_measured=_show_room)
+
+
+def _show_room(room: PartialRoom) -> None:
+    typer.echo(f'Partial files in {room.folder} ({format_size(max(room.capacity, 0))} available)')

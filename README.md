@@ -214,9 +214,8 @@ resume — happens on that disk, not on DEST:
   anything else is a usage error (exit `2`). The tool creates only its own
   folder of this DEST below it, `PATH/<key>/`, where `<key>` is the first 16
   hex digits of the SHA-256 of DEST's resolved path. So one `partial_dir` in
-  the config file serves every destination, and the run prints `Partial files
-  in PATH/<key>` after the `Downloading …` line. That folder holds only
-  partial files.
+  the config file serves every destination. That folder holds only partial
+  files.
 - Once every byte of a file is in, it is copied to
   `DEST/.yandex-disk-rescue/partial/<id>.copy` as one sequential stream, one
   file at a time for the whole run, so DEST sees a single writer. The size
@@ -238,6 +237,22 @@ resume — happens on that disk, not on DEST:
 - A file waiting for its copy keeps its place among the
   `download_connections` files in progress, so when DEST is slower than the
   network, fetching slows down instead of filling `PATH`.
+- The partial files never take more than the room `PATH` had when the run
+  started: the free space of its filesystem, plus what the partial files
+  already there take, minus a reserve of 1 GiB left for everything else.
+  Once any move (below) is done, the run prints `Partial files in PATH/<key>
+  (<size> available)`. A file being downloaded counts its full size; a
+  partial file kept for a later pass or run counts the disk space it
+  actually takes, which for a segmented file is only what was written so
+  far. Files take their room in path order, a file that does not fit yet
+  waits for one in progress to end, and when none is left in progress it is
+  deferred to the next pass with `no room yet in the partial folder <folder>
+  (<size> needed, <size> available)`. A file larger than the whole room
+  fails with `larger than the room in the partial folder <folder> (<size>
+  needed, <size> available)`; `--retry-failed` fetches it once there is room.
+  When another program fills that disk anyway, the run stops with `Error:
+  Could not write <path>: No space left on device.` (below) and a rerun
+  resumes from the journals.
 - Use a persistent folder on a fast local disk: not a tmpfs, and not a
   container layer that a rebuild discards. When the folder is lost, the
   downloads in progress start again from their first byte. Do not share one
@@ -566,7 +581,8 @@ and look-ups go to the Disk API and are paced separately, by
 
 Many files written at once make a hard disk seek between them. When DEST is a
 hard disk (a USB one especially), set `partial_dir` to a folder on a fast
-local disk ([Partial files](#downloading)): the interleaved writes of the
+local disk with free space for at least the largest file plus 1 GiB
+([Partial files](#downloading)): the interleaved writes of the
 files in progress, the checkpoint flushes, the zeros written to extend a
 segmented file, and the re-reading of confirmed bytes on a resume all move
 there, and DEST only receives one sequential copy of each finished file.

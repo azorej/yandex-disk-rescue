@@ -1684,7 +1684,8 @@ def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(dis
     assert result.exit_code == 0, result.output
     folder = _separate_folder(dest, partial_root)
     total = format_size(sum(map(len, files.values())))
-    assert f'Downloading 8 files ({total}) to {dest}\nPartial files in {folder}\n' in result.stdout
+    room = rf'Partial files in {re.escape(str(folder))} \([0-9.]+ MiB available\)'
+    assert re.search(rf'^{re.escape(f"Downloading 8 files ({total}) to {dest}")}\n{room}$', result.stdout, re.M)
     assert f'8 downloaded ({total}), 0 skipped, 0 quarantined, 0 failed\n' in result.stdout
     for path, content in files.items():
         local = local_file(dest, path)
@@ -1843,10 +1844,14 @@ def test_with_a_partial_folder_a_run_stopped_on_the_way_to_dest_finishes_on_the_
 
 
 # Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, an fsync of a staged copy
-# creates the marker `blocked` there and never returns; every other fsync runs as usual.
+# creates the marker `blocked` there and never returns; every other fsync runs as usual. The run keeps no reserve in
+# its partial folder, as `partial_root` does in this process.
 _COPY_FSYNC_GATE = """
 import os, pathlib, time
 
+from yandex_disk_rescue import mirroring
+
+mirroring.PARTIAL_RESERVE = 0
 _gate = pathlib.Path(os.environ['FSYNC_GATE'])
 _fsync = os.fsync
 
@@ -2017,7 +2022,10 @@ def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download
 
     assert result.exit_code == 0, result.output
     old, new = _partial_folder(dest, old_root), _partial_folder(dest, new_root)
-    assert _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', old, new) in result.stdout
+    moving = _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', old, new)
+    assert moving in result.stdout
+    if new_root is not None:
+        assert result.stdout.index(moving) < result.stdout.index(f'Partial files in {new} (')
     for source in sources:
         reads = [(offset, length) for _, path, offset, length in calls if path == str(source)]
         assert reads
@@ -2122,6 +2130,162 @@ def test_a_moved_partial_file_cut_short_below_a_confirmed_offset_fetches_that_se
     assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(kept)
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
     assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+
+
+BIG2_PATH = 'disk:/Big/big2.bin'
+BIG2 = random.Random(5).randbytes(MiB)
+
+
+def _free(monkeypatch, free: int) -> None:
+    """Make the filesystem of the partial folder report `free` bytes free; `partial_root` keeps no reserve, so the
+    room of a run is `free` and the bytes its kept partial files allocate."""
+    monkeypatch.setattr(localfs, 'free_bytes', lambda dir_fd: free)
+
+
+def _room_line(dest, partial_root, capacity: int) -> str:
+    return f'Partial files in {_separate_folder(dest, partial_root)} ({format_size(capacity)} available)\n'
+
+
+def _content_started(fake, path: str) -> list[float]:
+    return [r.started for r in fake.requests if r.path == '/download' and r.params['path'] == path]
+
+
+def test_a_partial_folder_with_room_for_one_large_file_fetches_the_large_files_one_at_a_time(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.chunk_delay = 0.01
+    _free(monkeypatch, MiB + MiB // 2)
+    ended: dict[int, float] = {}
+    remove_partial = Destination.remove_partial
+
+    def recording_remove_partial(destination, entry_id):
+        remove_partial(destination, entry_id)
+        ended[entry_id] = time.monotonic()
+
+    monkeypatch.setattr(Destination, 'remove_partial', recording_remove_partial)
+
+    result = run_download(*_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _room_line(dest, partial_root, MiB + MiB // 2) in result.stdout
+    assert _others_verified(dest, failed='')
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, BIG2_PATH).read_bytes() == BIG2
+    assert min(_content_started(big, BIG2_PATH)) > ended[_entry_id(BIG_PATH)]
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_file_larger_than_the_room_of_the_partial_folder_fails_and_a_retry_with_room_fetches_it(
+    big, dest, partial_root, monkeypatch
+):
+    with monkeypatch.context() as patch:
+        _free(patch, MiB // 2)
+        result = run_download(*_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 1
+    folder = _separate_folder(dest, partial_root)
+    reason = f'larger than the room in the partial folder {folder} (1.0 MiB needed, 512.0 KiB available)'
+    assert _room_line(dest, partial_root, MiB // 2) in result.stdout
+    assert f'Failed: 1\n  {BIG_PATH}: {reason}\n' in result.stdout
+    assert _failure_records() == [(BIG_PATH, reason)]
+    assert _fetches(big, BIG_PATH) == []
+    assert _partials(dest, partial_root) == []
+    assert _others_verified(dest, BIG_PATH)
+
+    retry = run_download(*_partial_args(partial_root), '--retry-failed', str(dest))
+
+    assert retry.exit_code == 0, retry.output
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert _failure_records() == []
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_file_waiting_for_room_is_deferred_when_the_last_running_file_is_deferred_and_a_pass_with_room_ends_both(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.chunk_delay = 0.01
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+    # One large file fits, and the second one does not fit next to the bytes the first one keeps once deferred.
+    free = MiB + MiB // 8
+    _free(monkeypatch, free)
+    args = ('--download-retries', '0', *_partial_args(partial_root))
+
+    result = run_download(*args, '--download-passes', '1', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    [kept] = _partials(dest, partial_root)
+    assert kept.name == str(_entry_id(BIG_PATH))
+    allocated = kept.stat().st_blocks * 512
+    folder = _separate_folder(dest, partial_root)
+    waited = f'no room yet in the partial folder {folder} (1.0 MiB needed, {format_size(free - allocated)} available)'
+    assert [reason for path, reason in _failure_records() if path == BIG2_PATH] == [waited]
+    assert _content_started(big, BIG2_PATH) == []
+    earlier = len(big.requests)
+
+    rerun = run_download(*args, 'disk:/Big', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _room_line(dest, partial_root, free + allocated) in rerun.stdout
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    assert _fetches(big, BIG2_PATH, earlier) == [None]
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'big2.bin').read_bytes() == BIG2
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_kept_sparse_partial_file_takes_only_the_room_it_allocates(segmented, dest, partial_root, monkeypatch):
+    for segment, cut in zip(SEGMENT_RANGES, _SEGMENT_CUTS, strict=True):
+        where = {'path': SEGMENTED_PATH}
+        segmented.inject('GET', '/download', Truncate(after_bytes=cut), where=where, where_headers={'range': segment})
+    args = ('--download-retries', '0', '--download-passes', '1', *SEGMENTED_ARGS, *_partial_args(partial_root))
+    assert run_download(*args, str(dest)).exit_code == 1
+    [kept] = _partials(dest, partial_root)
+    allocated = kept.stat().st_blocks * 512
+    assert kept.stat().st_size == len(SEGMENTED)
+    # Room for the segmented file at full size, which leaves no room for `BIG` next to it at full size.
+    capacity = len(SEGMENTED) + MiB // 2
+    assert allocated + len(BIG) <= capacity < len(SEGMENTED) + len(BIG)
+    _free(monkeypatch, capacity - allocated)
+    segmented.add_file(BIG_PATH, BIG, modified=MODIFIED)
+
+    result = run_download(*args, '--scan-max-age', '0', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _room_line(dest, partial_root, capacity) in result.stdout
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_run_stopped_while_a_file_waits_for_room_ends_at_once_and_the_rerun_goes_on(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.chunk_delay = 0.01
+    _free(monkeypatch, MiB + MiB // 2)
+    folder = _separate_folder(dest, partial_root)
+    pwrite = os.pwrite
+
+    def failing_write(fd, data, offset):
+        if os.readlink(f'/proc/self/fd/{fd}') == str(folder / str(_entry_id(BIG_PATH))) and offset >= MiB // 2:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        return pwrite(fd, data, offset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'pwrite', failing_write)
+        result = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {folder / str(_entry_id(BIG_PATH))}: No space left on device.\n'
+    assert _content_started(big, BIG2_PATH) == []
+
+    rerun = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'big2.bin').read_bytes() == BIG2
 
 
 @pytest.mark.parametrize(
@@ -2733,7 +2897,7 @@ async def _mirror_run(
             run = MirrorRun(
                 manifest.mirror(account.uid, scan_root.path, destination.path), destination, retry_failed=False
             )
-            yield lambda: run.run(client, content, policy, passes=1)
+            yield lambda: run.run(client, content, policy, passes=1, room_measured=lambda _: None)
 
 
 async def _until(condition: Callable[[], bool], what: str) -> None:

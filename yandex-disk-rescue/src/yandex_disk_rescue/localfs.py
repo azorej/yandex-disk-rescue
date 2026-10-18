@@ -1,5 +1,6 @@
 """The filesystem calls a destination makes on names and open files: looking a name up, opening a folder or a file,
-creating a folder, the rename that never replaces an existing path, reading an open file and setting its times.
+creating a folder, the rename that never replaces an existing path, reading an open file and setting its times, and
+the free space of a filesystem.
 
 Every call on a name works relative to an open folder descriptor and never follows a symbolic link, so nothing is
 ever read or written through a link that appears inside the destination.
@@ -53,3 +54,9 @@ def rename_noreplace(src: str, dst: str, *, src_dir_fd: int, dst_dir_fd: int) ->
 
 def set_times(fd: int, *, atime_ns: int, mtime_ns: int) -> None:
     os.utime(fd, ns=(atime_ns, mtime_ns))
+
+
+def free_bytes(dir_fd: int) -> int:
+    """The bytes an unprivileged process can still allocate on the filesystem of the open folder `dir_fd`."""
+    found = os.fstatvfs(dir_fd)
+    return found.f_bavail * found.f_frsize

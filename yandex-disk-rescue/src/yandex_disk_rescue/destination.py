@@ -4,7 +4,8 @@ in, and every file operation inside them; and the read-only view of a destinatio
 Partial files live in the destination's own `.yandex-disk-rescue/partial/`, or, with a partial folder given, in the
 destination's own folder below it. In the first layout a finished partial file is itself placed or quarantined; in
 the second it is first copied to a staged copy in the destination's `partial/`, which is then placed or quarantined.
-The partial folder an earlier run used, either layout, opens to read and delete the partial files left there.
+The partial folder an earlier run used, either layout, opens to read and delete the partial files left there. The
+free space of the partial folder's filesystem and the bytes each partial file allocates there can be looked up.
 
 All operations go through open folder descriptors and `localfs`, so none follows a symbolic link inside the
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
@@ -377,6 +378,26 @@ class Destination(_Tree):
         """Make the files created in and deleted from the partial folder durable."""
         with _work_errors(self.partial_folder):
             os.fsync(self._files_fd)
+
+    def partial_free_bytes(self) -> int:
+        """The free bytes of the filesystem `partial_folder` is on. Any error raises `DestinationError` naming the
+        folder."""
+        try:
+            return localfs.free_bytes(self._files_fd)
+        except OSError as exc:
+            raise DestinationError.of(self.partial_folder, exc) from None
+
+    def partial_allocated(self, entry_id: int) -> int:
+        """The bytes the partial file of `entry_id` allocates on its filesystem, which a sparse file keeps below its
+        size; 0 when there is no regular file of that name. Any other error raises `DestinationError` naming it."""
+        name = str(entry_id)
+        try:
+            found = localfs.lstat(name, dir_fd=self._files_fd)
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            raise DestinationError.of(self.partial_folder / name, exc) from None
+        return found.st_blocks * 512 if stat.S_ISREG(found.st_mode) else 0
 
     def previous_partials(self, folder: Path) -> PreviousPartials | None:
         """The separate partial folder `folder` an earlier run used (a `partial_folder` of a destination opened with a

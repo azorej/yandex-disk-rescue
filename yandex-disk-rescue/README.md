@@ -121,7 +121,8 @@ yandex-disk-rescue/
 │   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
 │   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
-│   │   │             #   retry set (`--retry-failed`), its start line, the partial-folder line, summary,
+│   │   │             #   retry set (`--retry-failed`), its start line, the move line, the partial-folder line
+│   │   │             #   with its room once measured, summary,
 │   │   │             #   exit code
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, exit code
@@ -135,7 +136,10 @@ yandex-disk-rescue/
 │   │                 #   above it (skip, hold quarantined files, fetch again files with a verify finding without
 │   │                 #   reading their copy, folders, things in the way, hard-link aliases) with
 │   │                 #   up to `download_connections` files in progress at once, after moving the confirmed
-│   │                 #   bytes of the downloads in progress when the partial folder changed since the last run,
+│   │                 #   bytes of the downloads in progress when the partial folder changed since the last run
+│   │                 #   and, with separate partial files, admission to the partial folder's room (measured
+│   │                 #   once, idle partial files counting what they allocate, each fetched file its full size,
+│   │                 #   in path order: wait, defer to the next pass, or fail a file larger than the room),
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
 │   │                 #   pipeline (adopt a matching local copy, or resume a partial file segment by segment
@@ -169,7 +173,8 @@ yandex-disk-rescue/
 │   │                 #   DEST's own folder below `--partial-dir` (`<key>/`, created on open), the staged copy
 │   │                 #   `partial/<id>.copy` a separate partial file is copied to (each left by a stopped run
 │   │                 #   deleted at the start of the next), the partial folder an earlier run used (reading,
-│   │                 #   deleting its partial files and its leftovers), reading existing files,
+│   │                 #   deleting its partial files and its leftovers), the free space of the partial folder and
+│   │                 #   the bytes each partial file allocates there, reading existing files,
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
 │   │                 #   link; which errors stop the run;
@@ -177,7 +182,7 @@ yandex-disk-rescue/
 │   │                 #   lock file exists, whether the destination itself is still readable)
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
-│   │                 #   an open file and setting its times
+│   │                 #   an open file and setting its times; the free space of a folder's filesystem
 │   ├── units.py      # format_size — binary-unit byte counts for command output
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest path
