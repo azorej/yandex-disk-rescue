@@ -6,11 +6,18 @@ as on stderr; a traceback is written as one prefixed line per line, so each line
 run wrote it.
 
 A write to stderr that fails (a `2> file` on a full disk, a terminal that went away) turns stderr off for the rest of
-the run instead of raising: `sys.stderr` is replaced by `os.devnull`, so every later write to it, the tool's or a
-library's, goes nowhere, and the `on_failure` that `stderr_failures` installed is called once with the reason.
+the run instead of raising: `sys.stderr` is replaced by a stream that discards everything, so every later write to it,
+the tool's or a library's, goes nowhere, and the `on_failure` that `stderr_failures` installed is called once with the
+reason.
+
+Lock order: the `Notices` handler's lock, then the stderr lock, the live view's and rich's locks; the log file's
+handler lock is taken last and nothing is taken under it. A failure of stderr or of the log file is only recorded
+where it happens, and reported once those locks are released, so no record is logged under the stderr lock (or one
+taken after it) and nothing is written to stderr under the log file's lock.
 """
 
 import contextlib
+import io
 import logging
 import os
 import sys
@@ -58,7 +65,8 @@ class LogFile(logging.Handler):
     Before a record would take the file past `MAX_BYTES`, the file is rotated: `.1` … `.BACKUP_COUNT-1` move up one
     and the file becomes `.1`. Every file is created with mode 0600. The constructor raises `OSError` when the file
     cannot be opened. A write or a rotation that fails later turns the handler off for the rest of the run instead of
-    raising: it keeps the reason in `failure` and calls `on_failure(reason)` once, from the thread whose write failed.
+    raising: it keeps the reason in `failure` and calls `on_failure(reason)` once, from the thread whose write failed,
+    after the handler's lock is released.
     """
 
     def __init__(self, path: Path, command: str, on_failure: Callable[[str], None]) -> None:
@@ -68,7 +76,14 @@ class LogFile(logging.Handler):
         self.path = path
         self.failure: str | None = None
         self._on_failure = on_failure
+        self._failure_lock = threading.Lock()
+        self._failure_reported = False
         self._fd: int | None = _open_log(path)
+
+    def handle(self, record: logging.LogRecord) -> logging.LogRecord | bool:
+        handled = super().handle(record)
+        self._report_failure()
+        return handled
 
     def emit(self, record: logging.LogRecord) -> None:
         if self._fd is None:
@@ -108,7 +123,13 @@ class LogFile(logging.Handler):
             # close reports an error too.
             with contextlib.suppress(OSError):
                 os.close(fd)
-        self._on_failure(reason)
+
+    def _report_failure(self) -> None:
+        with self._failure_lock:
+            if self.failure is None or self._failure_reported:
+                return
+            self._failure_reported = True
+        self._on_failure(self.failure)
 
 
 class Notices(logging.Handler):
@@ -125,12 +146,21 @@ class Notices(logging.Handler):
         write_stderr(self.format(record))
 
 
+class _Discarded(io.TextIOBase):
+    def write(self, text: str) -> int:
+        return len(text)
+
+
 class _Stderr:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.writer: Callable[[str], None] | None = None
+        # Taken only for a few attribute changes, never while logging or writing.
         self.off_lock = threading.Lock()
         self.off = False
+        self.failure: str | None = None
+        self.reported = False
+        self.discarded = _Discarded()
         self.on_failure: Callable[[str], None] | None = None
 
 
@@ -175,26 +205,36 @@ def stderr_off() -> bool:
 
 @contextmanager
 def stderr_failures(on_failure: Callable[[str], None]) -> Iterator[None]:
-    """Call `on_failure(reason)` when a write to stderr fails while the context runs, from the thread whose write
-    failed."""
+    """Report a write to stderr that fails while the context runs to `on_failure(reason)`, once: when the
+    `write_stderr` that met it returns, at the next `report_stderr_failure`, or at the latest when the context exits.
+    Call it with no lock held."""
     _stderr.on_failure = on_failure
     try:
         yield
     finally:
+        report_stderr_failure()
         _stderr.on_failure = None
+
+
+def report_stderr_failure() -> None:
+    """Pass the failure of stderr, if there is one and it is not reported yet, to the `on_failure` of
+    `stderr_failures`. Call it with no lock held."""
+    with _stderr.off_lock:
+        on_failure = _stderr.on_failure
+        if _stderr.failure is None or _stderr.reported or on_failure is None:
+            return
+        _stderr.reported = True
+    on_failure(_stderr.failure)
 
 
 def _turn_off(exc: OSError) -> None:
     with _stderr.off_lock:
         if _stderr.off:
             return
-        _stderr.off = True
+        _stderr.off, _stderr.failure = True, exc.strerror or str(exc)
         # The failed stream keeps the bytes it could not write and no API discards them; Python would retry them at
         # exit and turn that failure into exit code 120.
-        sys.stderr = open(os.devnull, 'w', encoding='utf-8')
-        on_failure = _stderr.on_failure
-    if on_failure is not None:
-        on_failure(exc.strerror or str(exc))
+        sys.stderr = _stderr.discarded
 
 
 def notice(text: str, *, timestamped: bool) -> None:
@@ -207,16 +247,16 @@ def notice(text: str, *, timestamped: bool) -> None:
 def write_stderr(text: str) -> None:
     """Write `text`, its control characters but newlines escaped, and a newline to stderr, one caller at a time:
     through the writer `stderr_through` installed, or else to the current `sys.stderr`, flushed. Nothing is written
-    once stderr is off."""
-    if _stderr.off:
-        return
-    text = display_text(text)
-    with _stderr.lock:
-        if _stderr.writer is not None:
-            _stderr.writer(text)
-            return
-        STDERR.write(f'{text}\n')
-        STDERR.flush()
+    once stderr is off; a failure of stderr this write met, or an earlier one, is reported when it returns."""
+    if not _stderr.off:
+        text = display_text(text)
+        with _stderr.lock:
+            if _stderr.writer is not None:
+                _stderr.writer(text)
+            else:
+                STDERR.write(f'{text}\n')
+                STDERR.flush()
+    report_stderr_failure()
 
 
 @contextmanager

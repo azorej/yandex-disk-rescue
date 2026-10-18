@@ -211,7 +211,7 @@ yandex-disk-rescue/
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the notices on stderr (timestamped off a terminal),
 │   │                 #   sent through the live view while one is shown; a write to stderr that fails turns
-│   │                 #   stderr off for the run (`sys.stderr` becomes os.devnull) instead of raising
+│   │                 #   stderr off for the run (`sys.stderr` then discards everything) instead of raising
 │   ├── units.py      # format_size and format_duration — binary-unit byte counts and durations for command output
 │   ├── display.py    # display_line and display_text — text with every control character and lone surrogate
 │   │                 #   escaped (`\x1b`, `\x0a`, `\udcxx`), applied where the report, stderr, the live view and

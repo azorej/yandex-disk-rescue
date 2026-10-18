@@ -37,6 +37,7 @@ from yandex_disk_rescue.logs import (
     LogFile,
     Notices,
     notice,
+    report_stderr_failure,
     stderr_failures,
     stderr_through,
     timestamp,
@@ -173,6 +174,7 @@ class Output:
         to_stderr = shown and not self._terminal
 
         def emit(*, final: bool) -> None:
+            report_stderr_failure()
             line = state.snapshot().status_line(final=final)
             if line is None:
                 return
@@ -288,8 +290,10 @@ def _logged_run(command: str, options: OutputOptions, *, details: Mapping[str, o
             try:
                 yield Output(log_file, options, terminal=terminal)
             except BaseException as exc:
+                report_stderr_failure()
                 _log_end(command, exc)
                 raise
+            report_stderr_failure()
             _log.info('%s completed (exit 0)', command, extra=FILE_ONLY)
     finally:
         for handler in handlers:

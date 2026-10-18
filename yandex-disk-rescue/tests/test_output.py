@@ -5,6 +5,7 @@ import errno
 import fcntl
 import io
 import json
+import logging
 import os
 import pty
 import re
@@ -230,6 +231,56 @@ def test_a_stderr_that_stops_taking_writes_keeps_the_exit_code_of_a_failed_or_in
         assert messages[-1] == 'download failed (exit 1): 1 failed; see the list above.'
     else:
         assert messages[-1] == 'download interrupted (exit 130)'
+
+
+def test_a_log_file_and_a_stderr_failing_at_once_never_deadlock_and_each_is_reported_once(tmp_path, monkeypatch):
+    monkeypatch.setattr(logs, '_stderr', logs._Stderr())
+    writing, release = threading.Event(), threading.Event()
+
+    class BlockedStderr(io.StringIO):
+        def write(self, text: str) -> int:
+            writing.set()
+            release.wait(10)
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(sys, 'stderr', BlockedStderr())
+    log_failures: list[str] = []
+    log_failed = threading.Event()
+
+    def on_log_failure(reason: str) -> None:
+        log_failures.append(reason)
+        log_failed.set()
+        logs.notice(f'could not write the log file: {reason}', timestamped=False)
+
+    (tmp_path / 'full.log').symlink_to('/dev/full')
+    log_file = logs.LogFile(tmp_path / 'full.log', 'test', on_log_failure)
+    records: list[str] = []
+    capture = logging.Handler()
+    capture.emit = lambda record: records.append(record.getMessage())
+    logger = logging.getLogger('yandex_disk_rescue.lock_order')
+    monkeypatch.setattr(logger, 'propagate', False)
+    monkeypatch.setattr(logger, 'handlers', [log_file, capture])
+
+    with logs.stderr_failures(lambda reason: logger.warning('stderr off: %s', reason)):
+        holding = threading.Thread(target=logs.write_stderr, args=('held',), daemon=True)
+        holding.start()
+        assert writing.wait(10)
+        failing = threading.Thread(target=logger.warning, args=('the log file fails',), daemon=True)
+        failing.start()
+        assert log_failed.wait(10)
+        # Long enough for the failing thread to wait for the stderr lock the other one holds.
+        time.sleep(0.2)
+        release.set()
+        holding.join(10)
+        failing.join(10)
+        assert not holding.is_alive()
+        assert not failing.is_alive()
+
+    log_file.close()
+    assert log_failures == [os.strerror(errno.ENOSPC)]
+    assert [message for message in records if message.startswith('stderr off: ')] == [
+        f'stderr off: {os.strerror(errno.ENOSPC)}'
+    ]
 
 
 def test_the_log_names_every_failed_file_and_a_rerun_appends_to_it(disk, dest):
