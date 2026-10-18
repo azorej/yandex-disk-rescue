@@ -588,11 +588,15 @@ still listed, and those of files now verified are still deleted.
   preview. A preview a crash left half-written (`*.preview-saving`) is
   deleted at the start of the next run's preview step. A preview of a file later removed from the Disk stays in
   `previews/`, untracked, until you delete it.
-- A preview that cannot be fetched or saved is listed under `Previews not
-  saved` with the reason. A token Yandex rejects, or a full disk, an I/O
-  error or a read-only filesystem in `previews/`, ends the preview step, and
-  every file not handled yet is listed with that reason. Previews never
-  change the run's outcome or exit code, and never stop the run.
+- A preview that cannot be fetched, saved or deleted is listed under
+  `Previews not saved or deleted` with the reason. A token Yandex rejects,
+  or a full disk, an I/O error, a read-only filesystem or a permission error
+  in `previews/` (`could not use previews in <folder>: <reason>`), ends the
+  preview step, and every file not handled yet is listed with that reason. A
+  preview of a verified file that cannot be deleted keeps its record, so the
+  next run deletes it. Previews never change the run's outcome or exit code,
+  and never stop the run, except when the manifest itself cannot be written,
+  which stops it as in any other phase.
 - Ctrl+C or SIGTERM during the preview step stops only that step: the
   fetches in flight are dropped, a preview being written is finished and
   recorded first, the summary is printed with `Previews interrupted: P of N
@@ -634,7 +638,7 @@ Failed: 3
 1 of them never got data from Yandex Disk for a day or more: open them in the Yandex Disk web interface, and ask Yandex support about those that do not open there either.
 Saved only as a preview (a reduced image, not verified): 1
   disk:/Photos/napkin.jpg -> .yandex-disk-rescue/previews/napkin.jpg.preview.jpg
-Previews not saved: 1
+Previews not saved or deleted: 1
   disk:/Photos/scan.pdf: Could not fetch the preview: the preview host returned HTTP 500 (after 6 attempts)
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
 Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
@@ -645,9 +649,9 @@ shows at most 20 entries, then `… and N more`. `Unreadable in DEST,
 downloaded again` lists each copy already in DEST that could not be read
 (see "Files already in DEST"); it does not change the exit code. `Saved only
 as a preview` lists the failed files whose preview is saved, and `Previews not
-saved` those whose preview could not be (see "Previews of files that cannot be
-downloaded"); neither changes the exit code. When anything
-failed or is quarantined, the run ends with exit code `1` and
+saved or deleted` those whose preview could not be saved or deleted (see
+"Previews of files that cannot be downloaded"); neither changes the exit
+code. When anything failed or is quarantined, the run ends with exit code `1` and
 `Error: F failed; see the list above.`, `Error: Q quarantined; see the list
 above.` or `Error: F failed and Q quarantined; see the lists above.` A plain
 rerun retries every file that is not verified yet except the quarantined
@@ -694,9 +698,11 @@ below the `PATH` an earlier run used. In `previews/` it deletes a file's
 preview once the file is verified, with the folders that left empty (never
 `previews/` itself), and replaces it with the preview of a newer version of
 the same file that failed too, which may have been the last trace of the
-older version. At the start of every run it deletes the staged copies
-(`<id>.copy` files) in `DEST/.yandex-disk-rescue/partial/`, and in the partial
-folder of the run every file that is not the partial file of a download in
+older version. At the start of every preview step it deletes the regular
+`*.preview-saving` files below `previews/`, the previews a crash left
+half-written (folders and links of that name are left alone). At the start
+of every run it deletes the staged copies (`<id>.copy` files) in
+`DEST/.yandex-disk-rescue/partial/`, and in the partial folder of the run every file that is not the partial file of a download in
 progress (folders and links there are left alone). After moving the
 downloads in progress out of an earlier run's partial folder, it deletes the
 files left in it, then the folder itself when it is empty (DEST's own
@@ -1202,8 +1208,8 @@ lists the copies in DEST found unreadable and downloaded again, each with
 item has `unavailable`, `true` for a file [unavailable on Yandex
 Disk](#downloading), and `counts.unavailable` counts those; `preview_only`
 lists the failed files saved only as a preview, each with `path`, `preview`
-(relative to DEST) and `bytes`, `preview_errors` the previews not saved, each
-with `path` and `reason`, and `counts.previews_pending` the failed files an
+(relative to DEST) and `bytes`, `preview_errors` the previews not saved or
+deleted, each with `path` and `reason`, and `counts.previews_pending` the failed files an
 interrupted preview step did not get to; `scan` is the
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`

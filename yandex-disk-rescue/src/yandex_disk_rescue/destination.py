@@ -61,7 +61,7 @@ _KEY_DIGITS = 16
 # Errors that no other file of the run would escape: the run stops instead of failing every file in turn.
 FATAL_ERRNOS = frozenset({errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS})
 # A permission error in the work directory, unlike one on a path of the mirror, would meet every file too.
-_WORK_FATAL_ERRNOS = FATAL_ERRNOS | {errno.EACCES, errno.EPERM}
+WORK_FATAL_ERRNOS = FATAL_ERRNOS | {errno.EACCES, errno.EPERM}
 # How a filesystem refuses a name it cannot hold, as exFAT refuses `?`.
 NAME_ERRNOS = frozenset({errno.EINVAL, errno.EILSEQ, errno.ENAMETOOLONG})
 # A path, or a folder on the way to it, that is missing or not a real folder.
@@ -857,7 +857,7 @@ def _work_errors(action: DiskAction, path: Path) -> Iterator[None]:
     try:
         yield
     except OSError as exc:
-        if exc.errno in _WORK_FATAL_ERRNOS:
+        if exc.errno in WORK_FATAL_ERRNOS:
             raise DestinationError.of(action, path, exc) from None
         raise
 

@@ -2,26 +2,26 @@
 of verified files are deleted, and, unless previews are turned off, each file that failed on Yandex's side gets
 Yandex's largest preview of it, saved below `.yandex-disk-rescue/previews/` and recorded in the manifest.
 
-The step never fails the run. A preview that cannot be fetched or saved is reported in `MirrorReport.preview_errors`,
-and the step goes on; a token Yandex rejects, or an error in the previews folder that no other preview would escape
-(`FATAL_ERRNOS`: a full disk or quota, an I/O error, a read-only filesystem), ends the step, and every file not
-handled yet is reported with that reason. Ctrl+C or SIGTERM ends the step only: the fetches in flight are dropped, a
-save already running in its worker thread is waited for and recorded, and the step returns normally with the files it
-did not get to counted in `MirrorReport.previews_pending`.
+The step never fails the run. A preview that cannot be fetched, saved or deleted is reported in
+`MirrorReport.preview_errors`, and the step goes on; a token Yandex rejects, or an error in the previews folder that no
+other preview would escape (`WORK_FATAL_ERRNOS`: a full disk or quota, an I/O error, a read-only filesystem, a
+permission error), ends the step, and every file not handled yet is reported with that reason. Ctrl+C or SIGTERM ends
+the step only: the fetches in flight are dropped, a save already running in its worker thread is waited for and
+recorded, and the step returns normally with the files it did not get to counted in `MirrorReport.previews_pending`.
 """
 
 import asyncio
 import logging
 import stat
-from collections.abc import Coroutine, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from pathlib import PurePosixPath
 
 from yandex_disk_rescue import api
-from yandex_disk_rescue.destination import FATAL_ERRNOS, PREVIEWS_DIR_NAME, Destination
+from yandex_disk_rescue.destination import PREVIEWS_DIR_NAME, WORK_FATAL_ERRNOS, Destination
 from yandex_disk_rescue.disk_threads import DiskThreads
 from yandex_disk_rescue.local_names import WORK_DIR_NAME
-from yandex_disk_rescue.manifest import Mirror, MirrorEntry, PreviewRecord, RemoteIdentity
-from yandex_disk_rescue.mirroring import Failure, MirrorReport, PreviewOnly
+from yandex_disk_rescue.manifest import Mirror, MirrorEntry, PreviewRecord, RemoteIdentity, verified_now
+from yandex_disk_rescue.mirroring import Failure, MirrorReport, PreviewOnly, concurrently
 from yandex_disk_rescue.progress import PreviewProgress
 from yandex_disk_rescue.units import format_size
 
@@ -69,7 +69,7 @@ async def save_previews(
             await step.remove_unfinished()
             await step.clean_up(entries.values())
             queue = iter(candidates)
-            await _concurrently([step.work(queue, entries) for _ in range(workers)])
+            await concurrently([step.work(queue, entries) for _ in range(workers)])
         except asyncio.CancelledError:
             task = asyncio.current_task()
             if task is None:
@@ -122,7 +122,7 @@ class _PreviewStep:
         for entry in entries:
             if self._stopped is not None:
                 return
-            if entry.preview is not None and _verified_now(entry):
+            if entry.preview is not None and verified_now(entry):
                 await self._remove(entry, entry.preview.path, forget=True)
 
     async def work(self, candidates: Iterator[Failure], entries: dict[str, MirrorEntry]) -> None:
@@ -216,9 +216,9 @@ class _PreviewStep:
     def _os_error(self, entry: MirrorEntry, failing: str, exc: OSError, *, settles: bool = True) -> None:
         """Report `exc` from `failing` as the preview error of `entry`; one no other preview would escape stops the
         step."""
-        if exc.errno in FATAL_ERRNOS:
+        if exc.errno in WORK_FATAL_ERRNOS:
             folder = self._destination.path / WORK_DIR_NAME / PREVIEWS_DIR_NAME
-            self._stopped = f'could not save previews in {folder}: {exc.strerror}'
+            self._stopped = f'could not use previews in {folder}: {exc.strerror}'
             self._failed(entry, self._stopped, settles=settles)
         else:
             self._failed(entry, f'{failing}: {exc.strerror}', settles=settles)
@@ -238,26 +238,7 @@ class _PreviewStep:
         self._progress.handled(saved=saved)
 
 
-def _verified_now(entry: MirrorEntry) -> bool:
-    """Whether the entry is a file whose download record is verified for its current identity."""
-    record = entry.download
-    if entry.resource.kind != 'file' or record is None or record.state != 'verified':
-        return False
-    return record.identity == RemoteIdentity.of(entry.resource)
-
-
 def _local_path(entry: MirrorEntry) -> PurePosixPath:
     if entry.local_path is None:
         raise ValueError(f'{entry.resource.path} has no local name')
     return entry.local_path
-
-
-async def _concurrently(calls: list[Coroutine[object, object, None]]) -> None:
-    """Run `calls` at once; the first exception one of them raises cancels the others and is raised once they have
-    all ended."""
-    try:
-        async with asyncio.TaskGroup() as group:
-            for call in calls:
-                group.create_task(call)
-    except BaseExceptionGroup as raised:
-        raise raised.exceptions[0] from None

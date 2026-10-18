@@ -186,7 +186,7 @@ yandex-disk-rescue/
 │   │                 #   no byte (throttling neither counts nor breaks it) and the unavailable-on-Yandex-Disk
 │   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, each failure
 │   │                 #   flagged `on_yandex` when its cause is on Yandex's side, the summary lines (with the
-│   │                 #   previews saved and not saved, and the partial files that could not be deleted once
+│   │                 #   previews saved and not saved or deleted, and the partial files that could not be deleted once
 │   │                 #   their file was recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
 │   │                 #   stay on the event loop; `mirror_document`, the run's JSON object
@@ -195,7 +195,7 @@ yandex-disk-rescue/
 │   │                 #   each file failed on Yandex's side fetched (unless one for its current version is
 │   │                 #   saved), saved in a worker thread and recorded, up to `api_concurrency` files at once
 │   │                 #   (without `fetch`, only those saved already are listed); per-file preview errors, a step
-│   │                 #   that a rejected token or a full or failing disk ends, and Ctrl+C or SIGTERM ending only
+│   │                 #   that a rejected token or a full, failing or unwritable disk ends, and Ctrl+C or SIGTERM ending only
 │   │                 #   the step (a save in progress finished and recorded first)
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
 │   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each

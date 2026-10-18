@@ -46,6 +46,7 @@ from yandex_disk_rescue.manifest import (
     MirrorEntry,
     RemoteIdentity,
     VerifyPass,
+    verified_now,
 )
 from yandex_disk_rescue.mirroring import (
     Digest,
@@ -137,7 +138,7 @@ class VerifyRun:
         self._progress = progress
         self._entries = [e for e in mirror.entries() if e.resource.kind == 'file']
         through = verify_pass.checked_through
-        verified = [e for e in self._entries if _verified_now(e)]
+        verified = [e for e in self._entries if verified_now(e)]
         pending = [e for e in verified if through is None or e.resource.path > through]
         self._pending = {e.entry_id for e in pending}
         self._verified = {e.entry_id for e in verified}
@@ -322,11 +323,6 @@ def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity, read: C
         digest.update(digest.size, chunk)
         read(len(chunk))
     return digest.mismatch(identity)
-
-
-def _verified_now(entry: MirrorEntry) -> bool:
-    record = entry.download
-    return record is not None and record.state == 'verified' and record.identity == RemoteIdentity.of(entry.resource)
 
 
 def _saved_preview(entry: MirrorEntry) -> PurePosixPath | None:

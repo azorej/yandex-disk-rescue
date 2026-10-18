@@ -409,6 +409,14 @@ class MirrorEntry:
     preview: PreviewRecord | None  # the saved preview image; kept by every other record and by a rescan
 
 
+def verified_now(entry: MirrorEntry) -> bool:
+    """Whether `entry` is a file whose download record is verified for its current identity."""
+    record = entry.download
+    if entry.resource.kind != 'file' or record is None or record.state != 'verified':
+        return False
+    return record.identity == RemoteIdentity.of(entry.resource)
+
+
 @dataclass(frozen=True)
 class UnencodableEntry:
     """An entry a scan left out because its path is not valid Unicode (it holds a lone surrogate)."""

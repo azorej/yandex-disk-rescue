@@ -1,7 +1,7 @@
 """The Yandex Disk REST API client (account check, folder listing, download links, previews, error mapping, pacing
 and retries) and the content client that fetches file bytes from the download host."""
 
-from yandex_disk_rescue.api.client import PREVIEW_HOST, PREVIEW_SIZE, ApiLimits, DiskClient
+from yandex_disk_rescue.api.client import ApiLimits, DiskClient
 from yandex_disk_rescue.api.errors import (
     DiskApiError,
     DownloadRefusedError,
@@ -27,8 +27,6 @@ from yandex_disk_rescue.api.user_agent import USER_AGENT
 
 __all__ = [
     'MAX_PAUSE_SECONDS',
-    'PREVIEW_HOST',
-    'PREVIEW_SIZE',
     'ROOT',
     'USER_AGENT',
     'Account',

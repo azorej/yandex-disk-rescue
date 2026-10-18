@@ -108,6 +108,7 @@ from yandex_disk_rescue.manifest import (
     Segment,
     UnencodableEntry,
     VerifiedBy,
+    verified_now,
 )
 from yandex_disk_rescue.progress import ActiveFile, MirrorProgress, MoveProgress, Outcome, TransferState
 from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
@@ -869,7 +870,9 @@ class MirrorRun:
 
     def _check(self, destination: Destination) -> set[int]:
         """The files whose verified copy is still in place, by an `lstat` of each candidate."""
-        candidates = [e for e in self._entries if e.entry_id not in self._held and _verified_now(e)]
+        candidates = [
+            e for e in self._entries if e.entry_id not in self._held and e.finding is None and verified_now(e)
+        ]
         if not candidates:
             return set()
         self._progress.start_checking(len(candidates), str(destination.path))
@@ -2025,7 +2028,7 @@ class _FileFetch:
             await self._fetch([stream])
 
     async def _fetch(self, streams: list[_Stream]) -> None:
-        results = await _concurrently([self._stream(stream) for stream in streams if stream.pending])
+        results = await concurrently([self._stream(stream) for stream in streams if stream.pending])
         deferred = [result for result in results if result is not None]
         if deferred:
             waits = [failure.retry_after for failure in deferred if failure.retry_after is not None]
@@ -2116,7 +2119,7 @@ class _FileFetch:
                 self._progress.disconnected()
 
 
-async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]:
+async def concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]:
     """The results of `calls`, run at once. The first exception one of them raises cancels the others and, once they
     have all ended, is raised itself, with what the others raised meanwhile added as notes."""
     try:
@@ -2125,7 +2128,7 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
     except BaseExceptionGroup as raised:
         first, *others = raised.exceptions
         for other in others:
-            first.add_note(f'Also raised while the file was stopping: {type(other).__name__}: {other}')
+            first.add_note(f'Also raised while the others were stopping: {type(other).__name__}: {other}')
         raise first from None
     return [task.result() for task in tasks]
 
@@ -2134,8 +2137,8 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
     files, renamed entries, the copies found unreadable, what was moved aside, quarantined files with their reasons and
     copies, failures with their reasons, with a hint when any is unavailable on Yandex Disk, the failed files saved only
-    as a preview, the previews not saved with their reasons, how many failed files an interrupted preview step left,
-    and the partial files not deleted; each list shows its first `limit` members (`None`: all)."""
+    as a preview, the previews not saved or deleted with their reasons, how many failed files an interrupted preview
+    step left, and the partial files not deleted; each list shows its first `limit` members (`None`: all)."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
@@ -2178,7 +2181,7 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         shown = [f'{saved.path} -> {saved.preview}' for saved in report.preview_only]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.preview_errors:
-        lines.append(f'Previews not saved: {len(report.preview_errors)}')
+        lines.append(f'Previews not saved or deleted: {len(report.preview_errors)}')
         shown = [f'{error.path}: {error.reason}' for error in report.preview_errors]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.previews_pending:
@@ -2295,14 +2298,6 @@ def quarantined_reason(held: QuarantinedFile) -> str:
 def quarantined_document(held: QuarantinedFile) -> dict[str, object]:
     """The JSON object of the quarantined file `held`."""
     return {'path': held.path, 'reason': held.reason, 'last_retry': held.last_retry, 'copy': str(held.copy)}
-
-
-def _verified_now(entry: MirrorEntry) -> bool:
-    """Whether the entry is a file verified for its current identity, with no finding."""
-    record = entry.download
-    if entry.resource.kind != 'file' or record is None or record.state != 'verified' or entry.finding is not None:
-        return False
-    return record.identity == RemoteIdentity.of(entry.resource)
 
 
 def _in_place(entry: MirrorEntry, destination: Destination) -> bool:
