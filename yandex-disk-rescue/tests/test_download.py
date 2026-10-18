@@ -230,11 +230,12 @@ def _journal() -> list[tuple[int, int, int, str | None]]:
         return []
 
 
-def _failure_records() -> list[tuple[str, str]]:
-    """The (remote path, reason) of every failure record in the manifest, read with a connection of its own."""
+def _failure_records() -> list[tuple[str, str, int]]:
+    """The (remote path, reason, failed turns) of every failure record in the manifest, read with a connection of its
+    own."""
     with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
         return connection.execute(
-            'SELECT e.path, f.reason FROM failures f JOIN entries e ON e.id = f.entry_id ORDER BY e.path'
+            'SELECT e.path, f.reason, f.turns FROM failures f JOIN entries e ON e.id = f.entry_id ORDER BY e.path'
         ).fetchall()
 
 
@@ -418,7 +419,7 @@ def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_wit
     shown = f'Quarantined: 1\n  {path}: {reason}; last retry: the download host 127.0.0.1 returned HTTP 503'
     assert shown in retry.stdout
     assert 'Failed' not in retry.stdout
-    assert [failed for failed, _ in _failure_records()] == [path]
+    assert [failed for failed, *_ in _failure_records()] == [path]
 
     plain = run_download(str(dest))
 
@@ -1753,6 +1754,7 @@ def test_a_file_stalled_in_one_pass_resumes_in_the_next_with_a_fresh_link(big, d
     assert _fetches(big, BIG_PATH) == [None, _tail(300_000), _tail(300_000)]
     assert _linked(big).count(BIG_PATH) == 2
     assert _partials(dest) == []
+    assert _failure_records() == []
 
 
 def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succeed(big, dest):
@@ -1767,7 +1769,15 @@ def test_a_file_stalled_on_every_pass_fails_after_the_last_and_the_others_succee
     ) in result.stdout
     assert _fetches(big, BIG_PATH) == [None, None]
     assert _others_verified(dest, BIG_PATH)
-    assert _failure_records() == [(BIG_PATH, f'the download stalled: no data for {STALL_TIMEOUT} s (after 2 passes)')]
+    stalled = f'the download stalled: no data for {STALL_TIMEOUT} s (after 2 passes)'
+    assert _failure_records() == [(BIG_PATH, stalled, 2)]
+    big.inject('GET', '/download', STALL, STALL, where={'path': BIG_PATH})
+
+    again = run_download('--download-timeout', STALL_TIMEOUT, '--download-passes', '2', str(dest))
+
+    assert again.exit_code == 1
+    assert _fetches(big, BIG_PATH) == [None, None, None, None]
+    assert _failure_records() == [(BIG_PATH, stalled, 4)]
 
 
 def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_others(disk, dest):
@@ -1777,7 +1787,7 @@ def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_other
 
     assert first.exit_code == 1
     assert f'Failed: 1\n  {failed}: ' in first.stdout
-    assert [path for path, _ in _failure_records()] == [failed]
+    assert [path for path, *_ in _failure_records()] == [failed]
 
     disk.add_file('disk:/New/n.txt', b'new', modified=MODIFIED)
     # A plain run would fetch this one again; a retry never looks at it.
@@ -1811,7 +1821,7 @@ def test_retry_failed_makes_a_failed_folder_and_the_files_under_it(disk, dest, m
 
     assert first.exit_code == 1
     assert 'Failed: 2\n  disk:/Q?: the destination filesystem refuses the name Q? ' in first.stdout
-    assert [path for path, _ in _failure_records()] == ['disk:/Q?', 'disk:/Q?/x.txt']
+    assert [path for path, *_ in _failure_records()] == ['disk:/Q?', 'disk:/Q?/x.txt']
 
     refusing = False
     retry = run_download('--retry-failed', str(dest))
@@ -2613,7 +2623,7 @@ def test_a_file_larger_than_the_room_of_the_partial_folder_fails_and_a_retry_wit
     reason = f'larger than the room in the partial folder {folder} (1.0 MiB needed, 512.0 KiB available)'
     assert _room_line(dest, partial_root, MiB // 2) in result.stdout
     assert f'Failed: 1\n  {BIG_PATH}: {reason}\n' in result.stdout
-    assert _failure_records() == [(BIG_PATH, reason)]
+    assert _failure_records() == [(BIG_PATH, reason, 1)]
     assert _fetches(big, BIG_PATH) == []
     assert _partials(dest, partial_root) == []
     assert _others_verified(dest, BIG_PATH)
@@ -2645,7 +2655,7 @@ def test_a_file_waiting_for_room_is_deferred_when_the_last_running_file_is_defer
     allocated = kept.stat().st_blocks * 512
     folder = _separate_folder(dest, partial_root)
     waited = f'no room yet in the partial folder {folder} (1.0 MiB needed, {format_size(free - allocated)} available)'
-    assert [reason for path, reason in _failure_records() if path == BIG2_PATH] == [waited]
+    assert [(reason, turns) for path, reason, turns in _failure_records() if path == BIG2_PATH] == [(waited, 1)]
     assert _content_started(big, BIG2_PATH) == []
     earlier = len(big.requests)
 
@@ -2658,6 +2668,31 @@ def test_a_file_waiting_for_room_is_deferred_when_the_last_running_file_is_defer
     assert (dest / 'big.bin').read_bytes() == BIG
     assert (dest / 'big2.bin').read_bytes() == BIG2
     assert _partials(dest, partial_root) == []
+
+
+def test_a_file_failed_once_and_then_only_waiting_for_room_counts_one_failed_turn_with_the_reason_it_is_reported_with(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.inject('GET', '/download', STALL, where={'path': BIG_PATH})
+    big.inject('GET', '/download', Truncate(after_bytes=600_000), STALL, where={'path': BIG2_PATH})
+    # One large file fits; once big2.bin keeps its partial file, big.bin no longer fits next to it.
+    _free(monkeypatch, MiB + MiB // 8)
+    args = ('--download-timeout', STALL_TIMEOUT, '--download-retries', '0', *_partial_args(partial_root))
+
+    result = run_download(*args, '--download-passes', '2', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    assert 'Passes: 2 of 2\n' in result.stdout
+    assert _fetches(big, BIG_PATH) == [None]
+    records = _failure_records()
+    assert [(path, turns) for path, _, turns in records] == [(BIG_PATH, 1), (BIG2_PATH, 2)]
+    [(_, waited, _), (_, stalled, _)] = records
+    folder = _separate_folder(dest, partial_root)
+    assert waited.startswith(f'no room yet in the partial folder {folder} (1.0 MiB needed, ')
+    assert waited.endswith(' (after 2 passes)')
+    assert stalled == f'the download stalled: no data for {STALL_TIMEOUT} s (after 2 passes)'
+    assert f'Failed: 2\n  {BIG_PATH}: {waited}\n  {BIG2_PATH}: {stalled}\n' in result.stdout
 
 
 def test_a_kept_sparse_partial_file_takes_only_the_room_it_allocates(segmented, dest, partial_root, monkeypatch):
@@ -3110,6 +3145,22 @@ def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_
     assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert len(_fetches(big, BIG_PATH)) == 2
     assert _partial_size(dest) == 300_000
+    stalled = 'the download stalled: no data for 1 s (after 2 attempts)'
+    assert _failure_records() == [(BIG_PATH, stalled, 1)]
+
+    checked = runner.invoke(app, ['verify', str(dest)])
+
+    assert checked.exit_code == 1
+    assert f'Not downloaded: 1\n  {BIG_PATH}: {stalled}\n' in checked.stdout
+
+    retry = run_download('--retry-failed', 'disk:/Big', str(dest))
+
+    assert retry.exit_code == 0, retry.output
+    assert f'Retrying 1 failed, quarantined, unfinished or broken file ({format_size(len(BIG))}) in {dest}\n' in (
+        retry.stdout
+    )
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _failure_records() == []
 
 
 # Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, an fsync of a partial file

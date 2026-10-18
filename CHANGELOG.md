@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Changed
 
+- A file whose transfer failed is recorded as failed at once, before its later passes, so a run stopped between
+  passes still lists it for `download --retry-failed` and `verify`. The manifest counts each entry's failed turns
+  (schema version 10).
 - Every HTTP request names the tool in its `User-Agent`:
   `yandex-disk-rescue/<version> (+https://github.com/azorej/yandex-disk-rescue)`.
 

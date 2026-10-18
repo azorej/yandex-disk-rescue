@@ -612,10 +612,16 @@ class MirrorRun:
     holds every file whose quarantine record is for its current identity: such a file is reported as quarantined
     without being looked at.
 
-    Every entry that fails gets a failure record with the reason when the failure happens; an entry verified, adopted
-    or made in place loses it. A failed entry is reported as failed, or as quarantined when its quarantine record is
-    for its current identity, the failure then shown as its last retry. Each entry the manifest records as left out of
-    its scan, because its name is not valid Unicode, is a failure of the run, and has no record.
+    Every failed turn of an entry is counted and recorded when it fails, in the entry's failure record with the
+    reason it is reported with and its failed turns since it last succeeded: a file that fails, a folder that cannot
+    be made, an entry below such a folder, and a file deferred by a transient failure. A file deferred for room was
+    not tried, and counts nothing. A file reported failed once the passes end counts one more failed turn only when
+    this run counted none for it; otherwise the report restates its record with the reason it is reported with and
+    the same count. A turn cancelled by Ctrl+C, SIGTERM or an error that stops the run counts nothing, and the file
+    keeps the record of its last failed turn. An entry verified, adopted or made in place loses its record. A failed
+    entry is reported as failed, or as quarantined when its quarantine record is for its current identity, the
+    failure then shown as its last retry. Each entry the manifest records as left out of its scan, because its name
+    is not valid Unicode, is a failure of the run, and has no record.
 
     A copy found unreadable gets its `corrupt` finding recorded and a notice when it is found, and is listed under
     `unreadable` whatever then happens to the file; a later pass of the run gives the file that finding, so the copy
@@ -639,6 +645,8 @@ class MirrorRun:
         destination.keep_partials(self._in_progress)
         self._current = self._check(destination)
         self._unreadable: dict[int, Finding] = {}
+        self._failed_turns = {e.entry_id: e.failure.turns for e in self._entries if e.failure is not None}
+        self._counted: set[int] = set()
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
         self._moved: list[tuple[MirrorEntry, tuple[Segment, ...], int]] = []
@@ -818,7 +826,7 @@ class MirrorRun:
                 if local.name != entry.resource.path.rpartition('/')[2]:
                     _note_renamed(report, entry, local)
                 if entry.entry_id in self._held:
-                    held = held_copy(entry, entry.failure)
+                    held = held_copy(entry, None if entry.failure is None else entry.failure.reason)
                     _log.debug('%s held in quarantine: kept at %s', entry.resource.path, held.copy)
                     report.quarantined.append(held)
                 elif reason := _blocked_by(local, blocked):
@@ -895,7 +903,7 @@ class MirrorRun:
         suffix = f' (after {used} passes)' if used > 1 else ''
         for entry, failure in deferred:
             reason = failure.final if stuck and isinstance(failure, NoRoomYet) else failure.reason + suffix
-            self._fail(tools.report, entry, reason)
+            self._fail(tools.report, entry, reason, new_turn=entry.entry_id not in self._counted)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -904,10 +912,14 @@ class MirrorRun:
         """One file's turn in a pass; a deferred file is added to `deferred`."""
         if (later := await self._download(entry, tools)) is not None:
             _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
+            if not isinstance(later, NoRoomYet):
+                self._mirror.record_failure(entry.entry_id, later.reason, turns=self._count_failed_turn(entry))
             self._progress.defer(entry.entry_id)
             deferred.append((entry, later))
 
-    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str) -> None:
+    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str, *, new_turn: bool = True) -> None:
+        """Report `entry` as failed for `reason` and record it; `new_turn` counts one more failed turn, otherwise the
+        record keeps the count this run already gave it."""
         path = entry.resource.path
         outcome: Outcome
         if is_held(entry):
@@ -919,8 +931,16 @@ class MirrorRun:
             _log.warning('%s failed: %s', path, reason)
             report.failed.append(Failure(entry.resource.path, reason))
             outcome = 'failed'
-        self._mirror.record_failure(entry.entry_id, reason)
+        turns = self._count_failed_turn(entry) if new_turn else self._failed_turns[entry.entry_id]
+        self._mirror.record_failure(entry.entry_id, reason, turns=turns)
         self._settle(entry, outcome)
+
+    def _count_failed_turn(self, entry: MirrorEntry) -> int:
+        """Count one more failed turn of `entry`; its failed turns since it last succeeded."""
+        turns = self._failed_turns.get(entry.entry_id, 0) + 1
+        self._failed_turns[entry.entry_id] = turns
+        self._counted.add(entry.entry_id)
+        return turns
 
     def _settle(self, entry: MirrorEntry, outcome: Outcome) -> None:
         if entry.entry_id in self._pending:

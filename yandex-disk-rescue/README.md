@@ -73,9 +73,12 @@ mirror up by its destination without creating one.
   `Mirror.checkpoint` moves its confirmed offsets, `Mirror.download` reads the record as it is now; verifying or
   forgetting the download deletes its journal. A partial record from schema version 3 or older gets one segment
   confirming nothing on the upgrade, so its file is downloaded again from byte 0.
-- A failure record (`failures`) holds the reason the entry's last turn in the mirror failed, for files and folders
-  alike. `Mirror.record_failure` replaces any earlier reason and `Mirror.clear_failure` drops it; verifying the
-  entry's file (`record_verified`) drops it too, while `forget` keeps it. `MirrorEntry.failure` reads it.
+- A failure record (`failures`) holds, for files and folders alike, the reason the entry's last failed turn in the
+  mirror was reported with and the count of its failed turns there since it last succeeded (at least 1).
+  `Mirror.record_failure(entry_id, reason, turns=…)` replaces any earlier record (the caller owns the count) and
+  `Mirror.clear_failure` drops it; verifying the entry's file (`record_verified`) drops it too, while `forget` keeps
+  it. `MirrorEntry.failure` reads it as a `FailureRecord`. A failure record from schema version 9 or older counts 1
+  failed turn on the upgrade.
 - A quarantine record (`quarantined`) holds the copy of the entry's last download that failed verification: its
   path relative to the destination, the reason, and the remote identity the download was for.
   `Mirror.record_quarantined` replaces any earlier record and deletes the entry's download record (with its journal)
@@ -164,7 +167,8 @@ yandex-disk-rescue/
 │   │                 #   hashing the bytes copied; quarantining a file that fails; move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
-│   │                 #   failure records written as entries fail and dropped as they succeed, the summary
+│   │                 #   failure records written and counted as each turn fails (also one deferred to a
+│   │                 #   later pass) and dropped as entries succeed, the summary
 │   │                 #   lines (with the partial files that could not be deleted once their file was
 │   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names

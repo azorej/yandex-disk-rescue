@@ -464,14 +464,17 @@ stream, never appended to the bytes kept.
   pass its reason is `download link rejected again after a refresh (HTTP <n>)`.
 
 **Retrying failures.** Every file or folder a run reports under `Failed` is
-recorded in the manifest for that DEST with the reason shown, as soon as it
-fails: a file still failing after the last pass, a refused download, a file
-changed or removed in the cloud, a local error, a hard link to another file of
-the mirror, a refused name, a folder that could not be made, and every entry
-under such a folder. The record is dropped once the entry succeeds: a file
-verified or adopted, a folder made or found in place. Files stopped by Ctrl+C,
-SIGTERM or an error that stops the run get no failure record; their unfinished
-downloads stay recorded as partial.
+recorded in the manifest for that DEST, as soon as a turn of it fails: a
+refused download, a file changed or removed in the cloud, a local error, a
+hard link to another file of the mirror, a refused name, a folder that could
+not be made, every entry under such a folder, and a transient transfer failure
+that waits for a later pass. The record holds the reason last shown and the
+count of failed turns since the entry last succeeded; a file still failing
+after the last pass keeps the count and gets the reason it is reported with.
+The record is dropped once the entry succeeds: a file verified or adopted, a
+folder made or found in place. A turn stopped by Ctrl+C, SIGTERM or an error
+that stops the run records nothing: the file keeps any earlier record, and its
+unfinished download stays recorded as partial.
 
 A quarantined file gets no failure record and is not listed under `Failed`.
 When a retry of a quarantined file fails (a stall, say), the failure is
