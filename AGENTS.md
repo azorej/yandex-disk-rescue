@@ -61,6 +61,9 @@ mise run format         # Auto-fix lint issues and format
 mise run test           # Pytest; extra args pass through: mise run test -- -k greet
 mise run ci             # Full CI pipeline in Dagger — exactly what GitHub Actions runs
 mise run ci:selftest    # Tests for the Dagger module itself
+mise run ci:package     # Build, twine-check and install-smoke the wheel (uv tool, pipx) in Dagger
+mise run release:dist <tag>   # Rehearse a release up to the upload, into release/ (dist/ + notes.md)
+mise run release:verify <tag> # Check that PyPI serves release/dist/ and the version installs by name
 mise run lock           # Upgrade all dependencies in uv.lock
 mise run dagger:develop # Regenerate the Dagger SDK (after a Dagger version bump)
 mise tasks              # List every task
@@ -75,11 +78,12 @@ commands — never a raw `python`, `pip`, or `.venv/bin/...`.
 ├── yandex-disk-rescue/   # Workspace member: the CLI and its internals (Typer)
 ├── .dagger/              # Dagger module `repo-ci` (CI pipeline) + tests/ (its own tests)
 ├── .devcontainer/        # Ubuntu devcontainer: mise, Claude Code, Docker-in-Docker
-├── .github/              # CI workflow, PR template
+├── .github/              # Workflows, PR template, Dependabot config
 ├── .agents/skills/       # Agent skills (canonical); .claude/skills/ symlinks to them
 ├── .claude/              # Claude Code: shared settings, hooks, subagents
 ├── docs/                 # Guides; docs/plans/ holds implementation plans
 ├── scripts/              # Standalone helper scripts (not dev tasks — those are mise tasks)
+├── CHANGELOG.md          # Release notes (Keep a Changelog): `[Unreleased]`, then one section per version
 ├── mise.toml             # Tool versions, env, tasks
 ├── pyproject.toml        # Workspace root: members, dev deps, ruff/pytest config
 └── uv.lock               # Lock file — generated, never edited by hand
@@ -135,19 +139,38 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
 | Dagger engine | `dagger.json` + `.dagger/tests/dagger.json` (must equal the CLI) |
 | uv/Python image for CI | `UV_IMAGE` in `.dagger/src/repo_ci/main.py` |
 | ruff, pytest, pre-commit, libraries | `uv.lock` |
+| zizmor, actionlint, shellcheck | `uv.lock` |
+| uv_build (build backend) | range in `yandex-disk-rescue/pyproject.toml` and `.dagger/pyproject.toml`, moved together with uv in `mise.toml` |
 | pre-commit hook repos | `.pre-commit-config.yaml` |
+| GitHub Actions | full commit SHA in `.github/workflows/*.yml` (updated by Dependabot) |
 | mise, base OS | `.devcontainer/Dockerfile` |
 
 ### CI (Dagger + GitHub Actions)
 
 - Pipeline logic lives in the Dagger module (`.dagger/src/repo_ci/`);
   the workflow (`.github/workflows/ci.yml`) is a thin caller of `mise run`
-  tasks. A green `mise run ci` locally means a green CI run.
+  tasks. Each lane runs the same mise task locally: `Lint & test` is
+  `mise run ci`, `Dagger module tests` is `mise run ci:selftest`,
+  `Package & install smoke` is `mise run ci:package`; `Pre-commit hooks`
+  runs `pre-commit run --all-files`. Green tasks locally mean a green CI run.
 - Pull requests run only the lanes their paths touch; pushes to `main`,
   the weekly schedule and manual dispatch run everything. Branch
   protection requires the single `CI required` check.
 - When adding a lane: add a Dagger function, a mise task, a job in
   `ci.yml`, its path filter, and add the job to `required.needs`.
+- Workflows are linted by actionlint (with shellcheck) and `zizmor
+  --offline` as pre-commit hooks, so in the `hygiene` lane and on every
+  local commit. A new `uses:` is pinned to a full commit SHA with its
+  release tag as a comment (`@<sha> # vX.Y.Z`), and `actions/checkout`
+  sets `persist-credentials: false`. Fix a zizmor finding; only a false
+  positive gets an inline `# zizmor: ignore[<audit>]` with the reason.
+- Releases: a pushed `v*` tag runs `.github/workflows/release.yml`
+  (`dist` → `publish-pypi` → `verify-pypi` → `github-release`). It is the
+  one exception to "thin caller of mise tasks": publishing uses
+  `pypa/gh-action-pypi-publish` with Trusted Publishing (OIDC, no stored
+  secret), in a job that holds `id-token: write` and runs no repository
+  code, so nothing local can ever publish. Everything else is Dagger behind
+  `mise run release:dist` / `release:verify`.
 
 ### Dockerfiles and the devcontainer
 
@@ -162,6 +185,9 @@ outdated` lists newer tools; `mise run lock` upgrades Python deps):
   `chore:`, `docs:`, …); squash-merge PRs.
 - Never commit secrets. Local secrets go in `.env` (git-ignored; mise
   loads it — see `.env.example`).
+- A user-visible change adds a line under `## [Unreleased]` in
+  `CHANGELOG.md` in the same PR.
+- Releases: see "Releasing" in [`CONTRIBUTING.md`](CONTRIBUTING.md#releasing).
 
 ## Agent Workflow
 

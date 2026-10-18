@@ -52,6 +52,20 @@ depends = ["lint", "test"]
 description = "Run the full CI pipeline in Dagger — the same thing GitHub Actions runs"
 run = "dagger call check"
 
+[tasks."ci:package"]
+description = "Build, check and install-smoke the distributions in Dagger"
+run = "dagger call package"
+
+[tasks."release:dist"]
+description = "Check the tag and CHANGELOG, build, check and install-smoke a release into release/"
+usage = 'arg "<tag>" help="The release tag: v + the project version"'
+run = 'dagger call release --tag="${usage_tag?}" export --path=release --wipe'
+
+[tasks."release:verify"]
+description = "Check that PyPI serves release/dist/ and that the version installs by name"
+usage = 'arg "<tag>" help="The release tag: v + the published version"'
+run = 'dagger call published --tag="${usage_tag?}" --dist=release/dist'
+
 [tasks."ci:selftest"]
 description = "Run the Dagger module's own tests (.dagger/tests)"
 dir = ".dagger/tests"

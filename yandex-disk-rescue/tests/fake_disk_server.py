@@ -13,7 +13,8 @@ import re
 import threading
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -445,7 +446,9 @@ def _handler_for(api: FakeDiskApi) -> type[BaseHTTPRequestHandler]:
     return Handler
 
 
-def start_fake_disk_server() -> tuple[FakeDiskApi, ThreadingHTTPServer, threading.Thread]:
+@contextmanager
+def serve() -> Iterator[FakeDiskApi]:
+    """The fake API listening on a free 127.0.0.1 port, at its `base_url`, until the block exits."""
     api = FakeDiskApi(base_url='')
     server = ThreadingHTTPServer(('127.0.0.1', 0), _handler_for(api))
     server.daemon_threads = True
@@ -453,4 +456,9 @@ def start_fake_disk_server() -> tuple[FakeDiskApi, ThreadingHTTPServer, threadin
     api.base_url = f'http://{host}:{port}'
     thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01}, daemon=True)
     thread.start()
-    return api, server, thread
+    try:
+        yield api
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()

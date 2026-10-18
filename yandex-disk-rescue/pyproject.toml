@@ -1,26 +1,45 @@
 [project]
 name = "yandex-disk-rescue"
-version = "0.1.0"
+version = "1.0.0rc1"
 description = "Linux CLI that downloads everything from a Yandex Disk account: resumable, verified, rate-limit aware"
 authors = [
     {name = "Leonid Kozhinov", email = "azorej@gmail.com"}
 ]
-readme = "README.md"
+readme = "PYPI.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
-dependencies = [
-    "httpx>=0.28.1",
-    "rich>=15.0.0",
-    "tenacity>=9.1.4",
-    "typer>=0.27.3",
+keywords = ["yandex", "yandex-disk", "backup", "download", "mirror", "cli"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: System :: Archiving :: Backup",
+    "Topic :: Utilities",
 ]
+dependencies = [
+    "httpx>=0.28.1,<1",
+    "rich>=15.0.0,<16",
+    "tenacity>=9.1.4,<10",
+    "typer>=0.27.3,<1",
+]
+
+[project.urls]
+Homepage = "https://github.com/azorej/yandex-disk-rescue"
+Repository = "https://github.com/azorej/yandex-disk-rescue"
+Documentation = "https://github.com/azorej/yandex-disk-rescue/blob/main/README.md"
+Issues = "https://github.com/azorej/yandex-disk-rescue/issues"
+Changelog = "https://github.com/azorej/yandex-disk-rescue/blob/main/CHANGELOG.md"
 
 [project.scripts]
 yandex-disk-rescue = "yandex_disk_rescue.cli:app"
 
 [build-system]
-requires = ["hatchling>=1.32.4"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/yandex_disk_rescue"]
+# The range follows uv in mise.toml, like the one in .dagger/pyproject.toml.
+requires = ["uv_build>=0.13.1,<0.14"]
+build-backend = "uv_build"

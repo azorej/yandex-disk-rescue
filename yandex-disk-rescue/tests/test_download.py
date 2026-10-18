@@ -129,9 +129,24 @@ def _separate_folder(dest, partial_root):
 
 
 def _partials(dest, partial_root=None) -> list:
-    """The partial files of `dest`: in its own partial folder, or in its folder below `partial_root`."""
+    """The partial files of `dest`: in its own partial folder, or in its folder below `partial_root`, without the
+    run's transient rename probes."""
     folder = dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
-    return sorted(folder.iterdir()) if folder.is_dir() else []
+    if not folder.is_dir():
+        return []
+    return sorted(path for path in folder.iterdir() if path.name not in destination_module._PROBE_NAMES)
+
+
+def _partial_sizes(dest) -> list[int]:
+    """The sizes of the partial files of `dest` while a run changes them: a file deleted after it is listed is left
+    out."""
+    sizes = []
+    for partial in _partials(dest):
+        try:
+            sizes.append(partial.stat().st_size)
+        except FileNotFoundError:
+            continue
+    return sizes
 
 
 def _partial_args(partial_root) -> tuple[str, ...]:
@@ -177,7 +192,7 @@ def _below(path: str, folder) -> bool:
 
 
 def _partial_size(dest) -> int:
-    return sum(partial.stat().st_size for partial in _partials(dest))
+    return sum(_partial_sizes(dest))
 
 
 def _fetches(fake, path: str, since: int = 0) -> list[str | None]:
@@ -2623,7 +2638,10 @@ async def test_with_a_partial_folder_a_file_in_progress_shows_how_far_its_copy_t
     async with _mirror_run(big, 'disk:/Big', dest, partial_dir=partial_root, progress=progress) as run:
         task = asyncio.create_task(run())
         try:
-            await _until(lambda: states() == ['copying', waiting], f'one file copying and the other {waiting}')
+            await _until(
+                lambda: held.is_set() and states() == ['copying', waiting],
+                f'one file held after its first chunk and the other {waiting}',
+            )
             [copying] = [transfer for transfer in progress.snapshot().active if transfer.state == 'copying']
         finally:
             release.set()
@@ -2817,7 +2835,7 @@ def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_
     def failing_once_the_others_have_bytes(src, dst, *, src_dir_fd, dst_dir_fd):
         if dst == 'z.txt':
             deadline = time.monotonic() + 10
-            while sum(p.stat().st_size >= 64 * 1024 for p in _partials(dest)) < len(slow):
+            while sum(size >= 64 * 1024 for size in _partial_sizes(dest)) < len(slow):
                 assert time.monotonic() < deadline, 'the slow files never received a chunk'
                 time.sleep(0.01)
             failing.set()
@@ -2962,7 +2980,7 @@ def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error
     child = start_command('download', 'disk:/Stop', str(dest))
     try:
         wait_until(
-            lambda: sum(p.stat().st_size >= 64 * 1024 for p in _partials(dest)) == len(slow),
+            lambda: sum(size >= 64 * 1024 for size in _partial_sizes(dest)) == len(slow),
             child,
             'wrote a chunk of every slow file',
         )

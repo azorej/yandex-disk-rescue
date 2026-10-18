@@ -31,14 +31,15 @@ jobs:
     name: Detect changed paths
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: read
+      pull-requests: read # dorny/paths-filter lists a pull request's changed files through the API
     # Each output is an explicit boolean: dorny's 'false' is a non-empty
     # (truthy) string, so `steps.filter.outputs.x || ...` would be wrong.
     outputs:
       python: ${{ steps.filter.outputs.python == 'true' || github.event_name != 'pull_request' }}
       dagger: ${{ steps.filter.outputs.dagger == 'true' || github.event_name != 'pull_request' }}
+      package: ${{ steps.filter.outputs.package == 'true' || github.event_name != 'pull_request' }}
     steps:
-      - uses: dorny/paths-filter@v4
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
         if: github.event_name == 'pull_request'
         with:
@@ -53,6 +54,14 @@ jobs:
               - '**/*.py'
               - '**/*.md'  # ruff formats code blocks in Markdown
               - '**/pyproject.toml'
+              - '**/LICENSE'
+              - 'uv.lock'
+              - '.python-version'
+            package:
+              - *dagger
+              - 'yandex-disk-rescue/**'
+              - 'LICENSE'
+              - 'pyproject.toml'
               - 'uv.lock'
               - '.python-version'
 
@@ -63,8 +72,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           install_args: dagger
       # Same entry point as local `mise run ci`. Never pipe `dagger` output:
@@ -80,11 +91,30 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           install_args: dagger
       - run: mise run ci:selftest
+        env:
+          DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
+
+  package:
+    name: Package & install smoke
+    needs: changes
+    if: needs.changes.outputs.package == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
+        with:
+          install_args: dagger
+      - run: mise run ci:package
         env:
           DAGGER_CLOUD_TOKEN: ${{ secrets.DAGGER_CLOUD_TOKEN }}
 
@@ -93,8 +123,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
-      - uses: jdx/mise-action@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           install_args: python uv
       - run: uv sync --locked
@@ -109,7 +141,7 @@ jobs:
   required:
     name: CI required
     if: always()
-    needs: [changes, check, dagger-selftest, hygiene]
+    needs: [changes, check, dagger-selftest, package, hygiene]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
