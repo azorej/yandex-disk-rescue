@@ -37,6 +37,7 @@ from yandex_disk_rescue.logs import (
     LogFile,
     Notices,
     notice,
+    stderr_failures,
     stderr_through,
     timestamp,
     write_stderr,
@@ -128,7 +129,6 @@ class Output:
         self._options = options
         self._terminal = terminal
         self._view: LiveView | None = None
-        self._status_to_stderr = options.progress and options.verbosity != 'quiet' and not terminal
         self._document: Mapping[str, object] | None = None
 
     @property
@@ -167,27 +167,18 @@ class Output:
         goes to the log file; when the context exits, on every path, the phase's last line goes there too. Unless
         `--no-progress` or `--quiet` was given, stderr shows the phase too: on a terminal as a live view, cleared on
         every exit, with every notice and report line printed above it; anywhere else each status line goes to stderr
-        as a notice, until a write to stderr fails: then the status lines stop going there for the rest of the run, a
-        warning saying so goes to the log file, and the run goes on. Nothing is written for a phase that has not
-        started. No line is written once the context has exited."""
+        as a notice. Nothing is written for a phase that has not started. No line is written once the context has
+        exited."""
         shown = self._options.progress and self._options.verbosity != 'quiet'
+        to_stderr = shown and not self._terminal
 
         def emit(*, final: bool) -> None:
             line = state.snapshot().status_line(final=final)
             if line is None:
                 return
             _log.info('%s', line, extra=FILE_ONLY)
-            if self._status_to_stderr:
-                try:
-                    notice(line, timestamped=True)
-                except OSError as exc:
-                    self._status_to_stderr = False
-                    reason = exc.strerror or str(exc)
-                    _log.warning(
-                        'Could not write a status line to stderr: %s; status lines on stderr are off for this run.',
-                        reason,
-                        extra=FILE_ONLY,
-                    )
+            if to_stderr:
+                notice(line, timestamped=True)
 
         stop = threading.Event()
 
@@ -253,7 +244,7 @@ def command_output(
             try:
                 yield output
             except KeyboardInterrupt:
-                typer.echo(interrupted, err=True)
+                write_stderr(interrupted)
                 raise
     except BaseException as exc:
         if options.json:
@@ -287,19 +278,28 @@ def _logged_run(command: str, options: OutputOptions, *, details: Mapping[str, o
     for handler in handlers:
         _log.addHandler(handler)
     try:
-        arguments = ', '.join(f'{name}={value}' for name, value in {**details, **dataclasses.asdict(options)}.items())
-        _log.info('%s started: version %s, pid %d; %s', command, __version__, os.getpid(), arguments, extra=FILE_ONLY)
-        try:
-            yield Output(log_file, options, terminal=terminal)
-        except BaseException as exc:
-            _log_end(command, exc)
-            raise
-        _log.info('%s completed (exit 0)', command, extra=FILE_ONLY)
+        with stderr_failures(_stderr_failed):
+            arguments = ', '.join(
+                f'{name}={value}' for name, value in {**details, **dataclasses.asdict(options)}.items()
+            )
+            _log.info(
+                '%s started: version %s, pid %d; %s', command, __version__, os.getpid(), arguments, extra=FILE_ONLY
+            )
+            try:
+                yield Output(log_file, options, terminal=terminal)
+            except BaseException as exc:
+                _log_end(command, exc)
+                raise
+            _log.info('%s completed (exit 0)', command, extra=FILE_ONLY)
     finally:
         for handler in handlers:
             _log.removeHandler(handler)
             handler.close()
         _log.setLevel(previous)
+
+
+def _stderr_failed(reason: str) -> None:
+    _log.warning('Could not write to stderr: %s; stderr is off for this run.', reason, extra=FILE_ONLY)
 
 
 def _print_document(

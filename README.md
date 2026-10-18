@@ -900,11 +900,12 @@ A log file that cannot be opened stops the command before it does anything:
 that fails later (the state disk full, an I/O error) never stops the run:
 stderr gets one `Warning: could not write the log file <path>: <reason>;
 logging to it is off for this run.`, even with `-q`, and the report ends with
-`Log: <path> (incomplete: <reason>)`. Likewise a status line that cannot be
-written to stderr (a `2> file` on a full disk) never stops the run: the status
-lines stop going to stderr for the rest of the run, the log gets one warning
-`Could not write a status line to stderr: <reason>; status lines on stderr are
-off for this run.`, and keeps getting every status line.
+`Log: <path> (incomplete: <reason>)`. Likewise a write to stderr that fails
+(a `2> file` on a full disk, a terminal that went away) never stops the run
+and never changes its exit code: stderr is off for the rest of the run (no
+live view, status lines, notices or `Error: …` line), the log gets one warning
+`Could not write to stderr: <reason>; stderr is off for this run.`, and keeps
+getting every record and status line.
 
 ### JSON reports
 

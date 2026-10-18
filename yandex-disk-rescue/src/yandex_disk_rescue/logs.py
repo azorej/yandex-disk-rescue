@@ -4,10 +4,13 @@ Every line of the log file, and every notice on a stderr that is not a terminal,
 message is one line, every control character in it, a newline too, escaped (`display.display_line`), in the log file
 as on stderr; a traceback is written as one prefixed line per line, so each line of the log file says when and which
 run wrote it.
+
+A write to stderr that fails (a `2> file` on a full disk, a terminal that went away) turns stderr off for the rest of
+the run instead of raising: `sys.stderr` is replaced by `os.devnull`, so every later write to it, the tool's or a
+library's, goes nowhere, and the `on_failure` that `stderr_failures` installed is called once with the reason.
 """
 
 import contextlib
-import io
 import logging
 import os
 import sys
@@ -17,7 +20,6 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TextIO
 
 from yandex_disk_rescue.display import display_line, display_text
 
@@ -127,9 +129,72 @@ class _Stderr:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.writer: Callable[[str], None] | None = None
+        self.off_lock = threading.Lock()
+        self.off = False
+        self.on_failure: Callable[[str], None] | None = None
 
 
 _stderr = _Stderr()
+
+
+class StderrFile:
+    """A file for writers that must never fail on stderr, such as a rich `Console`: it writes to the current
+    `sys.stderr`, and a write or a flush that fails there turns stderr off."""
+
+    @property
+    def encoding(self) -> str:
+        return sys.stderr.encoding
+
+    def isatty(self) -> bool:
+        return sys.stderr.isatty()
+
+    def fileno(self) -> int:
+        return sys.stderr.fileno()
+
+    def write(self, text: str) -> int:
+        try:
+            sys.stderr.write(text)
+        except OSError as exc:
+            _turn_off(exc)
+        return len(text)
+
+    def flush(self) -> None:
+        try:
+            sys.stderr.flush()
+        except OSError as exc:
+            _turn_off(exc)
+
+
+STDERR = StderrFile()
+
+
+def stderr_off() -> bool:
+    """Whether a write to stderr has failed in this process, so stderr is off."""
+    return _stderr.off
+
+
+@contextmanager
+def stderr_failures(on_failure: Callable[[str], None]) -> Iterator[None]:
+    """Call `on_failure(reason)` when a write to stderr fails while the context runs, from the thread whose write
+    failed."""
+    _stderr.on_failure = on_failure
+    try:
+        yield
+    finally:
+        _stderr.on_failure = None
+
+
+def _turn_off(exc: OSError) -> None:
+    with _stderr.off_lock:
+        if _stderr.off:
+            return
+        _stderr.off = True
+        # The failed stream keeps the bytes it could not write and no API discards them; Python would retry them at
+        # exit and turn that failure into exit code 120.
+        sys.stderr = open(os.devnull, 'w', encoding='utf-8')
+        on_failure = _stderr.on_failure
+    if on_failure is not None:
+        on_failure(exc.strerror or str(exc))
 
 
 def notice(text: str, *, timestamped: bool) -> None:
@@ -141,22 +206,17 @@ def notice(text: str, *, timestamped: bool) -> None:
 
 def write_stderr(text: str) -> None:
     """Write `text`, its control characters but newlines escaped, and a newline to stderr, one caller at a time:
-    through the writer `stderr_through` installed, or else to the current `sys.stderr`, flushed. Raises `OSError` when
-    the write to `sys.stderr` fails; the line is dropped then, so a later write and Python's own flush at exit do not
-    retry it."""
+    through the writer `stderr_through` installed, or else to the current `sys.stderr`, flushed. Nothing is written
+    once stderr is off."""
+    if _stderr.off:
+        return
     text = display_text(text)
     with _stderr.lock:
         if _stderr.writer is not None:
             _stderr.writer(text)
             return
-        stream = sys.stderr
-        try:
-            stream.write(f'{text}\n')
-            stream.flush()
-        except OSError:
-            if stream is sys.__stderr__:
-                sys.stderr = _fresh_stderr(stream)
-            raise
+        STDERR.write(f'{text}\n')
+        STDERR.flush()
 
 
 @contextmanager
@@ -169,13 +229,6 @@ def stderr_through(writer: Callable[[str], None]) -> Iterator[None]:
     finally:
         with _stderr.lock:
             _stderr.writer = None
-
-
-def _fresh_stderr(stream: TextIO) -> TextIO:
-    """A stream like `stream` on its file descriptor, without the bytes `stream` holds back after a failed write: no
-    API discards them, and Python retries them at exit and turns a failure then into exit code 120."""
-    raw = io.FileIO(stream.fileno(), 'w', closefd=False)
-    return io.TextIOWrapper(io.BufferedWriter(raw), encoding=stream.encoding, errors=stream.errors, line_buffering=True)
 
 
 def _open_log(path: Path) -> int:

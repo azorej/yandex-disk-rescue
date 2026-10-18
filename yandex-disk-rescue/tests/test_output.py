@@ -180,6 +180,9 @@ def test_a_log_file_that_stops_taking_writes_never_stops_the_rescue(disk, dest, 
     assert (dest / 'Docs' / 'readme.txt').read_bytes() == b'read me'
 
 
+STDERR_OFF = f'Could not write to stderr: {os.strerror(errno.ENOSPC)}; stderr is off for this run.'
+
+
 def test_a_stderr_that_stops_taking_writes_never_stops_the_rescue_or_its_status_records(slow, dest):
     with open('/dev/full', 'w') as full:
         child = subprocess.run(
@@ -193,16 +196,40 @@ def test_a_stderr_that_stops_taking_writes_never_stops_the_rescue_or_its_status_
     assert child.returncode == 0
     assert 'Mirrored disk:/ to ' in child.stdout
     assert child.stdout.endswith(f'Manifest: {manifest_path()}\nLog: {log_path()}\n')
-    reason = os.strerror(errno.ENOSPC)
-    warning = f'Could not write a status line to stderr: {reason}; status lines on stderr are off for this run.'
-    [record] = [line for line in log_path().read_text(encoding='utf-8').splitlines() if line.endswith(warning)]
+    [record] = [line for line in log_path().read_text(encoding='utf-8').splitlines() if line.endswith(STDERR_OFF)]
     assert LOG_LINE.match(record)['level'] == 'WARNING'
     messages = log_messages()
-    after = messages[messages.index(warning) + 1 :]
+    after = messages[messages.index(STDERR_OFF) + 1 :]
     assert any(DOWNLOADING.match(message) for message in after)
     assert len([message for message in after if message.startswith('Downloaded: ')]) == 1
     assert messages[-1] == 'download completed (exit 0)'
     assert (dest / 'Photos' / '2024' / 'a.jpg').stat().st_size == 6 * 64 * 1024
+
+
+@pytest.mark.parametrize('ending', ['failed', 'interrupted'])
+def test_a_stderr_that_stops_taking_writes_keeps_the_exit_code_of_a_failed_or_interrupted_run(disk, dest, ending):
+    if ending == 'failed':
+        disk.inject('GET', '/v1/disk/resources/download', 404, where={'path': 'disk:/Docs/readme.txt'})
+    else:
+        disk.inject('GET', '/download', Delay(30), where={'path': 'disk:/Docs/readme.txt'})
+
+    with open('/dev/full', 'w') as full:
+        child = subprocess.Popen(['yandex-disk-rescue', 'download', str(dest)], stdout=subprocess.PIPE, stderr=full)
+        if ending == 'interrupted':
+            wait_until(
+                lambda: log_path().exists() and 'Pass 1 of ' in log_path().read_text(), child, 'started its pass'
+            )
+            child.send_signal(signal.SIGINT)
+        stdout, _ = child.communicate(timeout=120)
+
+    assert child.returncode == (1 if ending == 'failed' else 130)
+    messages = log_messages()
+    assert messages.count(STDERR_OFF) == 1
+    if ending == 'failed':
+        assert b'Mirrored disk:/ to ' in stdout
+        assert messages[-1] == 'download failed (exit 1): 1 failed; see the list above.'
+    else:
+        assert messages[-1] == 'download interrupted (exit 130)'
 
 
 def test_the_log_names_every_failed_file_and_a_rerun_appends_to_it(disk, dest):
@@ -626,6 +653,32 @@ def test_the_view_of_the_transfer_phase_opens_on_its_own_line_and_never_on_the_c
     transfers = shown.partition(b'Downloading 1 file (')[2]
     assert b'Downloading: 0 of 1 file, ' in transfers
     assert b'Checking ' not in transfers
+
+
+def test_a_terminal_that_goes_away_turns_the_live_view_off_and_the_run_goes_on(slow, dest):
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 100, 0, 0))
+    child = subprocess.Popen(
+        ['yandex-disk-rescue', 'download', str(dest)],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=slave,
+        env={**os.environ, 'TERM': 'xterm-256color'},
+    )
+    os.close(slave)
+    shown = b''
+    while b'Downloading: ' not in shown:
+        shown += os.read(master, 65536)
+    os.close(master)
+    stdout, _ = child.communicate(timeout=120)
+
+    assert child.returncode == 0
+    assert stdout.decode().endswith(f'Manifest: {manifest_path()}\nLog: {log_path()}\n')
+    messages = log_messages()
+    off = f'Could not write to stderr: {os.strerror(errno.EIO)}; stderr is off for this run.'
+    assert messages.count(off) == 1
+    assert [m for m in messages[messages.index(off) :] if m.startswith('Downloaded: ')]
+    assert messages[-1] == 'download completed (exit 0)'
 
 
 RED = 'disk:/Docs/\x1b[31mred\r.txt'

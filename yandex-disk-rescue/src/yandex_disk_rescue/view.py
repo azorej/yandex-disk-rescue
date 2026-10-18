@@ -6,7 +6,6 @@ printed through the view's console with markup, emoji and highlighting off, and 
 while the view is taken down.
 """
 
-import sys
 import threading
 from collections.abc import Callable, Iterator
 from typing import Self
@@ -20,6 +19,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from yandex_disk_rescue.display import display_line
+from yandex_disk_rescue.logs import STDERR, stderr_off
 from yandex_disk_rescue.progress import (
     ActiveTransfer,
     MirrorSnapshot,
@@ -37,11 +37,12 @@ SHOWN_TRANSFERS = 10
 
 class LiveView:
     """The view of the phase `state` follows, on a terminal on `sys.stderr`, shown while it is used as a context
-    manager and cleared, the cursor shown again, on every exit from it."""
+    manager and cleared, the cursor shown again, on every exit from it. Once stderr is off (`logs.stderr_off`), the
+    view draws nothing."""
 
     def __init__(self, state: ProgressState) -> None:
         self._console = Console(
-            file=sys.stderr, force_terminal=True, force_interactive=True, highlight=False, markup=False, emoji=False
+            file=STDERR, force_terminal=True, force_interactive=True, highlight=False, markup=False, emoji=False
         )
         self._state = state
         self._spinner = Spinner('dots')
@@ -82,6 +83,8 @@ class LiveView:
         )
 
     def _render(self) -> RenderableType:
+        if stderr_off():
+            return Text()
         return _View(self._state.snapshot(), self._spinner)
 
 
