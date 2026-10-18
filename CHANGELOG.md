@@ -47,6 +47,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Fixed
 
+- `download` no longer stops, or fails the file, when it cannot read a partial file (a bad sector) while resuming,
+  reading back or copying it: the partial file is emptied and the file downloaded again from its first byte, with a
+  notice; a second read error on it in the same run fails that file. A partial folder that is gone still stops the
+  run.
 - A Disk API request the API keeps failing for one file (its download link, or the check of an unfinished download
   against the Disk) no longer stops `download`. While the API still gives other files' links, only that file waits
   for the next pass, keeping the bytes it has, fails with the API's status after the last pass, and gets its

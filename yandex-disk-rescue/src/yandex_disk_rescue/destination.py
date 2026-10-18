@@ -170,19 +170,8 @@ class _Tree:
             os.close(fd)
 
     def reachable(self) -> bool:
-        """Whether the destination itself can still be read: its path `lstat`ed afresh and its folder listed through a
-        new descriptor, so a disk that is gone fails even where open descriptors still answer."""
-        try:
-            os.lstat(self.path)
-            fd = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-            try:
-                with os.scandir(fd) as found:
-                    next(found, None)
-            finally:
-                os.close(fd)
-        except OSError:
-            return False
-        return True
+        """Whether the destination itself can still be read, as `_folder_reachable` probes it."""
+        return _folder_reachable(self.path)
 
     @contextmanager
     def _folder(self, local: PurePosixPath) -> Iterator[int]:
@@ -261,7 +250,9 @@ class Destination(_Tree):
 
     An error in the work directory or the partial folder that every file would meet (a full disk, an I/O error, a
     read-only filesystem, a permission error) raises `DestinationError` with the action that failed: `read`, `write`
-    or `inspect` (an `lstat`, `fstat` or `fstatvfs`); other errors are the `OSError` of the call.
+    or `inspect` (an `lstat`, `fstat` or `fstatvfs`); other errors are the `OSError` of the call. Reading the bytes of
+    a partial file is the exception: any error there raises `PartialReadError` (see `PartialFile`), and
+    `partial_folder_reachable` tells a partial folder that is gone from one bad file in it.
 
     Every method blocks on the disk and may run in a worker thread. Moving aside and quarantining create this run's
     folders on first use, so no two of them may run at once.
@@ -417,6 +408,10 @@ class Destination(_Tree):
                     pass
                 except OSError as exc:
                     raise OSError(exc.errno, exc.strerror, str(path)) from None
+
+    def partial_folder_reachable(self) -> bool:
+        """Whether `partial_folder` can still be read, as `_folder_reachable` probes it."""
+        return _folder_reachable(self.partial_folder)
 
     def sync_partial_folder(self) -> None:
         """Make the files created in and deleted from the partial folder durable."""
@@ -719,10 +714,24 @@ class ExistingFile:
         os.fsync(self._fd)
 
 
+class PartialReadError(Exception):
+    """Reading the bytes of the partial file at `path` failed with `errno`; `reason` is its `strerror`. The caller
+    decides whether the run stops or the download's bytes are dropped."""
+
+    def __init__(self, path: Path, code: int, reason: str) -> None:
+        super().__init__(f'could not read {path}: {reason}')
+        self.path = path
+        self.errno = code
+        self.reason = reason
+
+
 class PartialFile:
     """An open partial file or staged copy at `path`: its size, reading back any range of what it holds, cutting or
     extending it (`truncate`), positional writes, fsyncs of the content written so far, then the final mtime and an
-    fsync."""
+    fsync.
+
+    Any error reading its bytes raises `PartialReadError`; the other calls raise `DestinationError` for an error in the
+    work directory that every other file would meet, and the `OSError` of the call otherwise."""
 
     def __init__(self, fd: int, path: Path) -> None:
         self._fd = fd
@@ -736,8 +745,10 @@ class PartialFile:
         """The bytes `[start, end)` in order, in chunks of at most 1 MiB; the file must hold at least `end` bytes."""
         offset = start
         while offset < end:
-            with _work_errors('read', self._path):
+            try:
                 chunk = localfs.read(self._fd, min(_READ_SIZE, end - offset), offset)
+            except OSError as exc:
+                raise PartialReadError(self._path, exc.errno, exc.strerror) from None
             if not chunk:
                 raise ValueError(f'the partial file ends at {offset} bytes, before {end}')
             yield chunk
@@ -772,7 +783,7 @@ class PreviousPartials:
     `Destination.own_partials`: the partial file of an entry, read-only, deleting it, and deleting what is left there.
 
     Every error raises `DestinationError` naming the file or the folder, except reading an opened partial file, which
-    fails as `PartialFile` does.
+    raises `PartialReadError` as `PartialFile` does.
     """
 
     def __init__(self, fd: int, path: Path, *, own: bool) -> None:
@@ -834,6 +845,22 @@ class PreviousPartials:
                 _remove_empty_folder(self.path)
         except OSError as exc:
             raise DestinationError.of('write', self.path, exc) from None
+
+
+def _folder_reachable(path: Path) -> bool:
+    """Whether the folder at `path` can still be read: `lstat`ed afresh and listed through a new descriptor, so a disk
+    that is gone fails even where open descriptors still answer."""
+    try:
+        os.lstat(path)
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            with os.scandir(fd) as found:
+                next(found, None)
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+    return True
 
 
 def _remove_empty_folder(path: Path) -> None:

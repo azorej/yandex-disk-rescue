@@ -180,7 +180,9 @@ yandex-disk-rescue/
 │   │                 #   ignores a range;
 │   │                 #   verify, by reading a segmented file back, or with separate partial files by
 │   │                 #   copying the finished file to its staged copy in DEST, one copy of the run at a time,
-│   │                 #   hashing the bytes copied; quarantining a file that fails; move aside
+│   │                 #   hashing the bytes copied; a partial file that cannot be read while its folder can
+│   │                 #   emptied and downloaded again from byte 0, at most once per file per run, the run
+│   │                 #   stopped when the folder is gone; quarantining a file that fails; move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
 │   │                 #   a per-file Disk API request failing past the retries deferring only its file while
@@ -224,7 +226,8 @@ yandex-disk-rescue/
 │   │                 #   another path), the free space of the partial folder,
 │   │                 #   the bytes each partial file allocates there and whether its filesystem keeps sparse
 │   │                 #   files (probed on open), reading existing files, whether the
-│   │                 #   destination itself is still readable (`reachable`),
+│   │                 #   destination itself or the partial folder is still readable (`reachable`,
+│   │                 #   `partial_folder_reachable`), a failed read of a partial file (`PartialReadError`),
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, placement, and the `previews/`
 │   │                 #   folder (saving a preview atomically, replacing an earlier one, removing it with the
