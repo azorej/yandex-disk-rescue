@@ -177,7 +177,7 @@ class VerifyRun:
         elif entry.entry_id in self._verified:
             _count_intact(entry, report)
         elif is_held(entry):
-            held = held_copy(entry, entry.failure)
+            held = held_copy(entry, None if entry.failure is None else entry.failure.reason)
             _log.debug('%s quarantined: kept at %s', entry.resource.path, held.copy)
             report.quarantined.append(held)
         else:
@@ -320,7 +320,7 @@ def _verified_now(entry: MirrorEntry) -> bool:
 def _not_downloaded_reason(entry: MirrorEntry) -> str:
     record = entry.download
     if entry.failure is not None:
-        return entry.failure
+        return entry.failure.reason
     if record is None:
         return 'not downloaded yet'
     if record.state == 'partial':

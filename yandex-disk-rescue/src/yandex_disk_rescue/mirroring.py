@@ -42,9 +42,9 @@ downloads were in progress, and they start again. The recorded folder reached un
 folder: nothing is moved, and the new path is recorded.
 
 With separate partials, the partial files take no more than the room of their folder, measured once the move is
-done (`PartialRoom`): a file fetched takes a turn of the room for its full size, in path order, and waits, is deferred
-to the next pass or fails when it does not fit. A pass that changed nothing in the room fails the files it deferred
-for room at once, since no later pass could fit them. An error writing the folder all the same stops the run.
+done (`PartialRoom`): a file fetched takes a turn of the room for its full size, in the order files start, and waits,
+is deferred to the next pass or fails when it does not fit. A pass that changed nothing in the room fails the files it
+deferred for room at once, since no later pass could fit them. An error writing the folder all the same stops the run.
 
 A folder or file whose name the destination filesystem refuses is created once more under its rejected-name
 conversion, which is then recorded as its local name.
@@ -602,7 +602,8 @@ class MirrorRun:
     """One run over a mirror: names are assigned, the staged copies and stray partial files a stopped run left
     deleted, the verified files already in the destination checked, the files this run will attempt counted, and the
     move of the partial files from the folder the mirror records planned (`partial_move`, `None` when it is this run's
-    folder) on construction; `move_partials` then makes that move, and `run` walks the run's entries in path order.
+    folder) on construction; `move_partials` then makes that move, and `run` walks the run's entries in path order,
+    starting the files with failed turns after the walk.
     The check and `run` report to `progress`: the check as it runs, then every file the run attempts, each settling
     once (deferred files settle in a later pass).
 
@@ -612,10 +613,16 @@ class MirrorRun:
     holds every file whose quarantine record is for its current identity: such a file is reported as quarantined
     without being looked at.
 
-    Every entry that fails gets a failure record with the reason when the failure happens; an entry verified, adopted
-    or made in place loses it. A failed entry is reported as failed, or as quarantined when its quarantine record is
-    for its current identity, the failure then shown as its last retry. Each entry the manifest records as left out of
-    its scan, because its name is not valid Unicode, is a failure of the run, and has no record.
+    Every failed turn of an entry is counted and recorded when it fails, in the entry's failure record with the
+    reason it is reported with and its failed turns since it last succeeded: a file that fails, a folder that cannot
+    be made, an entry below such a folder, and a file deferred by a transient failure. A file deferred for room was
+    not tried, and counts nothing. A file reported failed once the passes end counts one more failed turn only when
+    this run counted none for it; otherwise the report restates its record with the reason it is reported with and
+    the same count. A turn cancelled by Ctrl+C, SIGTERM or an error that stops the run counts nothing, and the file
+    keeps the record of its last failed turn. An entry verified, adopted or made in place loses its record. A failed
+    entry is reported as failed, or as quarantined when its quarantine record is for its current identity, the
+    failure then shown as its last retry. Each entry the manifest records as left out of its scan, because its name
+    is not valid Unicode, is a failure of the run, and has no record.
 
     A copy found unreadable gets its `corrupt` finding recorded and a notice when it is found, and is listed under
     `unreadable` whatever then happens to the file; a later pass of the run gives the file that finding, so the copy
@@ -639,6 +646,8 @@ class MirrorRun:
         destination.keep_partials(self._in_progress)
         self._current = self._check(destination)
         self._unreadable: dict[int, Finding] = {}
+        self._failed_turns = {e.entry_id: e.failure.turns for e in self._entries if e.failure is not None}
+        self._counted: set[int] = set()
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
         self._moved: list[tuple[MirrorEntry, tuple[Segment, ...], int]] = []
@@ -650,6 +659,7 @@ class MirrorRun:
             if e.resource.kind == 'file' and e.entry_id not in self._current and e.entry_id not in self._held
         ]
         self._pending = {e.entry_id for e in pending}
+        self._failed_before = sum(1 for e in pending if e.entry_id in self._failed_turns)
         self.pending_files = len(pending)
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
@@ -774,11 +784,12 @@ class MirrorRun:
         most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
         the download host asked for. Each file is fetched as `policy` says.
 
-        In every pass up to `content.connections` files are in progress at once, started in path order as slots free
-        up, and the segments of a segmented file queue for the same connections; a folder is made before any entry
-        below it starts. Each final path is checked, cleared, placed and recorded under one placement lock, so files
-        in progress never race for a path or an inode. The report lists everything in path order, whatever the
-        order the files ended in.
+        In every pass up to `content.connections` files are in progress at once, started as slots free up by their
+        failed turns so far in this mirror, fewest first, then in path order: the first pass starts each file with no
+        failed turn as the walk reaches it, and the others once the walk is done. The segments of a segmented file
+        queue for the same connections; a folder is made before any entry below it starts. Each final path is
+        checked, cleared, placed and recorded under one placement lock, so files in progress never race for a path or
+        an inode. The report lists everything in path order, whatever the order the files ended in.
 
         The first error that stops the run (`DestinationError`, `TokenRejectedError`, `DiskApiError`) cancels the
         files in progress and is raised as itself once they have ended.
@@ -795,7 +806,7 @@ class MirrorRun:
                 room_measured(room)
             tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), room, report, policy)
             changes = _changes(room)
-            _log_pass(1, passes, self.pending_files, self.pending_size, pause=None)
+            _log_pass(1, passes, self.pending_files, self.pending_size, pause=None, failed_before=self._failed_before)
             deferred = await self._first_pass(tools)
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes, changes=changes)
@@ -811,6 +822,7 @@ class MirrorRun:
         report = tools.report
         blocked: dict[PurePosixPath, str] = {}
         deferred: list[tuple[MirrorEntry, FileDeferred]] = []
+        failed_before: list[MirrorEntry] = []
         async with _FileTurns(tools.content.connections) as turns:
             for listed_entry in self._entries:
                 local = self._names[listed_entry.entry_id]
@@ -818,7 +830,7 @@ class MirrorRun:
                 if local.name != entry.resource.path.rpartition('/')[2]:
                     _note_renamed(report, entry, local)
                 if entry.entry_id in self._held:
-                    held = held_copy(entry, entry.failure)
+                    held = held_copy(entry, None if entry.failure is None else entry.failure.reason)
                     _log.debug('%s held in quarantine: kept at %s', entry.resource.path, held.copy)
                     report.quarantined.append(held)
                 elif reason := _blocked_by(local, blocked):
@@ -830,9 +842,13 @@ class MirrorRun:
                     report.skipped += 1
                     _note_verified(report, entry, _recorded_method(entry))
                     self._succeeded(entry)
+                elif entry.entry_id in self._failed_turns:
+                    failed_before.append(entry)
                 else:
                     await turns.start(self._turn(entry, tools, deferred))
-        return self._sorted(deferred)
+            for entry in sorted(failed_before, key=self._start_key):
+                await turns.start(self._turn(entry, tools, deferred))
+        return self._in_start_order(deferred)
 
     async def _make_folder(
         self, entry: MirrorEntry, local: PurePosixPath, blocked: dict[PurePosixPath, str], tools: _RunTools
@@ -890,12 +906,12 @@ class MirrorRun:
             async with _FileTurns(tools.content.connections) as turns:
                 for entry, _ in deferred:
                     await turns.start(self._turn(entry, tools, remaining))
-            deferred = self._sorted(remaining)
+            deferred = self._in_start_order(remaining)
         stuck = _stuck_for_room(deferred, tools.room, changes)
         suffix = f' (after {used} passes)' if used > 1 else ''
         for entry, failure in deferred:
             reason = failure.final if stuck and isinstance(failure, NoRoomYet) else failure.reason + suffix
-            self._fail(tools.report, entry, reason)
+            self._fail(tools.report, entry, reason, new_turn=entry.entry_id not in self._counted)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -904,10 +920,14 @@ class MirrorRun:
         """One file's turn in a pass; a deferred file is added to `deferred`."""
         if (later := await self._download(entry, tools)) is not None:
             _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
+            if not isinstance(later, NoRoomYet):
+                self._mirror.record_failure(entry.entry_id, later.reason, turns=self._count_failed_turn(entry))
             self._progress.defer(entry.entry_id)
             deferred.append((entry, later))
 
-    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str) -> None:
+    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str, *, new_turn: bool = True) -> None:
+        """Report `entry` as failed for `reason` and record it; `new_turn` counts one more failed turn, otherwise the
+        record keeps the count this run already gave it."""
         path = entry.resource.path
         outcome: Outcome
         if is_held(entry):
@@ -919,8 +939,16 @@ class MirrorRun:
             _log.warning('%s failed: %s', path, reason)
             report.failed.append(Failure(entry.resource.path, reason))
             outcome = 'failed'
-        self._mirror.record_failure(entry.entry_id, reason)
+        turns = self._count_failed_turn(entry) if new_turn else self._failed_turns[entry.entry_id]
+        self._mirror.record_failure(entry.entry_id, reason, turns=turns)
         self._settle(entry, outcome)
+
+    def _count_failed_turn(self, entry: MirrorEntry) -> int:
+        """Count one more failed turn of `entry`; its failed turns since it last succeeded."""
+        turns = self._failed_turns.get(entry.entry_id, 0) + 1
+        self._failed_turns[entry.entry_id] = turns
+        self._counted.add(entry.entry_id)
+        return turns
 
     def _settle(self, entry: MirrorEntry, outcome: Outcome) -> None:
         if entry.entry_id in self._pending:
@@ -938,8 +966,14 @@ class MirrorRun:
         self._unreadable[entry.entry_id] = finding
         report.unreadable.append(Failure(entry.resource.path, finding.reason))
 
-    def _sorted(self, deferred: list[tuple[MirrorEntry, FileDeferred]]) -> list[tuple[MirrorEntry, FileDeferred]]:
-        return sorted(deferred, key=lambda item: self._positions[item[0].entry_id])
+    def _start_key(self, entry: MirrorEntry) -> tuple[int, int]:
+        """Where `entry` starts among the files of a pass: by its failed turns so far, then by its place in the walk."""
+        return self._failed_turns.get(entry.entry_id, 0), self._positions[entry.entry_id]
+
+    def _in_start_order(
+        self, deferred: list[tuple[MirrorEntry, FileDeferred]]
+    ) -> list[tuple[MirrorEntry, FileDeferred]]:
+        return sorted(deferred, key=lambda item: self._start_key(item[0]))
 
     def _in_path_order(self, report: MirrorReport) -> None:
         by_path = {entry.resource.path: position for position, entry in enumerate(self._entries)}
@@ -2101,8 +2135,11 @@ def _note_moved_aside(report: MirrorReport, destination: Destination, local: Pur
     report.moved_aside.append(local)
 
 
-def _log_pass(number: int, passes: int, files: int, size: int, *, pause: float | None) -> None:
+def _log_pass(number: int, passes: int, files: int, size: int, *, pause: float | None, failed_before: int = 0) -> None:
+    """Log the start of a pass over `files` files of `size` bytes, `failed_before` of which have a failure record."""
     start = 'starts' if pause is None else f'starts in {pause:g} s'
+    if failed_before:
+        start += f'; {failed_before} that failed before'
     limit = passes or 'unlimited'
     noun = 'file' if files == 1 else 'files'
     _log.info('Pass %d of %s over %d %s (%s) %s', number, limit, files, noun, format_size(size), start)

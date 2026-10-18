@@ -9,7 +9,7 @@ scan still knows about them.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
-of a partial download (`download_segments`), the reason the last turn of an entry failed (`failures`), and the copy
+of a partial download (`download_segments`), the reason and count of an entry's failed turns (`failures`), and the copy
 of a download that failed verification and was moved to quarantine (`quarantined`), and what `verify` last found
 wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all keyed by `entries.id`.
 A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
@@ -172,7 +172,7 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         """,
     ),
     (
-        # `reason` is the user-facing reason the entry's last turn in this mirror failed.
+        # `reason` is the user-facing reason the entry's last failed turn in this mirror was reported with.
         """
         CREATE TABLE failures (
             mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
@@ -227,6 +227,11 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         # The folder holding the partial files of the mirror's downloads in progress, as `destination` is stored; NULL
         # for the destination's own `.yandex-disk-rescue/partial/`.
         'ALTER TABLE mirrors ADD COLUMN partial_folder BLOB',
+    ),
+    (
+        # `turns` counts the entry's failed turns in this mirror since it last succeeded. The failed turns of a record
+        # made before this column are unknown, so it starts at 1.
+        'ALTER TABLE failures ADD COLUMN turns INTEGER NOT NULL DEFAULT 1 CHECK (turns >= 1)',
     ),
 )
 
@@ -328,6 +333,15 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class FailureRecord:
+    """Why an entry's last failed turn in a mirror failed, as reported (`reason`), and how many of its turns there
+    failed since it last succeeded (`turns`, at least 1)."""
+
+    reason: str
+    turns: int
+
+
+@dataclass(frozen=True)
 class VerifyPass:
     """A `verify` pass in progress on a mirror: the files up to `checked_through` (a Disk path; `None` before the
     first) are checked, every file after it is still to check."""
@@ -342,7 +356,7 @@ class MirrorEntry:
     resource: Resource
     local_path: PurePosixPath | None  # relative to the destination; `None` until a name is assigned
     download: DownloadRecord | None
-    failure: str | None  # why the entry's last turn in this mirror failed; `None` once it succeeded
+    failure: FailureRecord | None  # the entry's failed turns in this mirror; `None` once it succeeded
     quarantine: Quarantine | None  # the last quarantined copy; `None` once the file is verified
     finding: Finding | None  # what was found wrong at the final path; `None` once a copy is verified there
 
@@ -787,11 +801,14 @@ class Mirror:
                 'DELETE FROM downloads WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
 
-    def record_failure(self, entry_id: int, reason: str) -> None:
-        """Record `reason` as why the entry's last turn failed, replacing any earlier reason."""
+    def record_failure(self, entry_id: int, reason: str, *, turns: int) -> None:
+        """Record `reason` as why the entry's last failed turn failed and `turns` as its count of failed turns,
+        replacing any earlier record; the caller owns the count. Raises `ValueError` when `turns` is below 1."""
+        if turns < 1:
+            raise ValueError(f'a failure record counts at least 1 failed turn, not {turns}')
         with self._manifest._transaction('update'):
             self._check_entry(entry_id)
-            self._manifest._connection.execute(_RECORD_FAILURE_SQL, (self.id, entry_id, reason))
+            self._manifest._connection.execute(_RECORD_FAILURE_SQL, (self.id, entry_id, reason, turns))
 
     def clear_failure(self, entry_id: int) -> None:
         """Delete the entry's failure, if any."""
@@ -915,7 +932,7 @@ class Mirror:
 _MIRROR_ENTRY_COLUMNS = """
     e.id, e.path, e.kind, e.size, e.md5, e.sha256, e.modified, n.local_path,
     d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino,
-    f.reason,
+    f.reason, f.turns,
     q.size, q.md5, q.sha256, q.modified, q.copy_path, q.reason,
     v.finding, v.reason
 """
@@ -977,8 +994,8 @@ _RECORD_DOWNLOAD_SQL = """
         local_mtime_ns = excluded.local_mtime_ns, local_ino = excluded.local_ino
 """
 _RECORD_FAILURE_SQL = """
-    INSERT INTO failures (mirror_id, entry_id, reason) VALUES (?, ?, ?)
-    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET reason = excluded.reason
+    INSERT INTO failures (mirror_id, entry_id, reason, turns) VALUES (?, ?, ?, ?)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET reason = excluded.reason, turns = excluded.turns
 """
 _RECORD_QUARANTINE_SQL = """
     INSERT INTO quarantined (mirror_id, entry_id, size, md5, sha256, modified, copy_path, reason)
@@ -1229,9 +1246,9 @@ def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
         resource=_resource(row[1:7]),
         local_path=None if local_path is None else PurePosixPath(local_path),
         download=None if row[8] is None else _download_record(row[8:17], segments),
-        failure=row[17],
-        quarantine=None if row[18] is None else _quarantine(row[18:24]),
-        finding=None if row[24] is None else Finding(kind=row[24], reason=row[25]),
+        failure=None if row[17] is None else FailureRecord(reason=row[17], turns=row[18]),
+        quarantine=None if row[19] is None else _quarantine(row[19:25]),
+        finding=None if row[25] is None else Finding(kind=row[25], reason=row[26]),
     )
 
 

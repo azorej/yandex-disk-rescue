@@ -73,9 +73,12 @@ mirror up by its destination without creating one.
   `Mirror.checkpoint` moves its confirmed offsets, `Mirror.download` reads the record as it is now; verifying or
   forgetting the download deletes its journal. A partial record from schema version 3 or older gets one segment
   confirming nothing on the upgrade, so its file is downloaded again from byte 0.
-- A failure record (`failures`) holds the reason the entry's last turn in the mirror failed, for files and folders
-  alike. `Mirror.record_failure` replaces any earlier reason and `Mirror.clear_failure` drops it; verifying the
-  entry's file (`record_verified`) drops it too, while `forget` keeps it. `MirrorEntry.failure` reads it.
+- A failure record (`failures`) holds, for files and folders alike, the reason the entry's last failed turn in the
+  mirror was reported with and the count of its failed turns there since it last succeeded (at least 1).
+  `Mirror.record_failure(entry_id, reason, turns=…)` replaces any earlier record (the caller owns the count) and
+  `Mirror.clear_failure` drops it; verifying the entry's file (`record_verified`) drops it too, while `forget` keeps
+  it. `MirrorEntry.failure` reads it as a `FailureRecord`. A failure record from schema version 9 or older counts 1
+  failed turn on the upgrade.
 - A quarantine record (`quarantined`) holds the copy of the entry's last download that failed verification: its
   path relative to the destination, the reason, and the remote identity the download was for.
   `Mirror.record_quarantined` replaces any earlier record and deletes the entry's download record (with its journal)
@@ -139,16 +142,16 @@ yandex-disk-rescue/
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
 │   │                 #   commit, the summary lines and `scan_document`, the scan's JSON object
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
-│   │                 #   over the retry set (failed, quarantined or partial files, files with a finding,
-│   │                 #   failed folders) and the folders
-│   │                 #   above it (skip, hold quarantined files, fetch again files with a finding without
-│   │                 #   reading their copy, folders, things in the way, hard-link aliases) with
-│   │                 #   up to `download_connections` files in progress at once, after moving the confirmed
-│   │                 #   bytes of the downloads in progress when the partial folder changed since the last run
-│   │                 #   and, with separate partial files, admission to the partial folder's room (measured
-│   │                 #   once, idle partial files counting what they allocate, each fetched file its full size,
-│   │                 #   in path order: wait, defer to the next pass, or fail a file larger than the room, and
-│   │                 #   every file deferred for room at once when a pass changed nothing in it),
+│   │                 #   over the retry set (failed, quarantined or partial files, files with a finding, failed
+│   │                 #   folders) and the folders above it (skip, hold quarantined files, fetch again files with a
+│   │                 #   finding without reading their copy, folders, things in the way, hard-link aliases) with up
+│   │                 #   to `download_connections` files in progress at once (files with failure records started
+│   │                 #   last, fewest failed turns first), after moving the confirmed bytes of the downloads in
+│   │                 #   progress when the partial folder changed since the last run and, with separate partial
+│   │                 #   files, admission to the partial folder's room (measured once, idle partial files counting
+│   │                 #   what they allocate, each fetched file its full size, in the order files start: wait, defer
+│   │                 #   to the next pass, or fail a file larger than the room, and every file deferred for room at
+│   │                 #   once when a pass changed nothing in it),
 │   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
 │   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
 │   │                 #   pipeline (adopt a matching local copy, record one that cannot be read as a `corrupt`
@@ -164,7 +167,8 @@ yandex-disk-rescue/
 │   │                 #   hashing the bytes copied; quarantining a file that fails; move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
 │   │                 #   file name the destination refuses, later passes over transiently failed files,
-│   │                 #   failure records written as entries fail and dropped as they succeed, the summary
+│   │                 #   failure records written and counted as each turn fails (also one deferred to a
+│   │                 #   later pass) and dropped as entries succeed, the summary
 │   │                 #   lines (with the partial files that could not be deleted once their file was
 │   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names

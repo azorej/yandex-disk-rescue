@@ -238,15 +238,25 @@ yandex-disk-rescue download disk:/Photos ~/Photos    # one folder
 exactly as [`scan`](#scanning-a-folder) does and prints the scan summary,
 unless a recent scan covers it (below). It then mirrors that folder into
 DEST, with up to `download_connections` files (default 20) downloading at
-once, started in path order: the folder structure is kept, each folder is
-created before anything inside it, empty folders are created, and every file
-gets the modification time it has on the Disk. It takes the `--api-*`
+once, started in the order below: the folder structure is kept, each folder
+is created before anything inside it, empty folders are created, and every
+file gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
 `--download-connections`, `--download-checkpoint-mib`, `--download-segments`,
 `--download-segment-threshold-mib`, `--partial-dir` and `--scan-max-age` (see
 [Configuration](#configuration)), `--no-scan` and `--retry-failed`
 (below). A file whose download host never answers holds one connection until
 it stalls and delays no other file.
+
+**Order.** Files with no failure record start first, in path order. Files that
+failed before start after all of them, fewest failed turns first, ties in path
+order, so a restart reaches new and healthy data at once. Each later pass
+follows the same rule over the files still to download. A partial download
+keeps its confirmed bytes whenever its turn comes, and folders are still made
+before anything inside them. With `--partial-dir`, a file that fits only once
+the kept partial file of an earlier failed download is gone may meet `no room
+yet` in pass 1 and get the room in the next pass; with `--download-passes 1`
+it fails with that reason, and the next run or `--retry-failed` fetches it.
 
 **Segmented files.** A file larger than `download_segment_threshold_mib` MiB
 (default 256) is downloaded as `download_segments` segments (default 4): equal
@@ -298,27 +308,26 @@ resume — happens on that disk, not on DEST:
   network, fetching slows down instead of filling `PATH`.
 - The partial files never take more than the room `PATH` had when the run
   started: the free space of its filesystem, plus what the partial files
-  already there take, minus a reserve of 1 GiB left for everything else.
-  Once any move (below) is done, the run prints `Partial files in PATH/<key>
-  (<size> available)`. A file being downloaded counts its full size; a
-  partial file kept for a later pass or run counts the disk space it
-  actually takes, which for a segmented file is only what was written so
-  far, until it is deleted (also when its file is found already in DEST
-  and adopted). Files take their room in path order, a file that does not
-  fit yet waits for one in progress to end, and when none is left in
-  progress it is deferred to the next pass with `no room yet in the partial
-  folder <folder> (<size> needed, <size> available)`. When a pass starts no
-  download and frees no room, and every file it defers waits for room, the
-  partial files kept there can never make room for each other: those files
-  fail at once, whatever `--download-passes` says, with `no room in the
-  partial folder <folder> next to the partial files kept there (<size>
-  needed, <size> available); free space there, then run again or with
-  --retry-failed`. A file larger than the whole room fails with `larger than
-  the room in the partial folder <folder> (<size> needed, <size>
-  available)`; `--retry-failed` fetches it once there is room.
-  When another program fills that disk anyway, the run stops with `Error:
-  Could not write <path>: No space left on device.` (below) and a rerun
-  resumes from the journals.
+  already there take, minus a reserve of 1 GiB left for everything else. Once
+  any move (below) is done, the run prints `Partial files in PATH/<key>
+  (<size> available)`. A file being downloaded counts its full size; a partial
+  file kept for a later pass or run counts the disk space it actually takes,
+  which for a segmented file is only what was written so far, until it is
+  deleted (also when its file is found already in DEST and adopted). Files
+  take their room in the order they start, a file that does not fit yet waits
+  for one in progress to end, and when none is left in progress it is deferred
+  to the next pass with `no room yet in the partial folder <folder> (<size>
+  needed, <size> available)`. When a pass starts no download and frees no
+  room, and every file it defers waits for room, the partial files kept there
+  can never make room for each other: those files fail at once, whatever
+  `--download-passes` says, with `no room in the partial folder <folder> next
+  to the partial files kept there (<size> needed, <size> available); free
+  space there, then run again or with --retry-failed`. A file larger than the
+  whole room fails with `larger than the room in the partial folder <folder>
+  (<size> needed, <size> available)`; `--retry-failed` fetches it once there
+  is room. When another program fills that disk anyway, the run stops with
+  `Error: Could not write <path>: No space left on device.` (below) and a
+  rerun resumes from the journals.
 - Use a persistent folder on a fast local disk: not a tmpfs, and not a
   container layer that a rebuild discards. When the folder is lost, the
   downloads in progress start again from their first byte. Do not share one
@@ -464,14 +473,17 @@ stream, never appended to the bytes kept.
   pass its reason is `download link rejected again after a refresh (HTTP <n>)`.
 
 **Retrying failures.** Every file or folder a run reports under `Failed` is
-recorded in the manifest for that DEST with the reason shown, as soon as it
-fails: a file still failing after the last pass, a refused download, a file
-changed or removed in the cloud, a local error, a hard link to another file of
-the mirror, a refused name, a folder that could not be made, and every entry
-under such a folder. The record is dropped once the entry succeeds: a file
-verified or adopted, a folder made or found in place. Files stopped by Ctrl+C,
-SIGTERM or an error that stops the run get no failure record; their unfinished
-downloads stay recorded as partial.
+recorded in the manifest for that DEST, as soon as a turn of it fails: a
+refused download, a file changed or removed in the cloud, a local error, a
+hard link to another file of the mirror, a refused name, a folder that could
+not be made, every entry under such a folder, and a transient transfer failure
+that waits for a later pass. The record holds the reason last shown and the
+count of failed turns since the entry last succeeded; a file still failing
+after the last pass keeps the count and gets the reason it is reported with.
+The record is dropped once the entry succeeds: a file verified or adopted, a
+folder made or found in place. A turn stopped by Ctrl+C, SIGTERM or an error
+that stops the run records nothing: the file keeps any earlier record, and its
+unfinished download stays recorded as partial.
 
 A quarantined file gets no failure record and is not listed under `Failed`.
 When a retry of a quarantined file fails (a stall, say), the failure is
@@ -486,7 +498,8 @@ copy in DEST that `download` could not read — and the folders with a failure
 record. Files never started are not in it; a
 plain `download` gets them. The scan step runs as usual; the retry set is
 fixed once it is done. The run then visits only the retry set and the
-folders above its members, in path order, with the usual passes and rules,
+folders above its members, in the [order](#downloading) of every run, with
+the usual passes and rules,
 and never looks at any other path of DEST: those files are neither checked
 nor counted. It starts with
 
