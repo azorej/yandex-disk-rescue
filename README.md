@@ -441,9 +441,10 @@ again.
 
 A later pass or a later run asks the Disk for the file again and, when its
 size, checksums and modification time are unchanged, re-reads each segment's
-confirmed bytes and checks them against their SHA-256. When they match, only
-the rest of the segment is fetched, with an HTTP `Range` request; bytes past
-the last checkpoint are fetched again, never trusted. A segment whose confirmed
+confirmed bytes and checks them against their SHA-256, one file of the run at
+a time per disk, so a restart on a hard disk reads sequentially. When they
+match, only the rest of the segment is fetched, with an HTTP `Range` request;
+bytes past the last checkpoint are fetched again, never trusted. A segment whose confirmed
 bytes changed on disk, or that a partial file deleted or cut short no longer
 holds, starts again from its first byte; the other segments go on from their
 checkpoints. When the file changed in the cloud, the partial file is deleted
@@ -711,7 +712,10 @@ local disk with free space for at least the largest file plus 1 GiB
 ([Partial files](#downloading)): the interleaved writes of the
 files in progress, the checkpoint flushes, extending segmented files, and the
 re-reading of confirmed bytes on a resume all move there, and DEST only
-receives one sequential copy of each finished file.
+receives one sequential copy of each finished file. Bytes already on disk are
+hashed one file at a time per disk (the partial folder, DEST): the confirmed
+bytes of a resumed download, a segmented file read back, and a local copy
+before it is adopted, so the hashing reads sequentially.
 
 Segments speed up one large file on a fast link whose single connection is the
 limit; a folder of small files gains nothing from them, since its files
@@ -879,9 +883,10 @@ data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
   (none of its connections is open: a segment waits for a free one, or the
   file for a new download link), `no data for N s` (a connection open but no
   data for 5 s or more),
-  `preallocating`, `hashing` (a local copy), `reading back` (a segmented
-  file), `waiting for the copy` (of another file to DEST) and `copying N%`
-  (to DEST, with `--partial-dir`). `… and N more` counts the rest.
+  `preallocating`, `waiting to hash` (another file's bytes on the same disk
+  are being hashed), `hashing` (a local copy, or the confirmed bytes of a
+  resumed download), `reading back` (a segmented file), `waiting for the copy`
+  (of another file to DEST) and `copying N%` (to DEST, with `--partial-dir`). `… and N more` counts the rest.
 - In `verify`, the file being read follows the bar, with the bytes read of
   its size.
 - Notices and report lines written while a phase runs are printed above the

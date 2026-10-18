@@ -30,6 +30,7 @@ type TransferState = Literal[
     'waiting for a connection',
     'downloading',
     'preallocating',
+    'waiting to hash',
     'hashing',
     'reading back',
     'waiting for the copy',

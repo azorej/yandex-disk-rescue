@@ -152,13 +152,14 @@ yandex-disk-rescue/
 │   │                 #   what they allocate, each fetched file its full size, in the order files start: wait, defer
 │   │                 #   to the next pass, or fail a file larger than the room, and every file deferred for room at
 │   │                 #   once when a pass changed nothing in it),
-│   │                 #   and one placement lock over each check-clear-place-record of a final path, the first
-│   │                 #   run-stopping error raised as itself once the other files are cancelled, the per-file
-│   │                 #   pipeline (adopt a matching local copy, record one that cannot be read as a `corrupt`
-│   │                 #   finding and fetch the file again, or resume a partial file segment by segment
-│   │                 #   from its checkpoint journal once the cloud file is confirmed unchanged and each
-│   │                 #   segment's confirmed bytes re-hashed, a journal keeping no byte planned again as a new
-│   │                 #   download; the segment plan of a new download, one segment
+│   │                 #   one placement lock over each check-clear-place-record of a final path, one hash of
+│   │                 #   bytes on disk at a time per folder (re-hashing confirmed bytes, a read-back, a local
+│   │                 #   copy), the first run-stopping error raised as itself once the other files are
+│   │                 #   cancelled, the per-file pipeline (adopt a matching local copy, record one that cannot
+│   │                 #   be read as a `corrupt` finding and fetch the file again, or resume a partial file
+│   │                 #   segment by segment from its checkpoint journal once the cloud file is confirmed
+│   │                 #   unchanged and each segment's confirmed bytes re-hashed, a journal keeping no byte
+│   │                 #   planned again as a new download; the segment plan of a new download, one segment
 │   │                 #   in a partial folder without sparse files; one link per file shared by its segments
 │   │                 #   and taken once one holds a connection, preallocation of a segmented file, parallel
 │   │                 #   ranged fetches of its segments while hashing with checkpoints, immediate retries

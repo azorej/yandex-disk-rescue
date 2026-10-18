@@ -2173,6 +2173,150 @@ def test_with_a_partial_folder_a_resume_reads_that_folder_only(big, dest, partia
     assert _partials(dest) == []
 
 
+_HASHED_ROOT = 'disk:/Hashed'
+
+
+def _slow_preads(monkeypatch) -> list[tuple[str, str, int, int]]:
+    """The `_io_log` of every `os.pread`, each of which first sleeps 20 ms, so readers running at once interleave."""
+    log = _io_log(monkeypatch, ('pread',))
+    logged = os.pread
+
+    def slow(fd, size, offset):
+        time.sleep(0.02)
+        return logged(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', slow)
+    return log
+
+
+def _finishing_together(monkeypatch, folder, count: int, size: int) -> None:
+    """Hold the write that completes each of the first `count` `size`-byte partial files in `folder` until all of them
+    are there, so the read-backs that follow start together."""
+    together = threading.Barrier(count, timeout=10)
+    written: dict[str, int] = {}
+    lock = threading.Lock()
+    pwrite = os.pwrite
+
+    def gated(fd, data, offset):
+        path = os.readlink(f'/proc/self/fd/{fd}')
+        done = pwrite(fd, data, offset)
+        if _below(path, folder) and Path(path).name.isdigit():
+            with lock:
+                written[path] = written.get(path, 0) + done
+                complete = written[path] == size
+            if complete:
+                together.wait()
+        return done
+
+    monkeypatch.setattr(os, 'pwrite', gated)
+
+
+@pytest.mark.parametrize('phase', ['resume', 'read back', 'adopt'])
+def test_bytes_on_disk_are_hashed_for_one_file_at_a_time(disk, dest, monkeypatch, phase):
+    monkeypatch.setattr(destination_module, '_READ_SIZE', 256 * 1024)
+    size = {'resume': 2 * MiB, 'read back': 4 * MiB, 'adopt': MiB}[phase]
+    count = {'resume': 4, 'read back': 2, 'adopt': 3}[phase]
+    files = {f'{_HASHED_ROOT}/{n}.bin': random.Random(40 + n).randbytes(size) for n in range(count)}
+    for path, content in files.items():
+        disk.add_file(path, content, modified=MODIFIED)
+    partials = dest / '.yandex-disk-rescue' / 'partial'
+    hashed = dest if phase == 'adopt' else partials
+    args: tuple[str, ...] = ()
+    if phase == 'resume':
+        for path in files:
+            disk.inject('GET', '/download', Truncate(after_bytes=MiB), where={'path': path})
+        cut = run_download('--download-retries', '0', '--download-passes', '1', _HASHED_ROOT, str(dest))
+        assert cut.exit_code == 1, cut.output
+        assert [partial.stat().st_size for partial in _partials(dest)] == [MiB] * count
+    elif phase == 'read back':
+        args = SEGMENTED_ARGS
+        _finishing_together(monkeypatch, partials, count, size)
+    else:
+        dest.mkdir()
+        for path, content in files.items():
+            (dest / PurePosixPath(path).name).write_bytes(content)
+    log = _slow_preads(monkeypatch)
+
+    result = run_download('-v', *args, _HASHED_ROOT, str(dest))
+    calls = list(log)
+
+    assert result.exit_code == 0, result.output
+    for path, content in files.items():
+        assert (dest / PurePosixPath(path).name).read_bytes() == content
+    paths = [path for _, path, _, _ in calls if _below(path, hashed) and Path(path).name[0].isdigit()]
+    assert len(set(paths)) == count
+    runs = [path for path, _ in itertools.groupby(paths)]
+    assert len(runs) == len(set(runs)), f'the files were hashed interleaved: {runs}'
+    assert any(message.endswith(" waits for another file's hash") for message in log_messages())
+
+
+def test_with_a_partial_folder_resume_re_hashes_do_not_wait_for_an_adoption_hash_of_dest(
+    big, dest, partial_root, monkeypatch
+):
+    partial = _leave_partial(big, dest, partial_root=partial_root)
+    copy = random.Random(5).randbytes(MiB)
+    big.add_file('disk:/Big/a.bin', copy, modified=MODIFIED)
+    (dest / 'a.bin').write_bytes(copy)
+    monkeypatch.setattr(destination_module, '_READ_SIZE', 256 * 1024)
+    resumed = threading.Event()
+    timed_out: list[str] = []
+    pread = os.pread
+
+    def adoption_waits_for_the_resume(fd, size, offset):
+        path = os.readlink(f'/proc/self/fd/{fd}')
+        if path == str(partial):
+            resumed.set()
+        elif path == str(dest / 'a.bin') and offset == 0 and not resumed.wait(10):
+            timed_out.append(path)
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', adoption_waits_for_the_resume)
+    earlier = len(big.requests)
+
+    result = run_download('--partial-dir', str(partial_root), '--scan-max-age', '0', 'disk:/Big', str(dest))
+
+    assert timed_out == []
+    assert result.exit_code == 0, result.output
+    assert (dest / 'a.bin').read_bytes() == copy
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    assert _fetches(big, 'disk:/Big/a.bin', earlier) == []
+
+
+@pytest.mark.anyio
+async def test_a_copy_waiting_for_the_hash_of_another_shows_it_waits_to_hash(disk, dest, monkeypatch):
+    files = {f'{_HASHED_ROOT}/{n}.bin': random.Random(50 + n).randbytes(MiB) for n in range(2)}
+    dest.mkdir()
+    for path, content in files.items():
+        disk.add_file(path, content, modified=MODIFIED)
+        (dest / PurePosixPath(path).name).write_bytes(content)
+    monkeypatch.setattr(destination_module, '_READ_SIZE', 256 * 1024)
+    held, release = threading.Event(), threading.Event()
+    pread = os.pread
+
+    def held_at_the_first_read(fd, size, offset):
+        if not held.is_set() and _below(os.readlink(f'/proc/self/fd/{fd}'), dest):
+            held.set()
+            release.wait(10)
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', held_at_the_first_read)
+    progress = MirrorProgress()
+
+    def states() -> list[str]:
+        return sorted(transfer.state for transfer in progress.snapshot().active)
+
+    async with _mirror_run(disk, _HASHED_ROOT, dest, progress=progress) as run:
+        task = asyncio.create_task(run())
+        try:
+            await _until(lambda: states() == ['hashing', 'waiting to hash'], 'one copy hashing, the other waiting')
+        finally:
+            release.set()
+        report = await task
+
+    assert report.adopted == list(files)
+
+
 def test_with_a_partial_folder_every_run_deletes_the_staged_copies_left_in_dest_and_nothing_else(
     big, dest, partial_root, monkeypatch
 ):
