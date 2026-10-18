@@ -33,7 +33,8 @@ Actions run execute exactly the same steps.
 | `package --source DIR` | `dist`, then `smoke` on its output — the `Package & install smoke` lane |
 | `release-notes --source DIR --version V` | The body of `CHANGELOG.md`'s `## [V] - YYYY-MM-DD` section, up to the next `## [` heading or the link references; fails when the section is missing, duplicated or empty |
 | `release --source DIR --tag vV` | Fails unless the tag is `v` + the project version, then runs `release-notes`, `dist` and `smoke`; returns `dist/` (the sdist and the wheel) and `notes.md` — `mise run release:dist` |
-| `published --tag vV --dist DIR [--timeout S]` | Never cached. Waits (default 600 s) until PyPI lists both files of `--dist` with their local SHA-256, then `uv tool install yandex-disk-rescue==V` by name in a clean container, retrying while the index lags, and checks `--version` — `mise run release:verify` |
+| `index-serves --tag vV --dist DIR [--timeout S] [--index-url URL]` | Never cached. Polls `<index-url>/yandex-disk-rescue/V/json` (default PyPI) until it lists exactly the files of `--dist` with their local SHA-256; fails at once on a file the dist lacks or another digest, retries dropped connections, HTTP errors and truncated bodies, and on timeout names what it last saw |
+| `published --tag vV --dist DIR [--timeout S]` | Never cached. `index-serves` against PyPI (default 600 s), then `uv tool install yandex-disk-rescue==V` by name in a clean container, retrying while the index lags, and checks `--version` — `mise run release:verify` |
 
 `--source` defaults to the repository root (minus `.venv`, caches and
 generated SDKs), so the usual call is just:
@@ -48,8 +49,9 @@ dagger call workspace terminal  # debug shell inside the CI container
 ```
 
 Module tests (`.dagger/tests`) assert the toolchain, the workspace sync, the names `dist` exports, the
-CHANGELOG sections `release-notes` returns or refuses, and that `release` refuses a tag that is not the project
-version:
+CHANGELOG sections `release-notes` returns or refuses, that `release` refuses a tag that is not the project
+version, and that `index-serves` refuses a digest mismatch or extra files, retries until the listing is complete
+and times out naming the last listing (against a fake index):
 
 ```bash
 mise run ci:selftest            # = cd .dagger/tests && dagger call all
