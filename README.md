@@ -220,12 +220,11 @@ interrupted (Ctrl+C, SIGTERM, SIGKILL, a crash) leaves the previous scan in
 place, and the next run scans again from the start. Ctrl+C or SIGTERM
 (`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; the manifest
 holds the last completed scan.` and exits with 130 (Ctrl+C) or 143
-(SIGTERM). Scanning a
-folder replaces only that folder's part of the manifest. The manifest also
-records when each scan completed, and the entries left out because their
-names are not valid Unicode. Only one run can use
-the manifest at a time; a second one fails with `Another yandex-disk-rescue
-run is using ...`.
+(SIGTERM). Scanning a folder replaces only that folder's part of the
+manifest. The manifest also records when each scan completed, and the
+entries left out because their names are not valid Unicode. Only one run
+can use the manifest at a time; a second one fails with `Another
+yandex-disk-rescue run is using ...`.
 Paths outside `disk:/` (such as `trash:/`) are refused.
 
 ## Downloading
@@ -286,14 +285,14 @@ resume — happens on that disk, not on DEST:
   `PATH` is deleted once that is recorded.
 - A run stopped anywhere on the way (Ctrl+C, SIGTERM, SIGKILL, a crash, a
   power cut) never leaves a cut-short file at a final path, and fetches
-  nothing of that file again. Until the outcome is recorded, the partial file below `PATH`
-  and its journal stay as they are. Stopped before the copy is placed, it
-  leaves a staged copy, which the next run deletes at its start and then
-  copies the file again. Stopped once the copy is placed but before it is
-  recorded, it leaves the file at its final path, which the next run hashes,
-  adopts as matching the Disk, and then deletes the partial file. Stopped
-  after the record, it leaves only the partial file, which the next run
-  deletes at its start.
+  nothing of that file again. Until the outcome is recorded, the partial
+  file below `PATH` and its journal stay as they are. Stopped before the
+  copy is placed, it leaves a staged copy, which the next run deletes at its
+  start and then copies the file again. Stopped once the copy is placed but
+  before it is recorded, it leaves the file at its final path, which the
+  next run hashes, adopts as matching the Disk, and then deletes the partial
+  file. Stopped after the record, it leaves only the partial file, which the
+  next run deletes at its start.
 - A file waiting for its copy keeps its place among the
   `download_connections` files in progress, so when DEST is slower than the
   network, fetching slows down instead of filling `PATH`.
@@ -759,8 +758,9 @@ the manifest, is a usage error (exit `2`); `verify` never creates a manifest.
 until every file is checked. Ctrl+C or SIGTERM (`kill`, `systemctl stop`,
 `docker stop`) prints `Interrupted; rerun verify to continue where it
 stopped.` and exits with 130 (Ctrl+C) or 143 (SIGTERM); the findings made so
-far stay recorded. The next `verify DEST` continues the pass instead of starting over:
-it reads only the files after the last one checked, and starts with
+far stay recorded. The next `verify DEST` continues the pass instead of
+starting over: it reads only the files after the last one checked, and
+starts with
 
 ```
 Continuing the verification started 2026-10-17 09:30 UTC: 412 files (380.5 MiB) left
@@ -827,14 +827,14 @@ data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
 - Notices and report lines written while a phase runs are printed above the
   view, literally: a name such as `[red]x[/red].txt` shows as it is.
 - The view is cleared when its phase ends, also when the run stops with an
-  error, Ctrl+C or SIGTERM, and the cursor is shown again. What stays on the terminal
-  is the report, the notices and the result line.
+  error, Ctrl+C or SIGTERM, and the cursor is shown again. What stays on the
+  terminal is the report, the notices and the result line.
 
 **Status lines.** Off a terminal, each slow phase writes one status line every
 `progress_interval` seconds (default 60; see
 [Configuration](#configuration)), then a last line when it ends, also when
-the run stops with an error, Ctrl+C or SIGTERM. A multi-day run under `nohup` thus
-writes one line a minute:
+the run stops with an error, Ctrl+C or SIGTERM. A multi-day run under
+`nohup` thus writes one line a minute:
 
 ```
 2026-10-17T09:30:14.002Z Scanning disk:/: 45120 files, 3200 folders (812.3 GiB) listed, 1024 folders to list
@@ -1124,8 +1124,10 @@ does: it takes its last checkpoints, prints `Interrupted; …` and exits with
 143, and the next run continues from there. This holds also for a background
 job that a script starts, whose SIGINT is ignored; `kill -INT <pid>` stops
 the run only when it was started from an interactive shell. A SIGTERM sent
-while the run is already stopping is ignored, so the last checkpoints are
-never cut short; SIGKILL ends the run at once.
+while the run is already stopping, on Ctrl+C or an earlier SIGTERM, is
+ignored, so the last checkpoints are never cut short. A Ctrl+C during a
+SIGTERM stop takes over: the run stops at once, without waiting for the last
+checkpoints, and exits with 130. SIGKILL ends the run at once.
 
 ### As a systemd user service
 

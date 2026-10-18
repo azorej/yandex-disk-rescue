@@ -30,6 +30,9 @@ class _Stop:
         task = self.task
         if task is None or task.done():
             raise Terminated
+        # Already stopping on Ctrl+C: another cancellation would cut its cleanup short.
+        if task.cancelling():
+            return
         task.cancel()
         self.cancelled = task
         # Wake the loop should it be blocked in select() with a long timeout.
@@ -47,8 +50,8 @@ def _in_main_thread() -> bool:
 def sigterm_stops() -> Iterator[None]:
     """Make SIGTERM stop the run while the context is active: the first SIGTERM raises `Terminated` in the main thread,
     or, inside `run`, cancels the running coroutine's task, which then ends `run` with `Terminated`; every later
-    SIGTERM is ignored. The SIGTERM handler found is restored on every exit. Outside the main thread, which signals
-    never reach, it does nothing."""
+    SIGTERM, and one that arrives while Ctrl+C is stopping `run`, is ignored. The SIGTERM handler found is restored on
+    every exit. Outside the main thread, which signals never reach, it does nothing."""
     global _active
     if not _in_main_thread():
         yield

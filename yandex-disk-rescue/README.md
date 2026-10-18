@@ -280,6 +280,7 @@ yandex-disk-rescue/
     ├── test_cli.py
     ├── test_config.py
     ├── test_download.py
+    ├── test_interrupts.py
     ├── test_local_names.py
     ├── test_manifest.py
     ├── test_output.py

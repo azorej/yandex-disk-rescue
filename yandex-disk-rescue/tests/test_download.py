@@ -3039,16 +3039,24 @@ os.fsync = fsync
 """
 
 
-def test_sigterm_stops_a_background_job_ignoring_sigint_and_a_second_sigterm_keeps_the_final_checkpoint(
-    big, dest, tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ('first', 'sigint_ignored', 'exit_code', 'logged'),
+    [
+        (signal.SIGTERM, True, 143, 'download interrupted by SIGTERM (exit 143)'),
+        (signal.SIGINT, False, 130, 'download interrupted (exit 130)'),
+    ],
+    ids=['sigterm-in-a-background-job-ignoring-sigint', 'ctrl-c'],
+)
+def test_a_sigterm_while_the_run_stops_keeps_the_final_checkpoint(
+    big, dest, tmp_path, monkeypatch, first, sigint_ignored, exit_code, logged
 ):
     big.chunk_delay = 0.2
     gate = _gated(monkeypatch, tmp_path, _HOLDING_FSYNC_GATE)
-    child = start_command('download', 'disk:/Big', str(dest), sigint_ignored=True)
+    child = start_command('download', 'disk:/Big', str(dest), sigint_ignored=sigint_ignored)
     try:
         wait_until(lambda: _partial_size(dest) > 256 * 1024, child, 'wrote 256 KiB')
         (gate / 'go').touch()
-        child.send_signal(signal.SIGTERM)
+        child.send_signal(first)
         wait_until(lambda: any(gate.glob('blocked-*')), child, 'took its final checkpoint')
         child.send_signal(signal.SIGTERM)
         time.sleep(0.5)
@@ -3059,9 +3067,9 @@ def test_sigterm_stops_a_background_job_ignoring_sigint_and_a_second_sigterm_kee
         child.communicate()
     monkeypatch.delenv('PYTHONPATH')
 
-    assert child.returncode == 143, stderr
+    assert child.returncode == exit_code, stderr
     assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
-    assert log_messages()[-1] == 'download interrupted by SIGTERM (exit 143)'
+    assert log_messages()[-1] == logged
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
     assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
