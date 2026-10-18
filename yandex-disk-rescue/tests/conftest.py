@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from fake_disk_server import FakeDiskApi, start_fake_disk_server
+from fake_disk_server import FakeDiskApi, serve
 from mirror_tree import FILES, MODIFIED, SIZE_ONLY, TOKEN
 from yandex_disk_rescue import mirroring
 
@@ -31,14 +31,9 @@ def anyio_backend() -> str:
 @pytest.fixture
 def fake_disk_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeDiskApi]:
     """A real HTTP server on 127.0.0.1 standing in for the Yandex Disk API, wired in via YANDEX_DISK_RESCUE_API_URL."""
-    api, server, thread = start_fake_disk_server()
-    monkeypatch.setenv('YANDEX_DISK_RESCUE_API_URL', api.base_url)
-    try:
+    with serve() as api:
+        monkeypatch.setenv('YANDEX_DISK_RESCUE_API_URL', api.base_url)
         yield api
-    finally:
-        server.shutdown()
-        server.server_close()
-        thread.join()
 
 
 @pytest.fixture

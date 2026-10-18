@@ -248,6 +248,10 @@ yandex-disk-rescue/
     ├── data/manifest-v3.sql # A schema-v3 manifest dump with download records, the input of a migration test
     ├── data/manifest-v4.sql # A schema-v4 manifest dump with a verified and a partial record, the input of a
     │                        #   migration test
+    ├── installed/test_installed_cli.py # End-to-end tests of the `yandex-disk-rescue` on `PATH` in child processes
+    │                       #   with an environment of their own, against the fake API: `--version`, `--help`,
+    │                       #   `auth status`, a download with segmented files, a rerun, `verify`; stdlib, pytest
+    │                       #   and `fake_disk_server` only, run against the dev install and against the built wheel
     ├── conftest.py         # Autouse env/XDG isolation; the `fake_disk_api` and `closed_port_url` fixtures; `disk`
     │                       #   (the fake serving `mirror_tree.FILES`), `dest`, and `partial_root` (a folder on
     │                       #   `/dev/shm`, another filesystem than `dest`'s)
@@ -255,7 +259,8 @@ yandex-disk-rescue/
     │                       #   in a child process and waiting on it, the local path of a Disk file, the replaced
     │                       #   and quarantine run folders, a corrupted copy of bytes, the messages of the log file,
     │                       #   the lines of stderr without the notice timestamps
-    ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
+    ├── fake_disk_server.py # Real-socket fake Disk API and download host (stdlib only), started by `serve()` for
+    │                       #   the length of a `with` block: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
     │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
