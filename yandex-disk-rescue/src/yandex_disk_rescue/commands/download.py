@@ -11,10 +11,10 @@ from typing import Annotated
 import typer
 
 from yandex_disk_rescue import api, auth, paths, settings
-from yandex_disk_rescue.destination import Destination, check_destination
+from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest, ScanTime
-from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, TransferPolicy, mirror_summary
+from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, PartialRoom, TransferPolicy, mirror_summary
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -63,6 +63,7 @@ def download(
             'alone.',
         ),
     ] = False,
+    partial_dir: settings.PartialDir = settings.PARTIAL_DIR.default,
     scan_max_age: settings.ScanMaxAge = settings.SCAN_MAX_AGE.default,
     download_timeout: settings.DownloadTimeout = settings.DOWNLOAD_TIMEOUT.default,
     download_retries: settings.DownloadRetries = settings.DOWNLOAD_RETRIES.default,
@@ -84,6 +85,7 @@ def download(
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
     destination = check_destination(dest)
+    partial_folder = check_partial_dir(partial_dir, destination)
     token = auth.get_token()
     limits = settings.api_limits(
         interval_ms=api_interval_ms, concurrency=api_concurrency, timeout=api_timeout, retries=api_retries
@@ -95,6 +97,7 @@ def download(
                 token,
                 root,
                 destination,
+                partial_dir=partial_folder,
                 base_url=api_url,
                 limits=limits,
                 scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
@@ -185,6 +188,7 @@ async def _run(
     root: str,
     destination_path: Path,
     *,
+    partial_dir: Path | None,
     base_url: str,
     limits: api.ApiLimits,
     scan_policy: _ScanPolicy,
@@ -197,7 +201,7 @@ async def _run(
         scan_root = await resolve_scan_root(client, root)
         with Manifest.open(manifest_path) as manifest:
             reused = scan_policy.reused(scan_root.path, manifest.last_scan(account.uid, scan_root.path))
-            with Destination.open(destination_path) as destination:
+            with Destination.open(destination_path, partial_dir=partial_dir) as destination:
                 mirror = manifest.mirror(account.uid, scan_root.path, destination.path)
                 if reused is None:
                     for line in scan_summary(await scan_tree(client, manifest, account, scan_root)):
@@ -220,6 +224,18 @@ async def _mirror(
         )
     else:
         typer.echo(f'Downloading {run.pending_files} {files} ({size}) to {destination.path}')
+    if (move := run.partial_move) is not None and move.downloads:
+        if move.missing:
+            typer.echo(
+                f'The partial folder of the last run, {move.source}, is missing; its downloads in progress start '
+                'again from their first byte.'
+            )
+        else:
+            downloads = 'download' if move.downloads == 1 else 'downloads'
+            typer.echo(
+                f'Moving the confirmed bytes ({format_size(move.size)}) of {move.downloads} {downloads} in progress '
+                f'from {move.source} to {move.target}'
+            )
     async with api.ContentClient(timeout=transfers.timeout, connections=transfers.connections) as content:
         policy = TransferPolicy(
             retries=transfers.retries,
@@ -227,4 +243,8 @@ async def _mirror(
             segments=transfers.segments,
             segment_threshold=transfers.segment_threshold_mib * 2**20,
         )
-        return await run.run(client, content, policy, passes=transfers.passes)
+        return await run.run(client, content, policy, passes=transfers.passes, room_measured=_show_room)
+
+
+def _show_room(room: PartialRoom) -> None:
+    typer.echo(f'Partial files in {room.folder} ({format_size(max(room.capacity, 0))} available)')

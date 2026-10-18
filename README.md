@@ -184,7 +184,7 @@ created before anything inside it, empty folders are created, and every file
 gets the modification time it has on the Disk. It takes the `--api-*`
 options, `--download-timeout`, `--download-retries`, `--download-passes`,
 `--download-connections`, `--download-checkpoint-mib`, `--download-segments`,
-`--download-segment-threshold-mib` and `--scan-max-age` (see
+`--download-segment-threshold-mib`, `--partial-dir` and `--scan-max-age` (see
 [Configuration](#configuration)), `--no-scan` and `--retry-failed`
 (below). A file whose download host never answers holds one connection until
 it stalls and delays no other file.
@@ -194,11 +194,95 @@ it stalls and delays no other file.
 byte ranges fetched in parallel, each with an HTTP `Range` request on a
 connection of its own, all into one partial file that is first extended to the
 file's full size. Once every segment is in, the whole file is read back and
-checked against its size and checksums. A file at or below the threshold, and
-every file when `download_segments` is `1`, is fetched as one stream and
-checked as it arrives. The segments of a download are fixed when it starts: a
-download resumed by a later pass or a later run keeps them, even when the
-options changed since.
+checked against its size and checksums (with `--partial-dir`, the copy to
+DEST is the check; below). A file at or below the threshold, and every file
+when `download_segments` is `1`, is fetched as one stream and checked as it
+arrives. The segments of a download are fixed when it starts: a download
+resumed by a later pass or a later run keeps them, even when the options
+changed since.
+
+**Partial files.** A file being downloaded lives in a partial file, named by
+the file's id in the manifest. By default partial files are in
+`DEST/.yandex-disk-rescue/partial/`, and a verified partial file is itself
+moved to its final path. With `--partial-dir PATH` (`partial_dir` in the
+config file) they are kept below `PATH` instead, so all of their disk work —
+the writes of many files at once, the flush of every checkpoint, extending a
+segmented file to its full size, and re-reading the confirmed bytes on a
+resume — happens on that disk, not on DEST:
+
+- `PATH` must be an existing folder outside DEST, given as an absolute path;
+  anything else is a usage error (exit `2`). The tool creates only its own
+  folder of this DEST below it, `PATH/<key>/`, where `<key>` is the first 16
+  hex digits of the SHA-256 of DEST's resolved path. So one `partial_dir` in
+  the config file serves every destination. That folder holds only partial
+  files.
+- Once every byte of a file is in, it is copied to
+  `DEST/.yandex-disk-rescue/partial/<id>.copy` as one sequential stream, one
+  file at a time for the whole run, so DEST sees a single writer. The size
+  and checksums are checked over the bytes as they are copied, so DEST is
+  never read back. The copy gets the Disk modification time, is flushed to
+  the disk, and is then placed like any verified file, or quarantined in
+  DEST's `quarantine/` (below) when the check fails. The partial file below
+  `PATH` is deleted once that is recorded.
+- A run stopped anywhere on the way (Ctrl+C, a kill, a crash, a power cut)
+  never leaves a cut-short file at a final path, and fetches nothing of that
+  file again. Until the outcome is recorded, the partial file below `PATH`
+  and its journal stay as they are. Stopped before the copy is placed, it
+  leaves a staged copy, which the next run deletes at its start and then
+  copies the file again. Stopped once the copy is placed but before it is
+  recorded, it leaves the file at its final path, which the next run hashes,
+  adopts as matching the Disk, and then deletes the partial file. Stopped
+  after the record, it leaves only the partial file, which the next run
+  deletes at its start.
+- A file waiting for its copy keeps its place among the
+  `download_connections` files in progress, so when DEST is slower than the
+  network, fetching slows down instead of filling `PATH`.
+- The partial files never take more than the room `PATH` had when the run
+  started: the free space of its filesystem, plus what the partial files
+  already there take, minus a reserve of 1 GiB left for everything else.
+  Once any move (below) is done, the run prints `Partial files in PATH/<key>
+  (<size> available)`. A file being downloaded counts its full size; a
+  partial file kept for a later pass or run counts the disk space it
+  actually takes, which for a segmented file is only what was written so
+  far, until it is deleted (also when its file is found already in DEST
+  and adopted). Files take their room in path order, a file that does not
+  fit yet waits for one in progress to end, and when none is left in
+  progress it is deferred to the next pass with `no room yet in the partial
+  folder <folder> (<size> needed, <size> available)`. When a pass starts no
+  download and frees no room, and every file it defers waits for room, the
+  partial files kept there can never make room for each other: those files
+  fail at once, whatever `--download-passes` says, with `no room in the
+  partial folder <folder> next to the partial files kept there (<size>
+  needed, <size> available); free space there, then run again or with
+  --retry-failed`. A file larger than the whole room fails with `larger than
+  the room in the partial folder <folder> (<size> needed, <size>
+  available)`; `--retry-failed` fetches it once there is room.
+  When another program fills that disk anyway, the run stops with `Error:
+  Could not write <path>: No space left on device.` (below) and a rerun
+  resumes from the journals.
+- Use a persistent folder on a fast local disk: not a tmpfs, and not a
+  container layer that a rebuild discards. When the folder is lost, the
+  downloads in progress start again from their first byte. Do not share one
+  `PATH` between machines.
+- The manifest records which folder the partial files of each DEST are in.
+  When a run's folder differs from it — the option turned on or off, or
+  `PATH` changed — the run first moves the downloads in progress there,
+  printing `Moving the confirmed bytes (<size>) of N downloads in progress
+  from <old> to <new>`. Only the bytes the journals confirm are copied, one
+  file at a time; the rest (bytes past the last checkpoint, a segmented
+  file's zero-fill) is never read and is fetched again. Each copy is flushed
+  to the disk before its old file is deleted, and the old folder is deleted
+  at the end (for DEST's own `partial/`, only the files in it). A run stopped
+  during the move goes on with it on the next run, losing no confirmed byte.
+  A confirmed range missing from an old file cut short (by hand, or by a
+  power cut on a disk that lost the end of a write) is fetched again. When
+  the recorded folder is gone and downloads were in progress, the run prints
+  `The partial folder of the last run, <old>, is missing; its downloads in
+  progress start again from their first byte.`, and they do. The recorded
+  folder reached under another path (a bind mount, a link on the way) is
+  the same folder: nothing is moved, and the new path is recorded.
+- Remounting DEST at another path makes it a new mirror with a new `<key>`;
+  the old `PATH/<key>/` can then be deleted.
 
 **When it scans.** `download` reuses the last completed scan of the account
 covering REMOTE_PATH — a scan of REMOTE_PATH itself or of a folder above it,
@@ -226,7 +310,9 @@ scans.
 
 **Verified.** A file reaches its final path only after its size and every
 checksum the Disk has for it (MD5 and SHA-256) match the downloaded bytes.
-Until then it is written to `DEST/.yandex-disk-rescue/partial/`. A file with
+Until then it is written to the partial folder (`DEST/.yandex-disk-rescue/partial/`,
+or the one below `--partial-dir`, where the check runs over the bytes copied
+to DEST). A file with
 neither checksum on the Disk can only be checked by its size; the summary
 lists such files. Placing a file never replaces anything at its final path.
 
@@ -401,9 +487,18 @@ symbolic link is moved as the link itself; the tool never follows one inside
 DEST and never writes to its target. DEST itself may be a link.
 
 **Nothing is deleted.** The tool never deletes or truncates anything outside
-`DEST/.yandex-disk-rescue/partial/`; there, at the start of a run, it also
-deletes every file that is not the partial file of a download in progress
-(folders and links there are left alone). Moved-aside and quarantined copies
+`DEST/.yandex-disk-rescue/partial/` and, with `--partial-dir PATH`, DEST's
+folder `PATH/<key>/`, or the `<key>/` folder below the `PATH` an earlier run
+used. At the start of every run it deletes the staged copies
+(`<id>.copy` files) in `DEST/.yandex-disk-rescue/partial/`, and in the partial
+folder of the run every file that is not the partial file of a download in
+progress (folders and links there are left alone). After moving the
+downloads in progress out of an earlier run's partial folder, it deletes the
+files left in it, then the folder itself when it is empty (DEST's own
+`partial/` stays). A partial file that cannot
+be deleted once its file's outcome is recorded (a folder made there under its
+name, say) is listed under `Partial files not deleted` with the reason; the
+file still counts as verified or quarantined. Moved-aside and quarantined copies
 stay in `replaced/` and `quarantine/` until you remove them, after checking
 them. A quarantined copy whose file later verified, or whose record a new
 Disk version replaced, is no longer listed anywhere; browse the
@@ -423,7 +518,8 @@ A DEST that is not a folder or whose parent does not exist, or a DEST
 starting with `disk:` (swapped arguments), is a usage error (exit `2`). A
 destination mirrors exactly one remote folder of one account; downloading
 another folder into it is refused. `DEST/.yandex-disk-rescue/` is the tool's
-work directory: it holds partial files, the `replaced/` and `quarantine/`
+work directory: it holds partial files (or, with `--partial-dir`, the copies
+of finished ones), the `replaced/` and `quarantine/`
 folders and a lock, so only one run at a time can use a destination
 (`Another yandex-disk-rescue run is using DEST`), even runs with different
 manifests. The destination's filesystem must support
@@ -431,7 +527,8 @@ renaming without replacing (`RENAME_NOREPLACE`; ext4, xfs, btrfs, tmpfs and
 HFS+ do); the run stops at the start otherwise. A full disk or quota, an I/O
 error or a read-only filesystem stops the run with
 `Error: Could not write <path>: <reason>.`, and so does a permission error
-inside `DEST/.yandex-disk-rescue/`. A permission error on a path of the
+inside `DEST/.yandex-disk-rescue/` or the partial folder below
+`--partial-dir`. A permission error on a path of the
 mirror — a file or folder there owned by another user, or without the needed
 read, write or search permission — fails only the entries it affects, with
 `could not read <path>: <reason>`, `could not write <path>: <reason>` or
@@ -491,18 +588,23 @@ a segmented file; the segments queue for the same connections). Link requests
 and look-ups go to the Disk API and are paced separately, by
 `api_interval_ms` and `api_concurrency` (see [Rate limiting](#rate-limiting)).
 
-Many files written at once make a hard disk seek between them. On a USB hard
-disk, start around 8 connections and raise them while the throughput grows.
+Many files written at once make a hard disk seek between them. When DEST is a
+hard disk (a USB one especially), set `partial_dir` to a folder on a fast
+local disk with free space for at least the largest file plus 1 GiB
+([Partial files](#downloading)): the interleaved writes of the
+files in progress, the checkpoint flushes, the zeros written to extend a
+segmented file, and the re-reading of confirmed bytes on a resume all move
+there, and DEST only receives one sequential copy of each finished file.
 
 Segments speed up one large file on a fast link whose single connection is the
 limit; a folder of small files gains nothing from them, since its files
-already download in parallel. They cost disk work: on a filesystem without
-sparse files (HFS+, exFAT, FAT), extending the partial file to its full size
-writes zeros first, so a segmented file is written twice (zeros, then data)
-and read once more for verification. On such a disk, especially a USB hard
-disk, prefer `download_segments = 1` or `2`. The defaults (4 segments above
-256 MiB) are those of the Windows
-[Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
+already download in parallel. They cost disk work in the partial folder: on a
+filesystem without sparse files (HFS+, exFAT, FAT), extending the partial file
+to its full size writes zeros first, so a segmented file is written twice
+(zeros, then data) and, with partial files in DEST, read once more for
+verification. With partial files on such a disk, prefer `download_segments = 1`
+or `2`, or set `partial_dir`. The defaults (4 segments above 256 MiB) are those
+of the Windows [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
 A smaller `download_checkpoint_mib` means less fetched again after a crash or
 a power cut, at the cost of more flushes to the disk and more manifest
@@ -665,12 +767,15 @@ first one that sets it wins:
 | `download_checkpoint_mib` | `--download-checkpoint-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_CHECKPOINT_MIB` | `32` | 1 to 1024 (MiB); bytes a segment receives between two checkpoints of a download |
 | `download_segments` | `--download-segments` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENTS` | `4` | 1 to 8; segments of a file above the segment threshold, fetched in parallel; `1` never splits |
 | `download_segment_threshold_mib` | `--download-segment-threshold-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | `256` | 1 to 65536 (MiB); a larger file is downloaded as segments |
+| `partial_dir` | `--partial-dir` (`download`) | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | empty (partial files in DEST) | an absolute path of an existing folder outside DEST, or empty; see [Partial files](#downloading) |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
-(`auth login`, `auth status`, `scan`, `download`); the `download_*` options
-and `scan_max_age` apply to `download` and `client_id` to `auth login`.
+(`auth login`, `auth status`, `scan`, `download`); the `download_*` options,
+`partial_dir` and `scan_max_age` apply to `download` and `client_id` to `auth login`.
+`--partial-dir ''` keeps partial files in DEST whatever the config file says;
+an empty environment variable counts as unset, as for every option.
 
 The config file is `$XDG_CONFIG_HOME/yandex-disk-rescue/config.toml`
 (`~/.config/yandex-disk-rescue/config.toml` when `XDG_CONFIG_HOME` is unset

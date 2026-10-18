@@ -224,7 +224,7 @@ def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_a
 
     _scan(db, TREE)
     with sqlite3.connect(db) as connection:
-        connection.execute('DROP TABLE verify_passes')
+        connection.execute('ALTER TABLE mirrors DROP COLUMN partial_folder')
         connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 1}')
     with Manifest.open_existing(db) as manifest:
         assert [r.path for r in manifest.entries(UID, 'disk:/')] == sorted(r.path for r in TREE)
@@ -234,7 +234,7 @@ def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_a
             Manifest.open_existing(db)
     with closing(sqlite3.connect(db)) as connection:
         assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
-        assert connection.execute('SELECT count(*) FROM verify_passes').fetchone()[0] == 0
+        assert connection.execute('SELECT count(partial_folder) FROM mirrors').fetchone()[0] == 0
 
 
 def test_a_newer_schema_version_is_refused(tmp_path):
@@ -367,7 +367,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 9
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -391,7 +391,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 9
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -405,7 +405,9 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
     with Manifest.open(db) as manifest:
         mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
         entries = {e.resource.path: e for e in mirror.entries()}
+        partial_folder = mirror.partial_folder
 
+    assert partial_folder is None
     assert {path: e.failure for path, e in entries.items()} == {
         'disk:/Photos': None,
         'disk:/Photos/a.jpg': None,
@@ -420,7 +422,7 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 8
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 9
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
@@ -439,6 +441,25 @@ def test_a_mirror_is_found_again_by_its_destination(tmp_path):
 
     assert (again.id, again.destination, again.remote_root) == (first.id, dest, 'disk:/A')
     assert other.id != first.id
+
+
+def test_a_mirrors_partial_folder_round_trips_and_belongs_to_that_mirror_only(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    folder = Path(os.fsdecode(b'/var/tmp/partials-\xff/0123456789abcdef'))
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/A', tmp_path / 'dest')
+        manifest.mirror(UID, 'disk:/A', tmp_path / 'elsewhere')
+        assert mirror.partial_folder is None
+        mirror.record_partial_folder(folder)
+        with pytest.raises(ValueError, match='not an absolute path'):
+            mirror.record_partial_folder(Path('relative'))
+
+    with Manifest.open(db) as manifest:
+        mirror = manifest.mirror(UID, 'disk:/A', tmp_path / 'dest')
+        assert mirror.partial_folder == folder
+        assert manifest.mirror(UID, 'disk:/A', tmp_path / 'elsewhere').partial_folder is None
+        mirror.record_partial_folder(None)
+        assert mirror.partial_folder is None
 
 
 def test_a_recorded_mirror_is_looked_up_by_its_destination_without_creating_one(tmp_path):

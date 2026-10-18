@@ -1,6 +1,7 @@
 """Tests for the config file layer: real TOML files feeding the registry options of `scan` and `auth`."""
 
 import itertools
+import re
 import sqlite3
 import urllib.parse
 from contextlib import closing
@@ -18,7 +19,7 @@ TOKEN = 'y0_AgAAAAB-config-sentinel-token'
 OPTIONS = (
     'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, download_retries, '
     'download_passes, download_connections, download_checkpoint_mib, download_segments, '
-    'download_segment_threshold_mib, scan_max_age, client_id'
+    'download_segment_threshold_mib, partial_dir, scan_max_age, client_id'
 )
 
 
@@ -158,6 +159,11 @@ def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, ag
             'download_segment_threshold_mib: must be an integer from 1 to 65536.',
         ),
         ('scan_max_age = 10081\n', 'scan_max_age: must be an integer from 0 to 10080.'),
+        (
+            'partial_dir = "relative"\n',
+            'partial_dir: must be an absolute path, or empty to keep partial files in DEST.',
+        ),
+        ('partial_dir = 1\n', 'partial_dir: must be a string.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
         (b'client_id = "\xff"\n', 'is not UTF-8 text.'),
@@ -208,3 +214,26 @@ def test_download_reads_its_connection_cap_from_the_config_file(disk, tmp_path):
     assert result.exit_code == 0, result.output
     assert len([r for r in disk.requests if r.path == '/download']) == 4
     assert disk.peak_content_in_flight == 1
+
+
+@pytest.mark.parametrize('override', [False, True], ids=['config', 'empty-flag'])
+def test_download_reads_the_partial_folder_from_the_config_file_and_an_empty_flag_turns_it_off(
+    disk, tmp_path, partial_root, override
+):
+    _write_default_config(f'partial_dir = "{partial_root}"\n')
+    dest = tmp_path / 'dest'
+    off = ['--partial-dir', ''] if override else []
+
+    result = runner.invoke(app, ['download', *off, str(dest)])
+
+    assert result.exit_code == 0, result.output
+    if override:
+        assert 'Partial files' not in result.stdout
+        assert list(partial_root.iterdir()) == []
+    else:
+        [folder] = partial_root.iterdir()
+        assert re.search(
+            rf'^Partial files in {re.escape(str(folder))} \([0-9.]+ [KMG]iB available\)$', result.stdout, re.M
+        )
+        assert list(folder.iterdir()) == []
+    assert (dest / 'A' / 'file.txt').read_bytes() == b'A'

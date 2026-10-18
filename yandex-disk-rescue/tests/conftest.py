@@ -1,12 +1,16 @@
 """Shared fixtures for the yandex-disk-rescue tests."""
 
 import os
+import shutil
 import socket
+import tempfile
 from collections.abc import Iterator
+from pathlib import Path
 
 import pytest
 from fake_disk_server import FakeDiskApi, start_fake_disk_server
 from mirror_tree import FILES, MODIFIED, SIZE_ONLY, TOKEN
+from yandex_disk_rescue import mirroring
 
 
 @pytest.fixture(autouse=True)
@@ -63,3 +67,18 @@ def disk(fake_disk_api, monkeypatch):
 @pytest.fixture
 def dest(tmp_path):
     return tmp_path / 'dest'
+
+
+@pytest.fixture
+def partial_root(tmp_path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A folder on `/dev/shm`, a filesystem other than the one `tmp_path` (and so `dest`) is on, removed afterwards.
+
+    `/dev/shm` is far smaller than `mirroring.PARTIAL_RESERVE`, so runs in this process keep no reserve there.
+    """
+    monkeypatch.setattr(mirroring, 'PARTIAL_RESERVE', 0)
+    root = Path(tempfile.mkdtemp(dir='/dev/shm'))
+    try:
+        assert root.stat().st_dev != tmp_path.stat().st_dev, '/dev/shm must be a filesystem of its own'
+        yield root
+    finally:
+        shutil.rmtree(root)

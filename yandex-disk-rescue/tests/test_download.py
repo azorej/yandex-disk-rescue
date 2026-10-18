@@ -15,10 +15,10 @@ import sqlite3
 import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager, closing
+from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import pytest
 from fake_disk_server import Delay, FakeResponse, Truncate
@@ -117,9 +117,57 @@ def segmented(disk):
     return disk
 
 
-def _partials(dest) -> list:
-    folder = dest / '.yandex-disk-rescue' / 'partial'
+def _separate_folder(dest, partial_root):
+    """The folder of `dest` below the partial folder `partial_root`, named by the SHA-256 of its path."""
+    return partial_root / hashlib.sha256(os.fsencode(dest)).hexdigest()[:16]
+
+
+def _partials(dest, partial_root=None) -> list:
+    """The partial files of `dest`: in its own partial folder, or in its folder below `partial_root`."""
+    folder = dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
     return sorted(folder.iterdir()) if folder.is_dir() else []
+
+
+def _partial_args(partial_root) -> tuple[str, ...]:
+    return () if partial_root is None else ('--partial-dir', str(partial_root))
+
+
+def _io_log(monkeypatch, calls: tuple[str, ...]) -> list[tuple[str, str, int, int]]:
+    """Log `(call, path, offset, length)` for every call of `os.<call>`, the path read from `/proc/self/fd`;
+    `os.write` and `os.read` log the file position as the offset (-1 when there is none), `os.ftruncate` the new
+    length."""
+    log: list[tuple[str, str, int, int]] = []
+
+    def position(fd: int) -> int:
+        try:
+            return os.lseek(fd, 0, os.SEEK_CUR)
+        except OSError:
+            return -1
+
+    measures = {
+        'pwrite': lambda fd, data, offset: (offset, len(data)),
+        'pread': lambda fd, size, offset: (offset, size),
+        'write': lambda fd, data: (position(fd), len(data)),
+        'read': lambda fd, size: (position(fd), size),
+        'ftruncate': lambda fd, length: (length, 0),
+    }
+
+    def logged(call: str):
+        original, measure = getattr(os, call), measures[call]
+
+        def wrapper(fd, *args):
+            log.append((call, os.readlink(f'/proc/self/fd/{fd}'), *measure(fd, *args)))
+            return original(fd, *args)
+
+        return wrapper
+
+    for call in calls:
+        monkeypatch.setattr(os, call, logged(call))
+    return log
+
+
+def _below(path: str, folder) -> bool:
+    return path.startswith(f'{folder}/')
 
 
 def _partial_size(dest) -> int:
@@ -135,12 +183,14 @@ def _tail(start: int) -> str:
     return f'bytes={start}-{len(BIG) - 1}'
 
 
-def _leave_partial(fake, dest, *, after_bytes: int = 300_000):
-    """Run a download of `disk:/Big` cut short with no retry and no later pass, which keeps its partial file."""
+def _leave_partial(fake, dest, *, after_bytes: int = 300_000, partial_root=None):
+    """Run a download of `disk:/Big` cut short with no retry and no later pass, which keeps its partial file, in DEST
+    or below `partial_root`."""
     fake.inject('GET', '/download', Truncate(after_bytes=after_bytes), where={'path': BIG_PATH})
-    result = run_download('--download-retries', '0', '--download-passes', '1', 'disk:/Big', str(dest))
+    args = ('--download-retries', '0', '--download-passes', '1', *_partial_args(partial_root))
+    result = run_download(*args, 'disk:/Big', str(dest))
     assert result.exit_code == 1
-    [partial] = _partials(dest)
+    [partial] = _partials(dest, partial_root)
     assert partial.stat().st_size == after_bytes
     assert _journal() == [(0, len(BIG), after_bytes, hashlib.sha256(BIG[:after_bytes]).hexdigest())]
     return partial
@@ -226,11 +276,17 @@ def _quarantined(run, path: str, reason: str) -> str:
     return f'Quarantined: 1\n  {path}: {reason}; kept at {copy}\n{QUARANTINE_HINT}\n'
 
 
+@pytest.mark.parametrize('partials', ['in-dest', 'separate'])
 @pytest.mark.parametrize('segmented', [False, True], ids=['one-stream', 'segmented'])
-def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_failed(disk, dest, segmented):
+def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_failed(
+    disk, dest, segmented, partials, request
+):
     path = 'disk:/Photos/2024/a.jpg'
-    # Segmented, the corrupt byte lies in the third segment and only reading the whole file back can catch it.
+    # Segmented, the corrupt byte lies in the third segment and only reading the whole file back, or hashing the copy
+    # to DEST, can catch it.
     content, offset, args = (SEGMENTED, 2 * MiB + 10, SEGMENTED_ARGS) if segmented else (FILES[path], 10, ())
+    partial_root = request.getfixturevalue('partial_root') if partials == 'separate' else None
+    args = (*args, *_partial_args(partial_root))
     disk.add_file(path, content, modified=MODIFIED)
     disk.corrupt(path, offset=offset)
     corrupted, reason = corrupted_bytes(content, offset)
@@ -250,6 +306,7 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     assert copy.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     assert not local_file(dest, path).exists()
     assert _partials(dest) == []
+    assert _partials(dest, partial_root) == []
     assert _journal() == []
     assert _failure_records() == []
 
@@ -277,6 +334,8 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     assert copy.read_bytes() == corrupted
     assert _transfers(disk, earlier) == ['/v1/disk/resources/download'] + ['/download'] * (4 if segmented else 1)
     assert sorted(_fetches(disk, path, earlier), key=str) == (SEGMENT_RANGES if segmented else [None])
+    assert _partials(dest, partial_root) == []
+    assert _partials(dest) == []
 
     again = run_download(*args, str(dest))
 
@@ -1096,10 +1155,22 @@ def test_download_takes_one_or_two_paths(disk, args):
     assert disk.requests == []
 
 
-def test_an_unusable_destination_is_a_usage_error_that_creates_nothing(disk, tmp_path):
+def test_an_unusable_destination_or_partial_folder_is_a_usage_error_that_creates_nothing(
+    disk, tmp_path, partial_root, monkeypatch
+):
+    monkeypatch.setenv('COLUMNS', '300')
     regular = tmp_path / 'file'
     regular.write_bytes(b'')
     orphan = tmp_path / 'missing' / 'dest'
+    new, existing = tmp_path / 'x', tmp_path / 'existing'
+    (existing / 'inside').mkdir(parents=True)
+    (tmp_path / 'link').symlink_to(existing / 'inside')
+
+    def not_a_folder(raw) -> str:
+        return f'Error: The partial folder {raw} is not an existing folder; download creates only its own folder inside it.\n'
+
+    def inside(raw, dest) -> str:
+        return f'Error: The partial folder {raw} is inside the destination {dest}; choose a folder outside it.\n'
 
     cases = [
         ([str(regular)], f'Error: Destination {regular} exists and is not a folder.\n'),
@@ -1108,16 +1179,31 @@ def test_an_unusable_destination_is_a_usage_error_that_creates_nothing(disk, tmp
             f'Error: The parent folder of {orphan} does not exist; download creates only the last folder of the '
             'destination.\n',
         ),
-        ([str(tmp_path / 'x'), 'disk:/A'], 'disk:/A is a Disk path'),
+        ([str(new), 'disk:/A'], 'disk:/A is a Disk path'),
+        (['--partial-dir', str(partial_root), str(orphan)], 'Error: The parent folder of '),
+        (['--partial-dir', 'relative', str(new)], 'must be an absolute path, or empty to keep partial files in DEST.'),
+        (['--partial-dir', str(tmp_path / 'nope'), str(new)], not_a_folder(tmp_path / 'nope')),
+        (['--partial-dir', str(regular), str(new)], not_a_folder(regular)),
+        (['--partial-dir', str(existing), str(existing)], inside(existing, existing)),
+        (['--partial-dir', str(existing / 'inside'), str(existing)], inside(existing / 'inside', existing)),
+        (['--partial-dir', str(tmp_path / 'link'), str(existing)], inside(tmp_path / 'link', existing)),
     ]
     for args, message in cases:
         result = run_download(*args)
 
-        assert result.exit_code == 2
-        assert message in result.stderr
+        assert result.exit_code == 2, args
+        assert message in result.stderr, args
+
+    monkeypatch.setenv('YANDEX_DISK_RESCUE_PARTIAL_DIR', 'relative')
+    from_env = run_download(str(new))
+
+    assert from_env.exit_code == 2
+    assert 'must be an absolute path, or empty to keep partial files in DEST.' in from_env.stderr
 
     assert not orphan.parent.exists()
-    assert not (tmp_path / 'x').exists()
+    assert not new.exists()
+    assert [p.name for p in existing.rglob('*')] == ['inside']
+    assert list(partial_root.iterdir()) == []
     assert not manifest_path().exists()
     assert disk.requests == []
 
@@ -1200,25 +1286,51 @@ def test_a_filesystem_without_the_no_replace_rename_stops_the_run_before_any_dow
     assert sorted(p.name for p in dest.iterdir()) == ['.yandex-disk-rescue']
 
 
+@pytest.mark.parametrize('partials', ['in-dest', 'separate'])
 @pytest.mark.parametrize('code', [errno.ENOSPC, errno.EDQUOT, errno.EIO, errno.EROFS], ids=errno.errorcode.get)
-def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, dest, monkeypatch, code):
-    rename_noreplace = localfs.rename_noreplace
+def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(
+    segmented, dest, monkeypatch, request, code, partials
+):
+    """In DEST the placing of `top.txt` fails; with a partial folder a write to the partial file of `SEGMENTED` past
+    its first checkpoint does, and the rerun resumes it from that checkpoint."""
+    partial_root = request.getfixturevalue('partial_root') if partials == 'separate' else None
+    args = ('--download-checkpoint-mib', '1', *_partial_args(partial_root))
+    rename_noreplace, pwrite = localfs.rename_noreplace, os.pwrite
+    refused: list[str] = []
 
-    def failing(src, dst, *, src_dir_fd, dst_dir_fd):
+    def failing_rename(src, dst, *, src_dir_fd, dst_dir_fd):
         if dst == 'top.txt':
+            refused.append(str(dest / dst))
             raise OSError(code, os.strerror(code), dst)
         rename_noreplace(src, dst, src_dir_fd=src_dir_fd, dst_dir_fd=dst_dir_fd)
 
-    monkeypatch.setattr(localfs, 'rename_noreplace', failing)
-    result = run_download(str(dest))
+    def failing_write(fd, data, offset):
+        path = os.readlink(f'/proc/self/fd/{fd}')
+        if _below(path, partial_root) and offset >= MiB + MiB // 2:
+            refused.append(path)
+            raise OSError(code, os.strerror(code))
+        return pwrite(fd, data, offset)
+
+    with monkeypatch.context() as patch:
+        if partial_root is None:
+            patch.setattr(localfs, 'rename_noreplace', failing_rename)
+        else:
+            patch.setattr(os, 'pwrite', failing_write)
+        result = run_download(*args, str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {dest / "top.txt"}: {os.strerror(code)}.\n'
+    [path] = set(refused)
+    assert result.stderr == f'Error: Could not write {path}: {os.strerror(code)}.\n'
     assert 'Mirrored' not in result.stdout
-    assert not (dest / 'top.txt').exists()
+    if partial_root is None:
+        assert not (dest / 'top.txt').exists()
+    else:
+        assert path in [str(p) for p in _partials(dest, partial_root)]
+        assert not local_file(dest, SEGMENTED_PATH).exists()
+        assert MiB <= _confirmed() < MiB + MiB // 2
 
-    monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
-    rerun = run_download(str(dest))
+    confirmed, earlier = _confirmed(), len(segmented.requests)
+    rerun = run_download(*args, str(dest))
 
     assert rerun.exit_code == 0, rerun.output
     counts = re.search(
@@ -1226,8 +1338,12 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(disk, d
         rerun.stdout,
     )
     assert counts is not None, rerun.stdout
-    assert int(counts[1]) + int(counts[2]) == len(FILES)
+    assert int(counts[1]) + int(counts[2]) == len(FILES) + 1
     assert _others_verified(dest, failed='')
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    if partial_root is not None:
+        assert _fetches(segmented, SEGMENTED_PATH, earlier) == [f'bytes={confirmed}-{len(SEGMENTED) - 1}']
+        assert _partials(dest, partial_root) == []
 
 
 def _refuse(monkeypatch, call: str, code: int, refused: Callable[[str | int], bool]) -> None:
@@ -1556,6 +1672,787 @@ def test_a_partial_file_is_resumed_by_the_next_run_once_the_cloud_file_is_confir
     assert _partials(dest) == [partials / 'a folder']
 
 
+def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(disk, dest, partial_root, monkeypatch):
+    files = {**FILES, SEGMENTED_PATH: SEGMENTED, BIG_PATH: BIG}
+    disk.add_file(SEGMENTED_PATH, SEGMENTED, modified=MODIFIED)
+    disk.add_file(BIG_PATH, BIG, modified=MODIFIED)
+    log = _io_log(monkeypatch, ('pwrite', 'write', 'ftruncate'))
+
+    result = run_download('--partial-dir', str(partial_root), '--download-segments', '4', *SEGMENTED_ARGS, str(dest))
+    calls = list(log)
+
+    assert result.exit_code == 0, result.output
+    folder = _separate_folder(dest, partial_root)
+    total = format_size(sum(map(len, files.values())))
+    room = rf'Partial files in {re.escape(str(folder))} \([0-9.]+ MiB available\)'
+    assert re.search(rf'^{re.escape(f"Downloading 8 files ({total}) to {dest}")}\n{room}$', result.stdout, re.M)
+    assert f'8 downloaded ({total}), 0 skipped, 0 quarantined, 0 failed\n' in result.stdout
+    for path, content in files.items():
+        local = local_file(dest, path)
+        assert local.read_bytes() == content
+        assert local.stat().st_mtime_ns == _mtime_ns(MODIFIED)
+    assert list(folder.iterdir()) == []
+    assert _partials(dest) == []
+    assert any(call == 'pwrite' and _below(path, folder) for call, path, _, _ in calls)
+    in_dest = [(call, path, offset, length) for call, path, offset, length in calls if _below(path, dest)]
+    assert {(call, path.endswith('.copy')) for call, path, _, _ in in_dest} == {('pwrite', True)}
+    copies = [path for path, _ in itertools.groupby(path for _, path, _, _ in in_dest)]
+    assert len(copies) == len(set(copies)), 'the copies were written interleaved'
+    sizes = []
+    for copy in copies:
+        written = 0
+        for _, _, offset, length in (call for call in in_dest if call[1] == copy):
+            assert offset == written, f'{copy} was not written in order from offset 0'
+            written += length
+        sizes.append(written)
+    assert sorted(sizes) == sorted(len(content) for content in files.values() if content)
+
+
+@pytest.mark.parametrize('obstacle', ['file', 'link'])
+def test_a_destinations_partial_folder_that_is_not_a_folder_stops_the_run_before_any_download(
+    disk, dest, partial_root, tmp_path, obstacle
+):
+    folder = _separate_folder(dest, partial_root)
+    if obstacle == 'file':
+        folder.write_bytes(b'')
+    else:
+        folder.symlink_to(tmp_path)
+
+    result = run_download('--partial-dir', str(partial_root), str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {folder}: it is not a folder; move it away and run again.\n'
+    assert _transfers(disk) == []
+
+
+def test_with_a_partial_folder_a_resume_reads_that_folder_only(big, dest, partial_root, monkeypatch):
+    partial = _leave_partial(big, dest, partial_root=partial_root)
+    assert _partials(dest) == []
+    log = _io_log(monkeypatch, ('pread', 'read'))
+    earlier = len(big.requests)
+
+    result = run_download('--partial-dir', str(partial_root), 'disk:/Big', str(dest))
+    calls = list(log)
+
+    assert result.exit_code == 0, result.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    assert [call for call in calls if _below(call[1], dest)] == []
+    assert [(offset, length) for _, path, offset, length in calls if path == str(partial)][:2] == [
+        (0, 300_000),
+        (0, MiB),
+    ]
+    assert _partials(dest, partial_root) == []
+    assert _partials(dest) == []
+
+
+def test_with_a_partial_folder_every_run_deletes_the_staged_copies_left_in_dest_and_nothing_else(
+    big, dest, partial_root, monkeypatch
+):
+    _leave_partial(big, dest, partial_root=partial_root)
+    own = dest / '.yandex-disk-rescue' / 'partial'
+    for name in ('987654321.copy', '987654321', 'notes.copy', '12a.copy'):
+        (own / name).write_bytes(b'left by hand or by a crash')
+    (own / '123.copy').mkdir()
+    durability = _durability_log(monkeypatch)
+
+    result = run_download('--partial-dir', str(partial_root), 'disk:/Big', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert [p.name for p in _partials(dest)] == ['123.copy', '12a.copy', '987654321', 'notes.copy']
+    unlinked = durability.index(('unlink', str(own / '987654321.copy')))
+    assert ('fsync', str(own)) in durability[unlinked:]
+
+
+def _staged_copies(dest) -> list[str]:
+    return [p.name for p in _partials(dest) if p.name.endswith('.copy')]
+
+
+def _rerun_finishes_without_fetching(disk, dest, partial_root, monkeypatch, *, adopted: bool) -> None:
+    """Rerun the mirror of `disk:/Seg` with the partial folder `partial_root` after a run stopped while copying,
+    placing or recording `SEGMENTED`, and check it ends verified with no content fetched and no partial file or staged
+    copy left; a file fetched again is copied anew, after the run deleted the staged copy left by the stop."""
+    seen: list[list[str]] = []
+    partial = Destination.partial
+
+    @contextmanager
+    def watched(self, entry_id):
+        seen.append(_staged_copies(dest))
+        with partial(self, entry_id) as opened:
+            yield opened
+
+    monkeypatch.setattr(Destination, 'partial', watched)
+    earlier = len(disk.requests)
+
+    rerun = run_download('--partial-dir', str(partial_root), 'disk:/Seg', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _transfers(disk, earlier) == []
+    if adopted:
+        assert '0 downloaded (0 B), 1 skipped, 0 quarantined, 0 failed\n' in rerun.stdout
+    else:
+        assert f'1 downloaded ({format_size(len(SEGMENTED))}), 0 skipped' in rerun.stdout
+    assert seen == ([] if adopted else [[]])
+    local = dest / 'large.bin'
+    assert local.read_bytes() == SEGMENTED
+    assert local.stat().st_mtime_ns == _mtime_ns(MODIFIED)
+    assert _partials(dest) == []
+    assert _partials(dest, partial_root) == []
+    assert _journal() == []
+
+
+def _killed(*args, **kwargs):
+    raise KeyboardInterrupt
+
+
+def _killed_after_the_first_chunk(copied):
+    def copying(chunks, target):
+        yield next(copied(chunks, target))
+        raise KeyboardInterrupt
+
+    return copying
+
+
+@pytest.mark.parametrize('point', ['mid-copy', 'copied', 'placed', 'recorded'])
+def test_with_a_partial_folder_a_run_stopped_on_the_way_to_dest_finishes_on_the_rerun_without_a_fetch(
+    segmented, dest, partial_root, monkeypatch, point
+):
+    with monkeypatch.context() as patch:
+        match point:
+            case 'mid-copy':
+                patch.setattr(mirroring, '_copied', _killed_after_the_first_chunk(mirroring._copied))
+            case 'copied':
+                patch.setattr(Destination, 'place', _killed)
+            case 'placed':
+                patch.setattr(Mirror, 'record_verified', _killed)
+            case 'recorded':
+                patch.setattr(Destination, 'remove_partial', _killed)
+        stopped = run_download('--partial-dir', str(partial_root), 'disk:/Seg', str(dest))
+
+    assert stopped.exit_code == 130
+    assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
+    local = dest / 'large.bin'
+    placed = point in ('placed', 'recorded')
+    assert local.read_bytes() == SEGMENTED if placed else not local.exists()
+    [kept] = _partials(dest, partial_root)
+    assert kept.read_bytes() == SEGMENTED
+    full = (0, len(SEGMENTED), len(SEGMENTED), hashlib.sha256(SEGMENTED).hexdigest())
+    assert _journal() == ([] if point == 'recorded' else [full])
+    staged = _partials(dest)
+    assert [p.name for p in staged] == ([] if placed else [f'{kept.name}.copy'])
+    if point == 'mid-copy':
+        assert staged[0].read_bytes() == SEGMENTED[:MiB]
+
+    _rerun_finishes_without_fetching(segmented, dest, partial_root, monkeypatch, adopted=placed)
+
+
+# Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, an fsync of a staged copy
+# creates the marker `blocked` there and never returns; every other fsync runs as usual. The run keeps no reserve in
+# its partial folder, as `partial_root` does in this process.
+_COPY_FSYNC_GATE = """
+import os, pathlib, time
+
+from yandex_disk_rescue import mirroring
+
+mirroring.PARTIAL_RESERVE = 0
+_gate = pathlib.Path(os.environ['FSYNC_GATE'])
+_fsync = os.fsync
+
+
+def fsync(fd):
+    if os.readlink(f'/proc/self/fd/{fd}').endswith('.copy'):
+        (_gate / 'blocked').touch()
+        while True:
+            time.sleep(1)
+    return _fsync(fd)
+
+
+os.fsync = fsync
+"""
+
+
+def _gated(monkeypatch, tmp_path, gate_code: str) -> Path:
+    """Install `gate_code` as the `sitecustomize` of the subprocesses this test starts; the gate folder."""
+    site, gate = tmp_path / 'site', tmp_path / 'gate'
+    site.mkdir()
+    gate.mkdir()
+    (site / 'sitecustomize.py').write_text(gate_code)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
+    monkeypatch.setenv('FSYNC_GATE', str(gate))
+    return gate
+
+
+def test_with_a_partial_folder_a_run_killed_while_its_copy_is_fsynced_finishes_on_the_rerun_without_a_fetch(
+    segmented, dest, partial_root, tmp_path, monkeypatch
+):
+    gate = _gated(monkeypatch, tmp_path, _COPY_FSYNC_GATE)
+    child = start_command('download', '--partial-dir', str(partial_root), 'disk:/Seg', str(dest))
+    try:
+        wait_until(lambda: (gate / 'blocked').exists(), child, 'fsynced the staged copy')
+        child.kill()
+        child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+    monkeypatch.delenv('PYTHONPATH')
+
+    assert child.returncode == -signal.SIGKILL
+    assert not (dest / 'large.bin').exists()
+    [kept] = _partials(dest, partial_root)
+    assert _staged_copies(dest) == [f'{kept.name}.copy']
+
+    _rerun_finishes_without_fetching(segmented, dest, partial_root, monkeypatch, adopted=False)
+
+
+# The bytes each of the four segments of `SEGMENTED` confirms when `_leave_two_partials` cuts them short.
+_SEGMENT_CUTS = (100_000, 250_000, 400_000, 0)
+# The partial folder of the run leaving the partial files, then of the rerun: DEST's own (`None`), `partial_root`
+# itself, or a folder of that name in it.
+_PARTIAL_FOLDER_CHANGES = pytest.mark.parametrize(
+    ('before', 'after'), [(None, '.'), ('.', None), ('a', 'b')], ids=['on', 'off', 'moved']
+)
+
+
+def _partial_root(partial_root, name: str | None):
+    if name is None:
+        return None
+    root = partial_root / name
+    root.mkdir(exist_ok=True)
+    return root
+
+
+def _partial_folder(dest, partial_root):
+    """The folder of the partial files of `dest`: its own, or its folder below `partial_root`."""
+    return dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
+
+
+def _entry_id(path: str) -> int:
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        return connection.execute('SELECT id FROM entries WHERE path = ?', (path,)).fetchone()[0]
+
+
+def _leave_two_partials(fake, dest, partial_root):
+    """Run a mirror of the Disk cut short with no retry and no later pass, which keeps the partial files of `BIG`, 300
+    000 bytes confirmed, and of `SEGMENTED`, each segment confirming its `_SEGMENT_CUTS`, in DEST or below
+    `partial_root`; then write unconfirmed bytes past every confirmed offset. Their partial files, `BIG`'s first."""
+    fake.add_file(BIG_PATH, BIG, modified=MODIFIED)
+    fake.add_file(SEGMENTED_PATH, SEGMENTED, modified=MODIFIED)
+    fake.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+    for segment, cut in zip(SEGMENT_RANGES, _SEGMENT_CUTS, strict=True):
+        where = {'path': SEGMENTED_PATH}
+        fake.inject('GET', '/download', Truncate(after_bytes=cut), where=where, where_headers={'range': segment})
+    args = ('--download-retries', '0', '--download-passes', '1', *SEGMENTED_ARGS, *_partial_args(partial_root))
+    result = run_download(*args, str(dest))
+
+    assert result.exit_code == 1, result.output
+    folder = _partial_folder(dest, partial_root)
+    big, segmented = folder / str(_entry_id(BIG_PATH)), folder / str(_entry_id(SEGMENTED_PATH))
+    assert sorted(_partials(dest, partial_root)) == sorted([big, segmented])
+    assert _journals() == {
+        int(big.name): [(0, len(BIG), 300_000, hashlib.sha256(BIG[:300_000]).hexdigest())],
+        int(segmented.name): _segmented_journal(_SEGMENT_CUTS),
+    }
+    with big.open('ab') as file:
+        file.write(b'\xee' * 50_000)
+    with segmented.open('r+b') as file:
+        for n, cut in enumerate(_SEGMENT_CUTS):
+            file.seek(n * MiB + cut)
+            file.write(b'\xee' * 1000)
+    return big, segmented
+
+
+def _journals() -> dict[int, list[tuple[int, int, int, str | None]]]:
+    """The segments of each download journal in the manifest by entry id, read as `_journal` reads them."""
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        rows = connection.execute(
+            'SELECT entry_id, start, end, confirmed, digest FROM download_segments ORDER BY entry_id, start'
+        ).fetchall()
+    return {entry_id: [tuple(row[1:]) for row in group] for entry_id, group in itertools.groupby(rows, lambda r: r[0])}
+
+
+def _segmented_journal(cuts) -> list[tuple[int, int, int, str | None]]:
+    """The journal of `SEGMENTED` whose segment `n` confirms its first `cuts[n]` bytes."""
+    journal = []
+    for n, cut in enumerate(cuts):
+        start = n * MiB
+        journal.append((start, start + MiB, start + cut, hashlib.sha256(SEGMENTED[start : start + cut]).hexdigest()))
+    return [(start, end, confirmed, digest if confirmed > start else None) for start, end, confirmed, digest in journal]
+
+
+def _segment_tails(cuts) -> list[str]:
+    """The `Range` of each fetch of the rest of `SEGMENTED`'s segments after the first `cuts[n]` bytes of segment `n`,
+    sorted."""
+    return sorted(f'bytes={n * MiB + cut}-{(n + 1) * MiB - 1}' for n, cut in enumerate(cuts))
+
+
+def _durability_log(monkeypatch) -> list[tuple[str, str]]:
+    """Log `('fsync', path)` for every `os.fsync` and `('unlink', path)` for every `os.unlink` relative to a folder
+    descriptor, in call order, the paths read from `/proc/self/fd`."""
+    log: list[tuple[str, str]] = []
+    fsync, unlink = os.fsync, os.unlink
+
+    def logged_fsync(fd):
+        log.append(('fsync', os.readlink(f'/proc/self/fd/{fd}')))
+        return fsync(fd)
+
+    def logged_unlink(path, *, dir_fd=None):
+        if dir_fd is not None:
+            log.append(('unlink', f'{os.readlink(f"/proc/self/fd/{dir_fd}")}/{path}'))
+        return unlink(path, dir_fd=dir_fd)
+
+    monkeypatch.setattr(os, 'fsync', logged_fsync)
+    monkeypatch.setattr(os, 'unlink', logged_unlink)
+    return log
+
+
+def _moving(size: int, downloads: str, source, target) -> str:
+    return f'Moving the confirmed bytes ({format_size(size)}) of {downloads} in progress from {source} to {target}\n'
+
+
+@_PARTIAL_FOLDER_CHANGES
+def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download_in_progress(
+    disk, dest, partial_root, monkeypatch, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    sources = _leave_two_partials(disk, dest, old_root)
+    confirmed = {entry_id: [(s, c) for s, _, c, _ in segments] for entry_id, segments in _journals().items()}
+    log = _io_log(monkeypatch, ('pread', 'read'))
+    durability = _durability_log(monkeypatch)
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(new_root), *SEGMENTED_ARGS, str(dest))
+    calls = list(log)
+
+    assert result.exit_code == 0, result.output
+    old, new = _partial_folder(dest, old_root), _partial_folder(dest, new_root)
+    moving = _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', old, new)
+    assert moving in result.stdout
+    if new_root is not None:
+        assert result.stdout.index(moving) < result.stdout.index(f'Partial files in {new} (')
+    for source in sources:
+        reads = [(offset, length) for _, path, offset, length in calls if path == str(source)]
+        assert reads
+        for offset, length in reads:
+            assert any(start <= offset and offset + length <= end for start, end in confirmed[int(source.name)])
+        steps = [('fsync', str(new / source.name)), ('fsync', str(new)), ('unlink', str(source)), ('fsync', str(old))]
+        at = durability.index(steps[0])
+        for step in steps[1:]:
+            at = durability.index(step, at + 1)
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(_SEGMENT_CUTS)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    if old_root is None:
+        assert _partials(dest) == []
+    else:
+        assert not old.exists()
+        assert old_root.exists()
+    assert _partials(dest, new_root) == []
+    again = run_download(*_partial_args(new_root), str(dest))
+    assert again.exit_code == 0, again.output
+    assert 'Moving' not in again.stdout
+
+
+@_PARTIAL_FOLDER_CHANGES
+def test_a_move_of_partial_files_stopped_after_the_first_file_goes_on_in_the_rerun_losing_no_confirmed_byte(
+    disk, dest, partial_root, monkeypatch, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    big, segmented = _leave_two_partials(disk, dest, old_root)
+    new = _partial_folder(dest, new_root)
+    pwrite = os.pwrite
+
+    def stopped_on_the_second_file(fd, data, offset):
+        if os.readlink(f'/proc/self/fd/{fd}') == str(new / segmented.name):
+            raise KeyboardInterrupt
+        return pwrite(fd, data, offset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'pwrite', stopped_on_the_second_file)
+        stopped = run_download(*_partial_args(new_root), str(dest))
+
+    assert stopped.exit_code == 130
+    assert _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', big.parent, new) in stopped.stdout
+    assert not big.exists()
+    assert (new / big.name).read_bytes() == BIG[:300_000]
+    assert segmented.exists()
+    earlier = len(disk.requests)
+
+    rerun = run_download(*_partial_args(new_root), str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _moving(sum(_SEGMENT_CUTS), '1 download', big.parent, new) in rerun.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(_SEGMENT_CUTS)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert _partials(dest, new_root) == []
+
+
+def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file(
+    disk, dest, partial_root, monkeypatch
+):
+    big, segmented = _leave_two_partials(disk, dest, None)
+    pread = os.pread
+
+    def unreadable(fd, size, offset):
+        if os.readlink(f'/proc/self/fd/{fd}') == str(big):
+            raise OSError(errno.EBADMSG, os.strerror(errno.EBADMSG))
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', unreadable)
+
+    result = run_download(*_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.\n'
+    assert big.read_bytes()[:300_000] == BIG[:300_000]
+    assert segmented.exists()
+
+
+@pytest.mark.parametrize(('before', 'after'), [('.', None), ('a', 'b')], ids=['off', 'moved'])
+def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_byte_0(
+    disk, dest, partial_root, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    big, _ = _leave_two_partials(disk, dest, old_root)
+    shutil.rmtree(big.parent)
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(new_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (
+        f'The partial folder of the last run, {big.parent}, is missing; its downloads in progress start again from '
+        'their first byte.\n'
+    ) in result.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [None]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == sorted(SEGMENT_RANGES)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    again = run_download(*_partial_args(new_root), str(dest))
+    assert again.exit_code == 0, again.output
+    assert 'is missing' not in again.stdout
+
+
+def _recorded_partial_folder() -> Path | None:
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        [(folder,)] = connection.execute('SELECT partial_folder FROM mirrors').fetchall()
+    return None if folder is None else Path(os.fsdecode(folder))
+
+
+def test_a_lost_partial_folder_with_no_download_in_progress_is_not_reported(disk, dest, partial_root):
+    assert run_download(*_partial_args(partial_root), str(dest)).exit_code == 0
+    shutil.rmtree(_partial_folder(dest, partial_root))
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'is missing' not in result.stdout
+    assert _recorded_partial_folder() is None
+
+
+def test_the_recorded_partial_folder_reached_by_another_path_is_kept_as_it_is_and_the_new_path_recorded(
+    disk, dest, partial_root
+):
+    root = _partial_root(partial_root, 'a')
+    big, _ = _leave_two_partials(disk, dest, root)
+    # The folder the last run recorded, reached through a link as through a bind mount.
+    alias = partial_root / 'alias'
+    alias.symlink_to(root)
+    with closing(sqlite3.connect(manifest_path())) as connection, connection:
+        connection.execute('UPDATE mirrors SET partial_folder = ?', (os.fsencode(alias / big.parent.name),))
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(root), *SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert 'Moving' not in result.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(_SEGMENT_CUTS)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert _recorded_partial_folder() == big.parent
+
+
+@_PARTIAL_FOLDER_CHANGES
+def test_a_moved_partial_file_cut_short_below_a_confirmed_offset_fetches_that_segment_again(
+    disk, dest, partial_root, before, after
+):
+    old_root, new_root = _partial_root(partial_root, before), _partial_root(partial_root, after)
+    big, segmented = _leave_two_partials(disk, dest, old_root)
+    os.truncate(segmented, 2 * MiB + 1000)
+    kept = (_SEGMENT_CUTS[0], _SEGMENT_CUTS[1], 0, 0)
+    earlier = len(disk.requests)
+
+    result = run_download(*_partial_args(new_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    new = _partial_folder(dest, new_root)
+    assert _moving(300_000 + sum(kept), '2 downloads', big.parent, new) in result.stdout
+    assert _fetches(disk, BIG_PATH, earlier) == [_tail(300_000)]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(kept)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+
+
+BIG2_PATH = 'disk:/Big/big2.bin'
+BIG2 = random.Random(5).randbytes(MiB)
+
+
+def _free(monkeypatch, free: int) -> None:
+    """Make the filesystem of the partial folder report `free` bytes free; `partial_root` keeps no reserve, so the
+    room of a run is `free` and the bytes its kept partial files allocate."""
+    monkeypatch.setattr(localfs, 'free_bytes', lambda dir_fd: free)
+
+
+def _room_line(dest, partial_root, capacity: int) -> str:
+    return f'Partial files in {_separate_folder(dest, partial_root)} ({format_size(capacity)} available)\n'
+
+
+def _content_started(fake, path: str) -> list[float]:
+    return [r.started for r in fake.requests if r.path == '/download' and r.params['path'] == path]
+
+
+def test_a_partial_folder_with_room_for_one_large_file_fetches_the_large_files_one_at_a_time(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.chunk_delay = 0.01
+    _free(monkeypatch, MiB + MiB // 2)
+    ended: dict[int, float] = {}
+    remove_partial = Destination.remove_partial
+
+    def recording_remove_partial(destination, entry_id):
+        remove_partial(destination, entry_id)
+        ended[entry_id] = time.monotonic()
+
+    monkeypatch.setattr(Destination, 'remove_partial', recording_remove_partial)
+
+    result = run_download(*_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _room_line(dest, partial_root, MiB + MiB // 2) in result.stdout
+    assert _others_verified(dest, failed='')
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, BIG2_PATH).read_bytes() == BIG2
+    assert min(_content_started(big, BIG2_PATH)) > ended[_entry_id(BIG_PATH)]
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_file_larger_than_the_room_of_the_partial_folder_fails_and_a_retry_with_room_fetches_it(
+    big, dest, partial_root, monkeypatch
+):
+    with monkeypatch.context() as patch:
+        _free(patch, MiB // 2)
+        result = run_download(*_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 1
+    folder = _separate_folder(dest, partial_root)
+    reason = f'larger than the room in the partial folder {folder} (1.0 MiB needed, 512.0 KiB available)'
+    assert _room_line(dest, partial_root, MiB // 2) in result.stdout
+    assert f'Failed: 1\n  {BIG_PATH}: {reason}\n' in result.stdout
+    assert _failure_records() == [(BIG_PATH, reason)]
+    assert _fetches(big, BIG_PATH) == []
+    assert _partials(dest, partial_root) == []
+    assert _others_verified(dest, BIG_PATH)
+
+    retry = run_download(*_partial_args(partial_root), '--retry-failed', str(dest))
+
+    assert retry.exit_code == 0, retry.output
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert _failure_records() == []
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_file_waiting_for_room_is_deferred_when_the_last_running_file_is_deferred_and_a_pass_with_room_ends_both(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.chunk_delay = 0.01
+    big.inject('GET', '/download', Truncate(after_bytes=300_000), where={'path': BIG_PATH})
+    # One large file fits, and the second one does not fit next to the bytes the first one keeps once deferred.
+    free = MiB + MiB // 8
+    _free(monkeypatch, free)
+    args = ('--download-retries', '0', *_partial_args(partial_root))
+
+    result = run_download(*args, '--download-passes', '1', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    [kept] = _partials(dest, partial_root)
+    assert kept.name == str(_entry_id(BIG_PATH))
+    allocated = kept.stat().st_blocks * 512
+    folder = _separate_folder(dest, partial_root)
+    waited = f'no room yet in the partial folder {folder} (1.0 MiB needed, {format_size(free - allocated)} available)'
+    assert [reason for path, reason in _failure_records() if path == BIG2_PATH] == [waited]
+    assert _content_started(big, BIG2_PATH) == []
+    earlier = len(big.requests)
+
+    rerun = run_download(*args, 'disk:/Big', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert _room_line(dest, partial_root, free + allocated) in rerun.stdout
+    assert _fetches(big, BIG_PATH, earlier) == [_tail(300_000)]
+    assert _fetches(big, BIG2_PATH, earlier) == [None]
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'big2.bin').read_bytes() == BIG2
+    assert _partials(dest, partial_root) == []
+
+
+def test_a_kept_sparse_partial_file_takes_only_the_room_it_allocates(segmented, dest, partial_root, monkeypatch):
+    for segment, cut in zip(SEGMENT_RANGES, _SEGMENT_CUTS, strict=True):
+        where = {'path': SEGMENTED_PATH}
+        segmented.inject('GET', '/download', Truncate(after_bytes=cut), where=where, where_headers={'range': segment})
+    args = ('--download-retries', '0', '--download-passes', '1', *SEGMENTED_ARGS, *_partial_args(partial_root))
+    assert run_download(*args, str(dest)).exit_code == 1
+    [kept] = _partials(dest, partial_root)
+    allocated = kept.stat().st_blocks * 512
+    assert kept.stat().st_size == len(SEGMENTED)
+    # Room for the segmented file at full size, which leaves no room for `BIG` next to it at full size.
+    capacity = len(SEGMENTED) + MiB // 2
+    assert allocated + len(BIG) <= capacity < len(SEGMENTED) + len(BIG)
+    _free(monkeypatch, capacity - allocated)
+    segmented.add_file(BIG_PATH, BIG, modified=MODIFIED)
+
+    result = run_download(*args, '--scan-max-age', '0', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _room_line(dest, partial_root, capacity) in result.stdout
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert _partials(dest, partial_root) == []
+
+
+def test_the_kept_partial_file_of_an_adopted_file_frees_its_room_for_the_next_file(
+    segmented, dest, partial_root, monkeypatch
+):
+    with monkeypatch.context() as patch:
+        patch.setattr(Mirror, 'record_verified', _killed)
+        stopped = run_download('--partial-dir', str(partial_root), 'disk:/Seg', str(dest))
+    assert stopped.exit_code == 130
+    [kept] = _partials(dest, partial_root)
+    allocated = kept.stat().st_blocks * 512
+    # `after.bin` walks first and fits only once the partial file of the adopted `large.bin` is deleted.
+    segmented.add_file('disk:/Seg/after.bin', BIG, modified=MODIFIED)
+    _free(monkeypatch, MiB // 2)
+
+    result = run_download('--partial-dir', str(partial_root), '--scan-max-age', '0', 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert _room_line(dest, partial_root, MiB // 2 + allocated) in result.stdout
+    assert 'Already on disk and verified: 1\n  disk:/Seg/large.bin\n' in result.stdout
+    assert (dest / 'after.bin').read_bytes() == BIG
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+    assert _partials(dest, partial_root) == []
+
+
+def test_kept_partial_files_that_never_fit_next_to_each_other_fail_at_once_with_no_pass_limit(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    for path in (BIG_PATH, BIG2_PATH):
+        big.inject('GET', '/download', Truncate(after_bytes=600_000), where={'path': path})
+    args = ('--download-retries', '0', *_partial_args(partial_root))
+    assert run_download(*args, '--download-passes', '1', 'disk:/Big', str(dest)).exit_code == 1
+    kept = _partials(dest, partial_root)
+    allocated = sum(p.stat().st_blocks * 512 for p in kept)
+    assert len(kept) == 2
+    _free(monkeypatch, 0)
+    earlier = len(big.requests)
+
+    result = run_download(*args, '--download-passes', '0', 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    folder = _separate_folder(dest, partial_root)
+    lines = []
+    for path, partial in zip((BIG_PATH, BIG2_PATH), sorted(kept, key=lambda p: int(p.name)), strict=True):
+        needed = format_size(MiB - partial.stat().st_blocks * 512)
+        lines.append(
+            f'{path}: no room in the partial folder {folder} next to the partial files kept there ({needed} needed, '
+            '0 B available); free space there, then run again or with --retry-failed'
+        )
+    assert _room_line(dest, partial_root, allocated) in result.stdout
+    assert 'Passes: 1 of unlimited\n' in result.stdout
+    assert ''.join(f'  {line}\n' for line in lines) in result.stdout
+    assert _transfers(big, earlier) == []
+    assert sorted(_partials(dest, partial_root)) == sorted(kept)
+
+
+def test_a_run_stopped_while_a_file_waits_for_room_ends_at_once_and_the_rerun_goes_on(
+    big, dest, partial_root, monkeypatch
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    big.chunk_delay = 0.01
+    _free(monkeypatch, MiB + MiB // 2)
+    folder = _separate_folder(dest, partial_root)
+    pwrite = os.pwrite
+
+    def failing_write(fd, data, offset):
+        if os.readlink(f'/proc/self/fd/{fd}') == str(folder / str(_entry_id(BIG_PATH))) and offset >= MiB // 2:
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        return pwrite(fd, data, offset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'pwrite', failing_write)
+        result = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
+
+    assert result.exit_code == 1
+    assert result.stderr == f'Error: Could not write {folder / str(_entry_id(BIG_PATH))}: No space left on device.\n'
+    assert _content_started(big, BIG2_PATH) == []
+
+    rerun = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
+
+    assert rerun.exit_code == 0, rerun.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'big2.bin').read_bytes() == BIG2
+
+
+@pytest.mark.parametrize(
+    ('way', 'partials'),
+    [('downloaded', 'separate'), ('quarantined', 'separate'), ('adopted', 'in-dest'), ('adopted', 'separate')],
+)
+def test_a_partial_file_that_cannot_be_deleted_once_its_file_is_recorded_is_reported_and_fails_nothing(
+    disk, dest, monkeypatch, request, way, partials
+):
+    path = 'disk:/Docs/readme.txt'
+    partial_root = request.getfixturevalue('partial_root') if partials == 'separate' else None
+    folder = dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
+    if way == 'quarantined':
+        disk.corrupt(path, offset=0)
+    if way == 'adopted':
+        (dest / 'readme.txt').parent.mkdir(parents=True)
+        (dest / 'readme.txt').write_bytes(FILES[path])
+    record = 'record_quarantined' if way == 'quarantined' else 'record_verified'
+    original = getattr(Mirror, record)
+    in_the_way: list = []
+
+    def recorded_then_obstructed(self, entry_id, identity, *args):
+        original(self, entry_id, identity, *args)
+        if identity.size != len(FILES[path]):
+            return
+        obstacle = folder / str(entry_id)
+        obstacle.unlink(missing_ok=True)
+        obstacle.mkdir()
+        in_the_way.append(obstacle)
+
+    monkeypatch.setattr(Mirror, record, recorded_then_obstructed)
+
+    result = run_download(*_partial_args(partial_root), 'disk:/Docs', str(dest))
+
+    [obstacle] = in_the_way
+    assert f'Partial files not deleted: 1\n  {obstacle}: {os.strerror(errno.EISDIR)}\n' in result.stdout
+    assert 'Failed' not in result.stdout
+    if way == 'quarantined':
+        assert result.exit_code == 1
+        assert '1 quarantined, 0 failed\n' in result.stdout
+    else:
+        assert result.exit_code == 0, result.output
+        assert (dest / 'readme.txt').read_bytes() == FILES[path]
+        assert ', 0 quarantined, 0 failed\n' in result.stdout
+    assert _failure_records() == []
+    assert obstacle.is_dir()
+
+
 @pytest.mark.parametrize('change', ['rescanned', 'changed', 'removed'])
 def test_a_partial_file_of_a_file_changed_in_the_cloud_is_never_resumed(big, dest, change):
     _leave_partial(big, dest)
@@ -1826,12 +2723,7 @@ def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error
         disk.add_file(path, random.Random(n).randbytes(MiB))
     disk.add_file('disk:/Stop/z.txt', b'placed last')
     disk.chunk_delay = 0.2
-    site, gate = tmp_path / 'site', tmp_path / 'gate'
-    site.mkdir()
-    gate.mkdir()
-    (site / 'sitecustomize.py').write_text(_FSYNC_GATE)
-    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
-    monkeypatch.setenv('FSYNC_GATE', str(gate))
+    gate = _gated(monkeypatch, tmp_path, _FSYNC_GATE)
     child = start_command('download', 'disk:/Stop', str(dest))
     try:
         wait_until(
@@ -2119,12 +3011,12 @@ async def _mirror_run(
     ):
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
-        with Manifest.open(manifest_path()) as manifest, Destination.open(dest) as destination:
+        with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=None) as destination:
             await scan_tree(client, manifest, account, scan_root)
             run = MirrorRun(
                 manifest.mirror(account.uid, scan_root.path, destination.path), destination, retry_failed=False
             )
-            yield lambda: run.run(client, content, policy, passes=1)
+            yield lambda: run.run(client, content, policy, passes=1, room_measured=lambda _: None)
 
 
 async def _until(condition: Callable[[], bool], what: str) -> None:
