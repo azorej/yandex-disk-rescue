@@ -10,18 +10,21 @@ import typer.core
 
 from yandex_disk_rescue import __version__, api, auth, config, settings
 from yandex_disk_rescue.commands import download, scan, verify
+from yandex_disk_rescue.display import display_line
 from yandex_disk_rescue.errors import RescueError
+from yandex_disk_rescue.logs import write_stderr
 from yandex_disk_rescue.units import format_size
 
 
 class RescueErrorGroup(typer.core.TyperGroup):
-    """Root command group that renders a `RescueError` from any nested command as `Error: <message>`."""
+    """Root command group that renders a `RescueError` from any nested command as `Error: <message>`, one line with its
+    control characters escaped, and exits with its exit code also when stderr does not take the line."""
 
     def invoke(self, ctx: typer.Context) -> Any:
         try:
             return super().invoke(ctx)
         except RescueError as err:
-            typer.echo(f'Error: {err}', err=True)
+            write_stderr(f'Error: {display_line(str(err))}')
             raise typer.Exit(err.exit_code) from None
 
 

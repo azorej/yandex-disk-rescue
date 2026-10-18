@@ -5,6 +5,7 @@ from pathlib import Path
 
 APP_DIR_NAME = 'yandex-disk-rescue'
 MANIFEST_FILE_NAME = 'manifest.sqlite3'
+LOG_FILE_NAME = 'yandex-disk-rescue.log'
 
 
 def config_dir() -> Path:
@@ -20,6 +21,11 @@ def state_dir() -> Path:
 def manifest_path() -> Path:
     """Return the manifest database path in the state directory, without creating anything."""
     return state_dir() / MANIFEST_FILE_NAME
+
+
+def log_path() -> Path:
+    """Return the log file path in the state directory, without creating anything."""
+    return state_dir() / LOG_FILE_NAME
 
 
 def _xdg_dir(env_var: str, default_under_home: str) -> Path:

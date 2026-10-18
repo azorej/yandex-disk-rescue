@@ -6,6 +6,7 @@ import errno
 import fcntl
 import hashlib
 import itertools
+import json
 import os
 import random
 import re
@@ -29,20 +30,25 @@ from mirror_tree import (
     TOKEN,
     corrupted_bytes,
     local_file,
+    log_messages,
     quarantine_runs,
     replaced_runs,
     run_download,
     runner,
     start_command,
+    status_lines,
+    stderr_lines,
     wait_until,
 )
 from yandex_disk_rescue import api, localfs, mirroring
+from yandex_disk_rescue import destination as destination_module
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.destination import Destination, PartialFile
 from yandex_disk_rescue.manifest import Manifest, Mirror, Segment
 from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun
-from yandex_disk_rescue.paths import manifest_path
+from yandex_disk_rescue.paths import log_path, manifest_path
+from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -245,6 +251,7 @@ def test_a_fresh_mirror_holds_every_file_with_its_bytes_and_cloud_mtime(disk, de
         'Verified by size only (no cloud checksum): 1',
         f'  {SIZE_ONLY}',
         f'Manifest: {manifest_path()}',
+        f'Log: {log_path()}',
     ]
     assert lines[0].startswith('Scanned disk:/: 6 files, 4 folders')
     if redirect:
@@ -300,8 +307,11 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     assert _STAMP.fullmatch(run.name)
     assert _quarantined(run, path, reason) in result.stdout
     assert 'Failed' not in result.stdout
-    assert result.stderr == 'Error: 1 quarantined; see the list above.\n'
     copy = run / 'Photos' / '2024' / 'a.jpg'
+    assert stderr_lines(result.stderr) == [
+        f'{path} quarantined: {reason}; kept at {copy.relative_to(dest)}',
+        'Error: 1 quarantined; see the list above.',
+    ]
     assert copy.read_bytes() == corrupted
     assert copy.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     assert not local_file(dest, path).exists()
@@ -317,7 +327,7 @@ def test_a_corrupted_download_is_quarantined_and_fetched_again_only_with_retry_f
     assert f'Downloading 0 files (0 B) to {dest}\n' in held.stdout
     assert '0 downloaded (0 B), 5 skipped, 1 quarantined, 0 failed\n' in held.stdout
     assert _quarantined(run, path, reason) in held.stdout
-    assert held.stderr == 'Error: 1 quarantined; see the list above.\n'
+    assert stderr_lines(held.stderr) == ['Error: 1 quarantined; see the list above.']
     assert _transfers(disk, earlier) == []
 
     disk.repair(path)
@@ -395,6 +405,14 @@ def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_wit
     assert shown in plain.stdout
     assert f'; kept at .yandex-disk-rescue/quarantine/{run.name}/Docs/readme.txt\n' in plain.stdout
     assert 'Failed' not in plain.stdout
+    assert json.loads(run_download('--json', str(dest)).stdout)['quarantined'] == [
+        {
+            'path': path,
+            'reason': reason,
+            'last_retry': 'the download host 127.0.0.1 returned HTTP 503',
+            'copy': f'.yandex-disk-rescue/quarantine/{run.name}/Docs/readme.txt',
+        }
+    ]
 
 
 def test_a_new_disk_version_of_a_quarantined_file_is_not_held(disk, dest):
@@ -431,7 +449,7 @@ def test_a_run_killed_between_quarantining_a_copy_and_recording_it_downloads_the
         stopped = run_download('disk:/Docs', str(dest))
 
     assert stopped.exit_code == 130
-    assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stopped.stderr) == ['Interrupted; rerun to continue the download.']
     [run] = quarantine_runs(dest)
     copy = run / 'readme.txt'
     assert copy.read_bytes() == corrupted
@@ -485,11 +503,78 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
         'Failed: 1\n'
         '  disk:/Checks/short.bin: the download failed: '
     ) in result.stdout
-    assert result.stderr == 'Error: 1 failed and 1 quarantined; see the lists above.\n'
+    *notices, result_line = stderr_lines(result.stderr)
+    assert result_line == 'Error: 1 failed and 1 quarantined; see the lists above.'
+    quarantined, failed = sorted(notices)
+    assert quarantined == (
+        f'disk:/Checks/sha.bin quarantined: SHA-256 mismatch (expected {"0" * 64}, got {actual}); '
+        f'kept at .yandex-disk-rescue/quarantine/{run.name}/sha.bin'
+    )
+    assert failed.startswith('disk:/Checks/short.bin failed: the download failed: ')
     assert (dest / 'size-only.bin').read_bytes() == bytes([ord('s') ^ 0xFF]) + b'ize only'
     assert not (dest / 'sha.bin').exists()
     assert (run / 'sha.bin').read_bytes() == content
     assert not (dest / 'short.bin').exists()
+
+
+def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and_quarantined_copy(
+    disk, dest, tmp_path, monkeypatch
+):
+    content = b'sha-checked'
+    disk.add_file('disk:/Checks/sha.bin', content, md5=None, sha256='0' * 64)
+    disk.add_file('disk:/Checks/size-only.bin', b'size only', md5=None, sha256=None)
+    disk.add_file('disk:/Checks/short.bin', b'0123456789', md5=None, sha256=None)
+    for _ in range(2):
+        disk.inject('GET', '/download', Truncate(after_bytes=4), where={'path': 'disk:/Checks/short.bin'})
+    args = ('--download-retries', '0', '--download-passes', '1', 'disk:/Checks')
+    human = run_download(*args, str(tmp_path / 'human'))
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'json-state'))
+
+    result = run_download('--json', *args, str(dest))
+
+    assert human.exit_code == result.exit_code == 1
+    document = json.loads(result.stdout)
+    head = re.search(r': (\d+) downloaded \((.+)\), (\d+) skipped, (\d+) quarantined, (\d+) failed\n', human.stdout)
+    counts = document['counts']
+    shown = (counts['downloaded'], format_size(counts['downloaded_size']), counts['skipped'])
+    assert shown + (counts['quarantined'], counts['failed']) == (int(head[1]), head[2], int(head[3]), 1, 1)
+    assert (int(head[4]), int(head[5])) == (1, 1)
+    assert counts == {
+        'downloaded': 1,
+        'downloaded_size': 9,
+        'skipped': 0,
+        'adopted': 0,
+        'size_only': 1,
+        'renamed': 0,
+        'moved_aside': 0,
+        'quarantined': 1,
+        'failed': 1,
+    }
+    assert (document['schema_version'], document['command'], document['exit_code']) == (1, 'download', 1)
+    assert document['error'] == {'message': '1 failed and 1 quarantined; see the lists above.'}
+    assert (document['remote_root'], document['destination'], document['retry_failed']) == (
+        'disk:/Checks',
+        str(dest),
+        False,
+    )
+    assert document['scan']['reused'] is False
+    assert (document['scan']['root'], document['scan']['files']) == ('disk:/Checks', 3)
+    assert document['to_download'] == {'files': 3, 'size': len(content) + len(b'size only') + 10}
+    assert document['passes'] == {'used': 1, 'limit': 1}
+    assert document['size_only'] == ['disk:/Checks/size-only.bin']
+    [quarantined] = document['quarantined']
+    assert quarantined['path'] == 'disk:/Checks/sha.bin'
+    assert quarantined['reason'].startswith('SHA-256 mismatch (expected ')
+    assert quarantined['last_retry'] is None
+    assert (dest / quarantined['copy']).read_bytes() == content
+    [failed] = document['failed']
+    assert failed['path'] == 'disk:/Checks/short.bin'
+    assert failed['reason'].startswith('the download failed: ')
+    assert (document['partial_dir'], document['partial_move'], document['partial_room']) == (None, None, None)
+    assert document['partials_left'] == []
+    report = stderr_lines(result.stderr)
+    assert report[report.index('Failed: 1') + 1] == f'  disk:/Checks/short.bin: {failed["reason"]}'
+    assert report[-1] == 'Error: 1 failed and 1 quarantined; see the lists above.'
 
 
 def test_names_are_mapped_for_the_destination_and_kept_on_a_rerun(disk, dest):
@@ -638,7 +723,7 @@ def test_a_run_stopped_once_a_converted_file_is_placed_finds_it_there_on_the_nex
     stopped = run_download('disk:/Odd', str(dest))
 
     assert stopped.exit_code == 1
-    assert stopped.stderr == f'Error: Could not write {dest / converted}: {os.strerror(errno.EIO)}.\n'
+    assert stderr_lines(stopped.stderr) == [f'Error: Could not write {dest / converted}: {os.strerror(errno.EIO)}.']
 
     monkeypatch.setattr(localfs, 'rename_noreplace', rename_noreplace)
     earlier = len(disk.requests)
@@ -975,7 +1060,8 @@ def test_a_token_rejected_on_a_link_request_stops_the_run(disk, dest):
     result = run_download(str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr.startswith('Error: Yandex rejected the token (invalid, expired or revoked).')
+    [error] = stderr_lines(result.stderr)
+    assert error.startswith('Error: Yandex rejected the token (invalid, expired or revoked).')
     assert 'Mirrored' not in result.stdout
 
 
@@ -995,6 +1081,15 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
     assert result.exit_code == 1
     assert failed in result.stdout
     assert '6 downloaded' in result.stdout
+    *notices, result_line = stderr_lines(result.stderr)
+    assert sorted(notices) == [
+        'disk:/Bad\\udc81 failed: the folder name is not valid Unicode, so the Disk API cannot list it or download '
+        'anything in it',
+        'disk:/Bad\\udc81 left out: the name is not valid Unicode',
+        'disk:/Docs/bad\\udc80.txt failed: the name is not valid Unicode, so the Disk API cannot download it',
+        'disk:/Docs/bad\\udc80.txt left out: the name is not valid Unicode',
+    ]
+    assert result_line == 'Error: 2 failed; see the list above.'
     assert all(local_file(dest, path).read_bytes() == content for path, content in FILES.items())
 
     for reuse in (['--no-scan'], [], ['--retry-failed']):
@@ -1205,6 +1300,7 @@ def test_an_unusable_destination_or_partial_folder_is_a_usage_error_that_creates
     assert [p.name for p in existing.rglob('*')] == ['inside']
     assert list(partial_root.iterdir()) == []
     assert not manifest_path().exists()
+    assert not log_path().exists()
     assert disk.requests == []
 
 
@@ -1320,7 +1416,7 @@ def test_a_full_or_failing_destination_stops_the_run_and_a_rerun_goes_on(
 
     assert result.exit_code == 1
     [path] = set(refused)
-    assert result.stderr == f'Error: Could not write {path}: {os.strerror(code)}.\n'
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {path}: {os.strerror(code)}.']
     assert 'Mirrored' not in result.stdout
     if partial_root is None:
         assert not (dest / 'top.txt').exists()
@@ -1367,7 +1463,9 @@ def test_a_permission_error_in_the_work_directory_stops_the_run(disk, dest, monk
 
     assert result.exit_code == 1
     partials = _partials(dest)
-    assert result.stderr in {f'Error: Could not write {partial}: {os.strerror(code)}.\n' for partial in partials}
+    assert stderr_lines(result.stderr) in [
+        [f'Error: Could not write {partial}: {os.strerror(code)}.'] for partial in partials
+    ]
     assert 'Mirrored' not in result.stdout
 
 
@@ -1398,7 +1496,9 @@ def test_a_permission_error_on_a_path_of_the_mirror_fails_that_file_only(disk, d
     listed = ''.join(f'  {path}: {reason}\n' for path, reason in failed)
     assert f', {len(failed)} failed\n' in result.stdout
     assert f'Failed: {len(failed)}\n{listed}' in result.stdout
-    assert result.stderr == f'Error: {len(failed)} failed; see the list above.\n'
+    *notices, result_line = stderr_lines(result.stderr)
+    assert sorted(notices) == [f'{path} failed: {reason}' for path, reason in failed]
+    assert result_line == f'Error: {len(failed)} failed; see the list above.'
     assert _others_verified(dest, failed='')
     assert not (dest / '.yandex-disk-rescue' / 'replaced').exists()
     if obstacle != 'untraversable':
@@ -1678,7 +1778,9 @@ def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(dis
     disk.add_file(BIG_PATH, BIG, modified=MODIFIED)
     log = _io_log(monkeypatch, ('pwrite', 'write', 'ftruncate'))
 
-    result = run_download('--partial-dir', str(partial_root), '--download-segments', '4', *SEGMENTED_ARGS, str(dest))
+    result = run_download(
+        '-v', '--partial-dir', str(partial_root), '--download-segments', '4', *SEGMENTED_ARGS, str(dest)
+    )
     calls = list(log)
 
     assert result.exit_code == 0, result.output
@@ -1686,6 +1788,11 @@ def test_with_a_partial_folder_each_file_reaches_dest_as_one_sequential_copy(dis
     total = format_size(sum(map(len, files.values())))
     room = rf'Partial files in {re.escape(str(folder))} \([0-9.]+ MiB available\)'
     assert re.search(rf'^{re.escape(f"Downloading 8 files ({total}) to {dest}")}\n{room}$', result.stdout, re.M)
+    messages = log_messages()
+    assert any(re.fullmatch(room, message) for message in messages)
+    assert any(f', partial_dir={partial_root}, ' in m for m in messages if m.startswith('download started: '))
+    copied = [m.partition(' copied to ')[0] for m in messages if re.search(f' copied to {dest} in [0-9.]+ s$', m)]
+    assert sorted(copied) == sorted(files)
     assert f'8 downloaded ({total}), 0 skipped, 0 quarantined, 0 failed\n' in result.stdout
     for path, content in files.items():
         local = local_file(dest, path)
@@ -1806,8 +1913,8 @@ def _killed(*args, **kwargs):
 
 
 def _killed_after_the_first_chunk(copied):
-    def copying(chunks, target):
-        yield next(copied(chunks, target))
+    def copying(chunks, target, progress):
+        yield next(copied(chunks, target, progress))
         raise KeyboardInterrupt
 
     return copying
@@ -1830,7 +1937,7 @@ def test_with_a_partial_folder_a_run_stopped_on_the_way_to_dest_finishes_on_the_
         stopped = run_download('--partial-dir', str(partial_root), 'disk:/Seg', str(dest))
 
     assert stopped.exit_code == 130
-    assert stopped.stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stopped.stderr) == ['Interrupted; rerun to continue the download.']
     local = dest / 'large.bin'
     placed = point in ('placed', 'recorded')
     assert local.read_bytes() == SEGMENTED if placed else not local.exists()
@@ -2020,13 +2127,25 @@ def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download
     durability = _durability_log(monkeypatch)
     earlier = len(disk.requests)
 
-    result = run_download(*_partial_args(new_root), *SEGMENTED_ARGS, str(dest))
+    result = run_download('-v', *_partial_args(new_root), *SEGMENTED_ARGS, str(dest))
     calls = list(log)
 
     assert result.exit_code == 0, result.output
     old, new = _partial_folder(dest, old_root), _partial_folder(dest, new_root)
+    size = format_size(300_000 + sum(_SEGMENT_CUTS))
     moving = _moving(300_000 + sum(_SEGMENT_CUTS), '2 downloads', old, new)
     assert moving in result.stdout
+    messages = log_messages()
+    assert moving.rstrip('\n') in messages
+    moved = [m for m in messages if ': partial file moved ' in m or m.startswith('Moved the partial files ')]
+    assert moved[:2] == [
+        f'{BIG_PATH}: partial file moved from {old} to {new} ({format_size(300_000)} confirmed)',
+        f'{SEGMENTED_PATH}: partial file moved from {old} to {new} ({format_size(sum(_SEGMENT_CUTS))} confirmed)',
+    ]
+    [end] = moved[2:]
+    assert end.startswith(f'Moved the partial files of 2 downloads in progress ({size}) from {old} to {new} in ')
+    [final] = [line for line in status_lines(result.stderr) if line.startswith('Mov')]
+    assert re.fullmatch(rf'Moved: 2 of 2 files, {re.escape(size)} in \d+ s, average .+/s', final)
     if new_root is not None:
         assert result.stdout.index(moving) < result.stdout.index(f'Partial files in {new} (')
     for source in sources:
@@ -2051,6 +2170,7 @@ def test_a_changed_partial_folder_gets_only_the_confirmed_bytes_of_each_download
     again = run_download(*_partial_args(new_root), str(dest))
     assert again.exit_code == 0, again.output
     assert 'Moving' not in again.stdout
+    assert not [line for line in status_lines(again.stderr) if line.startswith('Mov')]
 
 
 @_PARTIAL_FOLDER_CHANGES
@@ -2089,6 +2209,50 @@ def test_a_move_of_partial_files_stopped_after_the_first_file_goes_on_in_the_rer
     assert _partials(dest, new_root) == []
 
 
+def test_a_move_of_partial_files_shows_its_status_lines_then_its_last_one(disk, dest, partial_root, monkeypatch):
+    big, _ = _leave_two_partials(disk, dest, None)
+    pread = os.pread
+    slowed: list[int] = []
+
+    def slow_first_read(fd, size, offset):
+        if not slowed and os.readlink(f'/proc/self/fd/{fd}') == str(big):
+            slowed.append(fd)
+            time.sleep(1.5)
+        return pread(fd, size, offset)
+
+    monkeypatch.setattr(os, 'pread', slow_first_read)
+
+    result = run_download('--json', '--progress-interval', '1', *_partial_args(partial_root), str(dest))
+
+    assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    folder = _partial_folder(dest, partial_root)
+    assert document['partial_dir'] == str(partial_root)
+    assert document['partial_move'] == {
+        'source': str(big.parent),
+        'target': str(folder),
+        'downloads': 2,
+        'size': 300_000 + sum(_SEGMENT_CUTS),
+        'missing': False,
+    }
+    assert document['partial_room']['folder'] == str(folder)
+    assert document['partial_room']['available'] > 0
+    assert f'Partial files in {folder} ({format_size(document["partial_room"]["available"])} available)' in (
+        stderr_lines(result.stderr)
+    )
+    size = re.escape(format_size(300_000 + sum(_SEGMENT_CUTS)))
+    lines = [line for line in status_lines(result.stderr) if line.startswith('Mov')]
+    assert lines[:-1]
+    assert all(
+        re.fullmatch(rf'Moving: [01] of 2 files, .+ of {size} \(\d+\.\d%\), (?:.+/s, )?ETA .+', line)
+        for line in lines[:-1]
+    )
+    assert lines[:-1]
+    assert re.fullmatch(rf'Moved: 2 of 2 files, {size} in \d+ s, average .+/s', lines[-1])
+    status = status_lines(result.stderr)
+    assert status.index(lines[-1]) < status.index(next(line for line in status if line.startswith('Downloaded: ')))
+
+
 def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file(
     disk, dest, partial_root, monkeypatch
 ):
@@ -2105,7 +2269,7 @@ def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_f
     result = run_download(*_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.\n'
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {big}: {os.strerror(errno.EBADMSG)}.']
     assert big.read_bytes()[:300_000] == BIG[:300_000]
     assert segmented.exists()
 
@@ -2119,13 +2283,24 @@ def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_by
     shutil.rmtree(big.parent)
     earlier = len(disk.requests)
 
-    result = run_download(*_partial_args(new_root), str(dest))
+    result = run_download('--json', *_partial_args(new_root), str(dest))
 
     assert result.exit_code == 0, result.output
-    assert (
+    missing = (
         f'The partial folder of the last run, {big.parent}, is missing; its downloads in progress start again from '
-        'their first byte.\n'
-    ) in result.stdout
+        'their first byte.'
+    )
+    assert missing in stderr_lines(result.stderr)
+    document = json.loads(result.stdout)
+    move = document['partial_move']
+    assert (move['source'], move['target'], move['downloads'], move['missing']) == (
+        str(big.parent),
+        str(_partial_folder(dest, new_root)),
+        2,
+        True,
+    )
+    assert missing in log_messages()
+    assert not [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert _fetches(disk, BIG_PATH, earlier) == [None]
     assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == sorted(SEGMENT_RANGES)
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
@@ -2229,10 +2404,18 @@ def test_a_partial_folder_with_room_for_one_large_file_fetches_the_large_files_o
 
     monkeypatch.setattr(Destination, 'remove_partial', recording_remove_partial)
 
-    result = run_download(*_partial_args(partial_root), str(dest))
+    result = run_download('-v', *_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 0, result.output
     assert _room_line(dest, partial_root, MiB + MiB // 2) in result.stdout
+    folder = _separate_folder(dest, partial_root)
+    messages = log_messages()
+    waits = [m for m in messages if ' waits for room ' in m]
+    assert waits == [f'{BIG2_PATH} waits for room in the partial folder {folder} (1.0 MiB needed, 512.0 KiB available)']
+    turn = re.compile(rf'(.+) waits for its turn of the partial folder {re.escape(str(folder))} behind \d+ files? .+')
+    assert sorted(match[1] for m in messages if (match := turn.fullmatch(m))) == sorted(
+        p for p, c in FILES.items() if c
+    )
     assert _others_verified(dest, failed='')
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
     assert local_file(dest, BIG2_PATH).read_bytes() == BIG2
@@ -2397,12 +2580,58 @@ def test_a_run_stopped_while_a_file_waits_for_room_ends_at_once_and_the_rerun_go
         result = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {folder / str(_entry_id(BIG_PATH))}: No space left on device.\n'
+    assert stderr_lines(result.stderr) == [
+        f'Error: Could not write {folder / str(_entry_id(BIG_PATH))}: No space left on device.'
+    ]
     assert _content_started(big, BIG2_PATH) == []
 
     rerun = run_download(*_partial_args(partial_root), 'disk:/Big', str(dest))
 
     assert rerun.exit_code == 0, rerun.output
+    assert (dest / 'big.bin').read_bytes() == BIG
+    assert (dest / 'big2.bin').read_bytes() == BIG2
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    ('free', 'waiting'), [(4 * MiB, 'waiting for the copy'), (MiB + MiB // 2, 'waiting for room')], ids=['copy', 'room']
+)
+async def test_with_a_partial_folder_a_file_in_progress_shows_how_far_its_copy_to_dest_got_and_what_it_waits_for(
+    big, dest, partial_root, monkeypatch, free, waiting
+):
+    big.add_file(BIG2_PATH, BIG2, modified=MODIFIED)
+    _free(monkeypatch, free)
+    monkeypatch.setattr(destination_module, '_READ_SIZE', MiB // 4)
+    held, release = threading.Event(), threading.Event()
+    copied = mirroring._copied
+
+    def held_after_the_first_chunk(chunks, target, file_progress):
+        hold = not held.is_set()
+        for chunk in copied(chunks, target, file_progress):
+            yield chunk
+            if hold:
+                held.set()
+                release.wait(10)
+                hold = False
+
+    monkeypatch.setattr(mirroring, '_copied', held_after_the_first_chunk)
+    progress = MirrorProgress()
+
+    def states() -> list[str]:
+        return sorted(transfer.state for transfer in progress.snapshot().active)
+
+    async with _mirror_run(big, 'disk:/Big', dest, partial_dir=partial_root, progress=progress) as run:
+        task = asyncio.create_task(run())
+        try:
+            await _until(lambda: states() == ['copying', waiting], f'one file copying and the other {waiting}')
+            [copying] = [transfer for transfer in progress.snapshot().active if transfer.state == 'copying']
+        finally:
+            release.set()
+        report = await task
+
+    assert 0 < copying.copied < copying.size == copying.held
+
+    assert report.downloaded == 2
     assert (dest / 'big.bin').read_bytes() == BIG
     assert (dest / 'big2.bin').read_bytes() == BIG2
 
@@ -2437,18 +2666,23 @@ def test_a_partial_file_that_cannot_be_deleted_once_its_file_is_recorded_is_repo
 
     monkeypatch.setattr(Mirror, record, recorded_then_obstructed)
 
-    result = run_download(*_partial_args(partial_root), 'disk:/Docs', str(dest))
+    result = run_download('--json', *_partial_args(partial_root), 'disk:/Docs', str(dest))
 
     [obstacle] = in_the_way
-    assert f'Partial files not deleted: 1\n  {obstacle}: {os.strerror(errno.EISDIR)}\n' in result.stdout
-    assert 'Failed' not in result.stdout
+    report = stderr_lines(result.stderr)
+    assert f'Partial files not deleted: 1\n  {obstacle}: {os.strerror(errno.EISDIR)}' in '\n'.join(report)
+    assert json.loads(result.stdout)['partials_left'] == [{'path': str(obstacle), 'reason': os.strerror(errno.EISDIR)}]
+    notice = f'{path}: partial file {obstacle} not deleted: {os.strerror(errno.EISDIR)}; the outcome stands'
+    assert notice in report
+    assert notice in log_messages()
+    assert 'Failed' not in result.stderr
     if way == 'quarantined':
         assert result.exit_code == 1
-        assert '1 quarantined, 0 failed\n' in result.stdout
+        assert '1 quarantined, 0 failed\n' in result.stderr
     else:
         assert result.exit_code == 0, result.output
         assert (dest / 'readme.txt').read_bytes() == FILES[path]
-        assert ', 0 quarantined, 0 failed\n' in result.stdout
+        assert ', 0 quarantined, 0 failed\n' in result.stderr
     assert _failure_records() == []
     assert obstacle.is_dir()
 
@@ -2595,7 +2829,7 @@ def test_checkpoints_failing_while_a_stopped_run_cancels_its_files_add_no_error_
     result = run_download('disk:/Stop', str(dest))
 
     assert result.exit_code == 1
-    assert result.stderr == f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.\n'
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {dest / "z.txt"}: {os.strerror(errno.EIO)}.']
     assert 'Mirrored' not in result.stdout
     assert len(failed) == len(slow)
     assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, 1024 * 1024, 0, None)] * len(slow)
@@ -2614,7 +2848,8 @@ def test_ctrl_c_mid_file_checkpoints_every_byte_written_and_the_rerun_resumes_th
         child.communicate()
 
     assert child.returncode == 130, stderr
-    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
+    assert log_messages()[-1] == 'download interrupted (exit 130)'
     held = _partial_size(dest)
     assert 256 * 1024 < held < len(BIG)
     assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
@@ -2681,7 +2916,7 @@ def test_ctrl_c_in_the_pause_between_passes_stops_the_run_and_keeps_the_partial_
         child.communicate()
 
     assert child.returncode == 130, stderr
-    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert len(_fetches(big, BIG_PATH)) == 2
     assert _partial_size(dest) == 300_000
 
@@ -2743,7 +2978,7 @@ def test_ctrl_c_while_a_run_stopping_error_cancels_the_files_wins_over_the_error
         child.communicate()
 
     assert child.returncode == 130, stderr
-    assert stderr == 'Interrupted; rerun to continue the download.\n'
+    assert stderr_lines(stderr) == ['Interrupted; rerun to continue the download.']
     assert sorted(_journal()) == [(0, len(b'placed last'), 0, None)] + [(0, MiB, 0, None)] * len(slow)
 
 
@@ -3001,22 +3236,39 @@ POLICY = mirroring.TransferPolicy(retries=0, checkpoint_bytes=32 * 2**20, segmen
 
 @asynccontextmanager
 async def _mirror_run(
-    fake, root: str, dest, policy: mirroring.TransferPolicy = POLICY
+    fake,
+    root: str,
+    dest,
+    policy: mirroring.TransferPolicy = POLICY,
+    *,
+    partial_dir: Path | None = None,
+    progress: MirrorProgress | None = None,
 ) -> AsyncIterator[Callable[[], Awaitable[MirrorReport]]]:
-    """Scan `root` in this event loop, then yield a call running the mirror run of `root` into `dest` here too, with
-    real clients, the real manifest and a real destination, fetching as `policy` says."""
+    """Scan `root` in this event loop, then yield a call running the mirror run of `root` into `dest` here too, its
+    partial files below `partial_dir` when given, with real clients, the real manifest and a real destination, fetching
+    as `policy` says and reporting to `progress`."""
     async with (
         api.DiskClient(TOKEN, base_url=fake.base_url, limits=FAST_API) as client,
         api.ContentClient(timeout=5, connections=20) as content,
     ):
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
-        with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=None) as destination:
-            await scan_tree(client, manifest, account, scan_root)
+        with Manifest.open(manifest_path()) as manifest, Destination.open(dest, partial_dir=partial_dir) as destination:
+            await scan_tree(client, manifest, account, scan_root, ScanProgress())
+            state = progress or MirrorProgress()
             run = MirrorRun(
-                manifest.mirror(account.uid, scan_root.path, destination.path), destination, retry_failed=False
+                manifest.mirror(account.uid, scan_root.path, destination.path),
+                destination,
+                retry_failed=False,
+                progress=state,
             )
-            yield lambda: run.run(client, content, policy, passes=1, room_measured=lambda _: None)
+
+            async def mirrored() -> MirrorReport:
+                await run.move_partials(MoveProgress())
+                state.start_transferring(run.pending_files, run.pending_size, passes=1)
+                return await run.run(client, content, policy, passes=1, room_measured=lambda _: None)
+
+            yield mirrored
 
 
 async def _until(condition: Callable[[], bool], what: str) -> None:
@@ -3058,7 +3310,9 @@ async def test_a_cancelled_run_waits_for_the_write_in_flight_before_closing_the_
     assert len(written) == 2
     [partial] = _partials(dest)
     assert [stat.st_ino for stat in open_after_write] == [partial.stat().st_ino] * 2
-    assert partial.read_bytes() == BIG[: len(written[0]) + len(written[1])]
+    held = len(written[0]) + len(written[1])
+    assert partial.read_bytes() == BIG[:held]
+    assert _journal() == [(0, len(BIG), held, hashlib.sha256(BIG[:held]).hexdigest())]
 
 
 @pytest.mark.anyio

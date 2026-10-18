@@ -9,6 +9,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 from fake_disk_server import Delay, Truncate
+from mirror_tree import log_messages
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.paths import config_dir, manifest_path
@@ -19,7 +20,7 @@ TOKEN = 'y0_AgAAAAB-config-sentinel-token'
 OPTIONS = (
     'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, download_retries, '
     'download_passes, download_connections, download_checkpoint_mib, download_segments, '
-    'download_segment_threshold_mib, partial_dir, scan_max_age, client_id'
+    'download_segment_threshold_mib, partial_dir, scan_max_age, progress_interval, client_id'
 )
 
 
@@ -71,6 +72,23 @@ def test_the_flag_and_the_env_var_override_the_config_file(disk, monkeypatch, tm
 
     assert result.exit_code == 0, result.output
     assert min(_start_gaps(disk)) < 0.15
+
+
+@pytest.mark.parametrize(('source', 'interval'), [('config', '7'), ('env', '9'), ('flag', '11')])
+def test_the_progress_interval_comes_from_the_flag_the_env_var_or_the_config_file(disk, monkeypatch, source, interval):
+    _write_default_config('progress_interval = 7\n')
+    args = ['scan']
+    if source == 'env':
+        monkeypatch.setenv('YANDEX_DISK_RESCUE_PROGRESS_INTERVAL', interval)
+    elif source == 'flag':
+        monkeypatch.setenv('YANDEX_DISK_RESCUE_PROGRESS_INTERVAL', '9')
+        args.append(f'--progress-interval={interval}')
+
+    result = runner.invoke(app, args)
+
+    assert result.exit_code == 0, result.output
+    [started] = [message for message in log_messages() if message.startswith('scan started: ')]
+    assert started.endswith(f', progress=True, progress_interval={interval}, json=False')
 
 
 def test_auth_status_reads_the_api_url_from_the_config_file(fake_disk_api, monkeypatch):
@@ -164,6 +182,8 @@ def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, ag
             'partial_dir: must be an absolute path, or empty to keep partial files in DEST.',
         ),
         ('partial_dir = 1\n', 'partial_dir: must be a string.'),
+        ('progress_interval = 0\n', 'progress_interval: must be an integer from 1 to 3600.'),
+        ('progress_interval = 3601\n', 'progress_interval: must be an integer from 1 to 3600.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
         (b'client_id = "\xff"\n', 'is not UTF-8 text.'),

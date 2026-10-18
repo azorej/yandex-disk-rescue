@@ -1,6 +1,7 @@
 """`DiskClient`: every Yandex Disk REST API request goes through it."""
 
 import json
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -41,6 +42,7 @@ ACCOUNT_PATH = '/v1/disk/'
 RESOURCES_PATH = '/v1/disk/resources'
 DOWNLOAD_LINK_PATH = '/v1/disk/resources/download'
 PAGE_LIMIT = 1000
+_log = logging.getLogger(__name__)
 _RESOURCE_KEYS = ('path', 'type', 'size', 'md5', 'sha256', 'modified')
 _RESOURCE_FIELDS = ','.join(_RESOURCE_KEYS)
 _LISTING_FIELDS = ','.join(
@@ -220,13 +222,28 @@ class DiskClient:
             return response
         retry_after = parse_retry_after(response.headers.get('Retry-After'), now=datetime.now(UTC))
         self._limiter.throttled(retry_after)
+        _log.info(
+            'Disk API throttling: HTTP %d; request interval now %d ms; %s',
+            response.status_code,
+            round(self._limiter.interval * 1000),
+            'no Retry-After' if retry_after is None else f'Retry-After {retry_after:g} s',
+        )
         raise _TransientFailure(_status_failure(response), retry_after=retry_after)
 
     def _wait(self, state: RetryCallState) -> float:
         failure = state.outcome.exception() if state.outcome else None
         if isinstance(failure, _TransientFailure) and failure.retry_after is not None:
-            return failure.retry_after
-        return self._backoff(state)
+            wait = failure.retry_after
+        else:
+            wait = self._backoff(state)
+        _log.info(
+            'Disk API request failed: %s; retry %d of %d in %.1f s',
+            failure.message if isinstance(failure, _TransientFailure) else failure,
+            state.attempt_number,
+            self._limits.retries,
+            wait,
+        )
+        return wait
 
     @staticmethod
     def _raise_for_status(response: httpx.Response, *, context: str | None) -> None:

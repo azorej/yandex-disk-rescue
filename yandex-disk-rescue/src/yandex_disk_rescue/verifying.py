@@ -22,9 +22,10 @@ disconnected disk makes every file unreadable.
 """
 
 import errno
+import logging
 import stat
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -44,10 +45,14 @@ from yandex_disk_rescue.mirroring import (
     QuarantinedFile,
     held_copy,
     is_held,
+    quarantined_document,
+    quarantined_line,
+    quarantined_reason,
     size_mismatch,
     unencodable_reason,
 )
-from yandex_disk_rescue.scanning import display_path, listed
+from yandex_disk_rescue.progress import VerifyProgress
+from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 
 # The longest a pass keeps its cursor uncommitted while files are checked: a killed pass reads again at most the files
 # checked in this time, and the one in flight.
@@ -55,6 +60,7 @@ CURSOR_SECONDS = 5.0
 
 # A read failing with one of these means the device is gone, whatever the destination's path still answers.
 _DEVICE_GONE_ERRNOS = frozenset({errno.ENODEV, errno.ENXIO, errno.ESTALE})
+_log = logging.getLogger(__name__)
 
 
 class DestinationUnreadableError(RescueError):
@@ -66,8 +72,12 @@ class DestinationUnreadableError(RescueError):
 
 @dataclass(frozen=True)
 class Problem:
+    """A file listed for `reason`; under a finding, `repair` is its quarantine record for its current identity: the
+    download meant to repair it was quarantined."""
+
     path: str
     reason: str
+    repair: QuarantinedFile | None = None
 
 
 @dataclass
@@ -92,13 +102,10 @@ class VerifyReport:
         return sum(1 for problems in self._lists() if problems)
 
     def add(self, entry: MirrorEntry, finding: Finding) -> None:
-        """List `entry` under `finding`, with the reason and copy of its current quarantine record, if any."""
-        reason = finding.reason
-        if is_held(entry):
-            held = held_copy(entry, None)
-            reason = f'{reason}; repair quarantined: {held.reason}; kept at {held.copy}'
+        """List `entry` under `finding`, with its current quarantine record as its repair, if any."""
+        repair = held_copy(entry, None) if is_held(entry) else None
         {'missing': self.missing, 'modified': self.modified, 'corrupt': self.corrupt}[finding.kind].append(
-            Problem(entry.resource.path, reason)
+            Problem(entry.resource.path, finding.reason, repair)
         )
 
     def _lists(self) -> tuple[list[Problem] | list[QuarantinedFile], ...]:
@@ -107,7 +114,7 @@ class VerifyReport:
 
 class VerifyRun:
     """One part of a `verify` pass over a mirror: the files still to read are counted on construction (`files`,
-    `size`); `run` checks them.
+    `size`); `run` checks them, reporting each file and the bytes it hashes to `progress`.
 
     The pass checks the files in path order and moves its cursor (`VerifyPass.checked_through`) past each file once
     its check is recorded, committing it at least every `CURSOR_SECONDS` and whenever the run stops, so a later part
@@ -115,9 +122,12 @@ class VerifyRun:
     while it is verified for its current identity and has no finding.
     """
 
-    def __init__(self, mirror: Mirror, destination: ReadOnlyDestination, verify_pass: VerifyPass) -> None:
+    def __init__(
+        self, mirror: Mirror, destination: ReadOnlyDestination, verify_pass: VerifyPass, progress: VerifyProgress
+    ) -> None:
         self._mirror = mirror
         self._destination = destination
+        self._progress = progress
         self._entries = [e for e in mirror.entries() if e.resource.kind == 'file']
         through = verify_pass.checked_through
         verified = [e for e in self._entries if _verified_now(e)]
@@ -137,17 +147,18 @@ class VerifyRun:
         says the device is gone; nothing is recorded for that file, and the cursor stays before it.
         """
         report = VerifyReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
+        self._progress.start(self.files, self.size)
         try:
             for entry in self._entries:
                 self._report(entry, report)
+                self._progress.problems(report.problems)
         except KeyboardInterrupt, DestinationUnreadableError:
             self._commit_cursor()
             raise
         self._mirror.end_verify_pass()
-        report.not_downloaded += [
-            Problem(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()
-        ]
+        report.not_downloaded += [Problem(e.path, unencodable_reason(e)) for e in self._mirror.unencodable()]
         report.not_downloaded.sort(key=lambda problem: problem.path)
+        self._progress.problems(report.problems)
         return report
 
     def _report(self, entry: MirrorEntry, report: VerifyReport) -> None:
@@ -161,9 +172,13 @@ class VerifyRun:
         elif entry.entry_id in self._verified:
             _count_intact(entry, report)
         elif is_held(entry):
-            report.quarantined.append(held_copy(entry, entry.failure))
+            held = held_copy(entry, entry.failure)
+            _log.debug('%s quarantined: kept at %s', entry.resource.path, held.copy)
+            report.quarantined.append(held)
         else:
-            report.not_downloaded.append(Problem(entry.resource.path, _not_downloaded_reason(entry)))
+            reason = _not_downloaded_reason(entry)
+            _log.debug('%s not downloaded: %s', entry.resource.path, reason)
+            report.not_downloaded.append(Problem(entry.resource.path, reason))
 
     def _commit_cursor(self) -> None:
         if self._through is not None and self._through != self._committed:
@@ -172,42 +187,84 @@ class VerifyRun:
         self._committed_at = time.monotonic()
 
     def _check(self, entry: MirrorEntry, report: VerifyReport) -> None:
-        finding = _finding(entry, self._destination)
+        self._progress.reading(entry.resource.path, entry.resource.size or 0)
+        finding = _finding(entry, self._destination, self._progress.read)
+        self._progress.checked()
         if finding is not None:
+            _log.warning('%s %s: %s', entry.resource.path, finding.kind, finding.reason)
             self._mirror.record_finding(entry.entry_id, finding)
             report.add(entry, finding)
             return
+        _log.debug('%s intact', entry.resource.path)
         _count_intact(entry, report)
         if entry.finding is not None:
             self._mirror.clear_finding(entry.entry_id)
 
 
-def verify_summary(report: VerifyReport) -> list[str]:
+def verify_summary(report: VerifyReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a check: the counts, the files checked by size only, then each kind of problem with its
-    reasons."""
+    reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
-        f'Verified {report.destination} ({report.remote_root}): {report.intact} intact, {len(report.missing)} missing, '
-        f'{len(report.modified)} modified, {len(report.corrupt)} corrupt, {len(report.quarantined)} quarantined, '
+        f'Verified {report.destination} ({report.remote_root}): {report.intact} intact, '
+        f'{len(report.missing)} missing, {len(report.modified)} modified, {len(report.corrupt)} corrupt, {len(report.quarantined)} quarantined, '
         f'{len(report.not_downloaded)} not downloaded'
     ]
     if report.size_only:
         lines.append(f'Checked by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', report.size_only, len(report.size_only), '')
+        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
     for title, problems in (('Missing', report.missing), ('Modified', report.modified), ('Corrupt', report.corrupt)):
-        lines += _problem_lines(title, [f'{problem.path}: {problem.reason}' for problem in problems])
-    lines += _problem_lines('Quarantined', [f'{q.path}: {q.reason}; kept at {q.copy}' for q in report.quarantined])
-    lines += _problem_lines(
-        'Not downloaded', [f'{problem.path}: {problem.reason}' for problem in report.not_downloaded]
-    )
+        lines += _problem_lines(title, _problems(problems), limit)
+    lines += _problem_lines('Quarantined', [quarantined_line(held) for held in report.quarantined], limit)
+    lines += _problem_lines('Not downloaded', _problems(report.not_downloaded), limit)
     return lines
 
 
-def _problem_lines(title: str, shown: list[str]) -> list[str]:
-    return [f'{title}: {len(shown)}', *listed('', shown, len(shown), '')] if shown else []
+def verify_document(report: VerifyReport) -> dict[str, object]:
+    """The JSON object of a check: the counts of the summary's head line and the problems, and every list in full."""
+    return {
+        'destination': report.destination,
+        'remote_root': report.remote_root,
+        'counts': {
+            'intact': report.intact,
+            'size_only': len(report.size_only),
+            'missing': len(report.missing),
+            'modified': len(report.modified),
+            'corrupt': len(report.corrupt),
+            'quarantined': len(report.quarantined),
+            'not_downloaded': len(report.not_downloaded),
+            'problems': report.problems,
+        },
+        'size_only': report.size_only,
+        'missing': [_finding_document(problem) for problem in report.missing],
+        'modified': [_finding_document(problem) for problem in report.modified],
+        'corrupt': [_finding_document(problem) for problem in report.corrupt],
+        'quarantined': [quarantined_document(held) for held in report.quarantined],
+        'not_downloaded': [{'path': problem.path, 'reason': problem.reason} for problem in report.not_downloaded],
+    }
 
 
-def _finding(entry: MirrorEntry, destination: ReadOnlyDestination) -> Finding | None:
-    """What is wrong with the file at the entry's final path, or `None` when it is intact."""
+def _finding_document(problem: Problem) -> dict[str, object]:
+    repair = None if problem.repair is None else {'reason': problem.repair.reason, 'copy': str(problem.repair.copy)}
+    return {'path': problem.path, 'reason': problem.reason, 'repair_quarantined': repair}
+
+
+def _problems(problems: list[Problem]) -> list[str]:
+    return [f'{problem.path}: {problem.reason}{_repair(problem.repair)}' for problem in problems]
+
+
+def _repair(held: QuarantinedFile | None) -> str:
+    if held is None:
+        return ''
+    return f'; repair quarantined: {quarantined_reason(held)}; kept at {held.copy}'
+
+
+def _problem_lines(title: str, shown: list[str], limit: int | None) -> list[str]:
+    return [f'{title}: {len(shown)}', *listed('', shown, len(shown), '', limit=limit)] if shown else []
+
+
+def _finding(entry: MirrorEntry, destination: ReadOnlyDestination, read: Callable[[int], None]) -> Finding | None:
+    """What is wrong with the file at the entry's final path, or `None` when it is intact; `read` gets the size of
+    each chunk hashed."""
     record = _record(entry)
     local = _local_path(entry)
     try:
@@ -224,7 +281,7 @@ def _finding(entry: MirrorEntry, destination: ReadOnlyDestination) -> Finding | 
             if opened.st_size != record.identity.size:
                 mismatch = size_mismatch(record.identity, opened.st_size)
             else:
-                mismatch = _content_mismatch(file.chunks(), record.identity)
+                mismatch = _content_mismatch(file.chunks(), record.identity, read)
     except OSError as exc:
         if exc.errno in _DEVICE_GONE_ERRNOS or not destination.reachable():
             raise DestinationUnreadableError(destination.path, exc.strerror or str(exc)) from None
@@ -240,10 +297,11 @@ def _count_intact(entry: MirrorEntry, report: VerifyReport) -> None:
         report.size_only.append(entry.resource.path)
 
 
-def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity) -> str | None:
+def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity, read: Callable[[int], None]) -> str | None:
     digest = Digest()
     for chunk in chunks:
         digest.update(digest.size, chunk)
+        read(len(chunk))
     return digest.mismatch(identity)
 
 

@@ -4,13 +4,15 @@ destination, with the real manifest in the XDG state directory."""
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import random
+import re
 import signal
 import sqlite3
 import stat
 from contextlib import closing
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
 import pytest
@@ -25,14 +27,18 @@ from mirror_tree import (
     replaced_runs,
     run_download,
     runner,
+    slow_reads,
     start_command,
+    status_lines,
+    stderr_lines,
     wait_until,
 )
 from yandex_disk_rescue import localfs, verifying
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.commands import verify as verify_command
 from yandex_disk_rescue.destination import ReadOnlyDestination
 from yandex_disk_rescue.manifest import Mirror
-from yandex_disk_rescue.paths import manifest_path
+from yandex_disk_rescue.paths import log_path, manifest_path
 from yandex_disk_rescue.units import format_size
 
 CORRUPT = 'disk:/Photos/2024/a.jpg'
@@ -166,9 +172,12 @@ def test_a_complete_mirror_is_intact_with_no_token_and_no_network(
 
     assert result.exit_code == 0, result.output
     assert result.stdout == (
-        f'Verifying 6 files ({TOTAL}) in {dest}\n' + _intact_lines(dest, 6) + f'Manifest: {manifest_path()}\n'
+        f'Verifying 6 files ({TOTAL}) in {dest}\n'
+        + _intact_lines(dest, 6)
+        + f'Manifest: {manifest_path()}\n'
+        + f'Log: {log_path()}\n'
     )
-    assert result.stderr == ''
+    assert stderr_lines(result.stderr) == []
     assert len(disk.requests) == earlier
     assert _findings() == []
     assert [folder.stat().st_mtime_ns for folder in separate] == mtimes
@@ -203,14 +212,41 @@ def test_each_kind_of_damage_is_reported_and_recorded_and_a_link_is_never_follow
         f'Modified: 2\n  {CYRILLIC}: {linked_reason}\n  {EDITED}: {edited_reason}\n'
         f'Corrupt: 1\n  {CORRUPT}: {corrupt_reason}\n'
         f'Manifest: {manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
-    assert result.stderr == 'Error: 4 problems found; see the lists above.\n'
+    assert stderr_lines(result.stderr) == [
+        f'{README} missing: Docs/readme.txt is missing',
+        f'{CYRILLIC} modified: {linked_reason}',
+        f'{CORRUPT} corrupt: {corrupt_reason}',
+        f'{EDITED} modified: {edited_reason}',
+        'Error: 4 problems found; see the lists above.',
+    ]
     assert _findings() == [
         (README, 'missing', 'Docs/readme.txt is missing'),
         (CYRILLIC, 'modified', linked_reason),
         (CORRUPT, 'corrupt', corrupt_reason),
         (EDITED, 'modified', edited_reason),
     ]
+    document = json.loads(_verify('--json', str(dest)).stdout)
+    assert document['counts'] == {
+        'intact': 2,
+        'size_only': 1,
+        'missing': 1,
+        'modified': 2,
+        'corrupt': 1,
+        'quarantined': 0,
+        'not_downloaded': 0,
+        'problems': 4,
+    }
+    assert (document['missing'], document['modified'], document['corrupt']) == (
+        [{'path': README, 'reason': 'Docs/readme.txt is missing', 'repair_quarantined': None}],
+        [
+            {'path': CYRILLIC, 'reason': linked_reason, 'repair_quarantined': None},
+            {'path': EDITED, 'reason': edited_reason, 'repair_quarantined': None},
+        ],
+        [{'path': CORRUPT, 'reason': corrupt_reason, 'repair_quarantined': None}],
+    )
+    assert (document['exit_code'], document['error']) == (1, {'message': '4 problems found; see the lists above.'})
     assert linked.is_symlink()
     assert os.readlink(linked) == str(outside)
     assert outside.read_bytes() == b'not part of the mirror'
@@ -226,7 +262,7 @@ def test_an_unreadable_file_is_corrupt_and_the_others_are_still_checked(disk, de
     assert result.exit_code == 1
     reason = f'could not read Docs/readme.txt: {os.strerror(errno.EIO)}'
     assert _intact_lines(dest, 5, corrupt=1) + f'Corrupt: 1\n  {README}: {reason}\n' in result.stdout
-    assert result.stderr == 'Error: 1 problem found; see the list above.\n'
+    assert stderr_lines(result.stderr) == [f'{README} corrupt: {reason}', 'Error: 1 problem found; see the list above.']
     assert _findings() == [(README, 'corrupt', reason)]
 
 
@@ -255,9 +291,9 @@ def test_a_destination_gone_mid_check_stops_it_with_nothing_recorded(disk, dest,
 
     assert stopped.exit_code == 1
     assert stopped.stdout == f'Verifying 6 files ({TOTAL}) in {dest}\n'
-    assert stopped.stderr == (
-        f'Error: Could not read {dest}: {os.strerror(code)}; verify stopped. Rerun it once the disk is back.\n'
-    )
+    assert stderr_lines(stopped.stderr) == [
+        f'Error: Could not read {dest}: {os.strerror(code)}; verify stopped. Rerun it once the disk is back.'
+    ]
     assert _findings() == []
     started, through = _verify_pass()
     assert through == CYRILLIC
@@ -295,7 +331,7 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
         '  disk:/New/n.txt: not downloaded yet\n'
         f'  {EDITED}: changed on the Disk since it was downloaded\n'
     ) in result.stdout
-    assert result.stderr == 'Error: 4 problems found; see the lists above.\n'
+    assert stderr_lines(result.stderr) == ['Error: 4 problems found; see the lists above.']
     assert local_file(dest, EDITED).stat().st_ino not in reads
     assert (run / 'Photos' / '2024' / 'a.jpg').stat().st_ino not in reads
     assert _findings() == []
@@ -327,9 +363,21 @@ def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_
         _intact_lines(dest, 5, corrupt=1)
         + f'Corrupt: 1\n  {CORRUPT}: {finding}; repair quarantined: {quarantine_reason}; kept at {copy}\n'
         + f'Manifest: {manifest_path()}\n'
+        + f'Log: {log_path()}\n'
     ) in again.stdout
     assert 'Quarantined:' not in again.stdout
-    assert again.stderr == 'Error: 1 problem found; see the list above.\n'
+    assert stderr_lines(again.stderr) == ['Error: 1 problem found; see the list above.']
+
+    as_json = _verify('--json', str(dest))
+
+    assert as_json.exit_code == 1
+    document = json.loads(as_json.stdout)
+    assert document['corrupt'] == [
+        {'path': CORRUPT, 'reason': finding, 'repair_quarantined': {'reason': quarantine_reason, 'copy': str(copy)}}
+    ]
+    assert (document['quarantined'], document['counts']['problems']) == ([], 1)
+    assert (document['exit_code'], document['error']) == (1, {'message': '1 problem found; see the list above.'})
+    assert as_json.stderr.splitlines()[-1] == 'Error: 1 problem found; see the list above.'
 
 
 def _md5_mismatch(expected: bytes, got: bytes) -> str:
@@ -477,7 +525,7 @@ def test_a_destination_that_is_not_a_recorded_mirror_folder_is_a_usage_error_and
 
     dest.mkdir()
     no_manifest = _verify(str(dest))
-    created = manifest_path().parent.exists()
+    created = manifest_path().exists()
     assert runner.invoke(app, ['scan']).exit_code == 0
     unrecorded = _verify(str(dest))
 
@@ -552,36 +600,14 @@ def _after(through: str) -> list[str]:
     return [path for path in MANY if path > through]
 
 
-# Installed as `sitecustomize` in a verify subprocess: every `pread` sleeps 50 ms first, and leaves a marker named
-# after the inode it reads in the folder `READ_GATE`.
-_SLOW_READS = """
-import os, pathlib, time
-
-_gate, _pread = pathlib.Path(os.environ['READ_GATE']), os.pread
-
-
-def pread(fd, size, offset):
-    (_gate / str(os.fstat(fd).st_ino)).touch()
-    time.sleep(0.05)
-    return _pread(fd, size, offset)
-
-
-os.pread = pread
-"""
-
-
 def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_uninterrupted_verify_does(
     many, dest, tmp_path, monkeypatch
 ):
-    site, gate = tmp_path / 'site', tmp_path / 'gate'
-    site.mkdir()
-    gate.mkdir()
-    (site / 'sitecustomize.py').write_text(_SLOW_READS)
-    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
-    monkeypatch.setenv('READ_GATE', str(gate))
-    child = start_command('verify', str(dest))
+    gate = slow_reads(tmp_path, monkeypatch)
+    child = start_command('verify', '--progress-interval', '1', str(dest))
     try:
-        wait_until(lambda: len(list(gate.iterdir())) >= 10, child, 'read 10 files')
+        # Each file takes two reads, so 20 files take 2 s at least, the time of one status line and more.
+        wait_until(lambda: len(list(gate.iterdir())) >= 20, child, 'read 20 files')
         child.send_signal(signal.SIGINT)
         stdout, stderr = child.communicate(timeout=60)
     finally:
@@ -591,7 +617,16 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
 
     assert child.returncode == 130, stderr
     assert stdout == f'Verifying 40 files ({MANY_SIZE}) in {dest}\n'
-    assert stderr == 'Interrupted; rerun verify to continue where it stopped.\n'
+    *notices, result_line = stderr_lines(stderr)
+    assert [notice.partition(' ')[0] for notice in notices] == [EARLY]
+    assert result_line == 'Interrupted; rerun verify to continue where it stopped.'
+    *verifying, stopped_line = status_lines(stderr)
+    assert verifying
+    checked = [
+        int(re.match(r'Verifying: (\d+) of 40 files, .*; 1 problem(?:$|; reading )', line)[1]) for line in verifying
+    ]
+    assert checked == sorted(checked)
+    assert stopped_line.startswith('Verified: ')
     started, through = _verify_pass()
     assert EARLY <= through < LATE
     assert [path for path, *_ in _findings()] == [EARLY]
@@ -600,22 +635,57 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
 
     left = _after(through)
     assert resumed.stdout.startswith(f'{_started(started)} {len(left)} files ({format_size(1024 * len(left))}) left\n')
+    [resumed_line] = status_lines(resumed.stderr)
+    assert resumed_line.startswith(f'Verified: {len(left)} of {len(left)} files, {format_size(1024 * len(left))} in ')
+    assert resumed_line.endswith('; 2 problems')
     assert _verify_pass() is None
 
     uninterrupted = _verify(str(dest))
 
     assert uninterrupted.stdout.startswith(f'Verifying 40 files ({MANY_SIZE}) in {dest}\n')
-    assert (
-        (resumed.exit_code, resumed.stderr)
-        == (uninterrupted.exit_code, uninterrupted.stderr)
-        == (
-            1,
-            'Error: 2 problems found; see the list above.\n',
-        )
-    )
+    assert resumed.exit_code == uninterrupted.exit_code == 1
+    *found_now, result_line = stderr_lines(resumed.stderr)
+    *found_in_full, full_result_line = stderr_lines(uninterrupted.stderr)
+    assert result_line == full_result_line == 'Error: 2 problems found; see the list above.'
+    assert [notice.partition(' ')[0] for notice in found_now] == [LATE]
+    assert [notice.partition(' ')[0] for notice in found_in_full] == [EARLY, LATE]
     assert resumed.stdout.splitlines()[1:] == uninterrupted.stdout.splitlines()[1:]
     assert f'Verified {dest} (disk:/Many): 38 intact, 0 missing, 0 modified, 2 corrupt,' in resumed.stdout
     assert [path for path, *_ in _findings()] == [EARLY, LATE]
+
+
+def test_json_of_a_continued_pass_says_so_and_counts_what_an_uninterrupted_pass_does(many, dest, tmp_path, monkeypatch):
+    gate = slow_reads(tmp_path, monkeypatch)
+    child = start_command('verify', '--json', str(dest))
+    try:
+        wait_until(lambda: len(list(gate.iterdir())) >= 20, child, 'read 20 files')
+        child.send_signal(signal.SIGINT)
+        stopped, _ = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+    monkeypatch.delenv('PYTHONPATH')
+    started, through = _verify_pass()
+
+    resumed = json.loads(_verify('--json', str(dest)).stdout)
+    uninterrupted = json.loads(_verify('--json', str(dest)).stdout)
+
+    assert child.returncode == 130
+    interrupted = json.loads(stopped)
+    assert (interrupted['exit_code'], interrupted['error']) == (130, {'message': verify_command.INTERRUPTED})
+    assert 'pass' not in interrupted
+    left = _after(through)
+    assert resumed['pass'] == {
+        'started_at': f'{started.astimezone(UTC):%Y-%m-%dT%H:%M:%S}.{started.microsecond // 1000:03d}Z',
+        'continued': True,
+        'files_read': len(left),
+        'size_read': 1024 * len(left),
+    }
+    assert uninterrupted['pass']['continued'] is False
+    assert (uninterrupted['pass']['files_read'], uninterrupted['pass']['size_read']) == (40, 40 * 1024)
+    assert resumed['counts'] == uninterrupted['counts']
+    assert resumed['counts']['corrupt'] == 2
+    assert resumed['corrupt'] == uninterrupted['corrupt']
 
 
 def test_the_cursor_is_committed_every_cursor_seconds_and_never_past_the_file_in_flight(many, dest, monkeypatch):

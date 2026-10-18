@@ -1,15 +1,18 @@
 """The Disk tree the `download` and `verify` tests mirror (the `disk` fixture in `conftest.py` serves it), and helpers
-to run `download`, run a command in a child process, and look at its destination."""
+to run `download`, run a command in a child process, look at its destination, and read the log file."""
 
 import hashlib
 import os
+import re
 import subprocess
 import time
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.paths import log_path
 
 runner = CliRunner()
 
@@ -74,3 +77,66 @@ def corrupted_bytes(content: bytes, offset: int) -> tuple[bytes, str]:
     flipped[offset] ^= 0xFF
     good, bad = hashlib.md5(content).hexdigest(), hashlib.md5(flipped).hexdigest()
     return bytes(flipped), f'MD5 mismatch (expected {good}, got {bad})'
+
+
+LOG_LINE = re.compile(
+    r'(?P<time>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z) (?P<level>[A-Z]+) (?P<command>[a-z]+)\[(?P<pid>\d+)\] '
+)
+
+
+def log_messages(path=None) -> list[str]:
+    """The message of every line of the log file (default: the current one), each line checked for its prefix."""
+    lines = (path or log_path()).read_text(encoding='utf-8').splitlines()
+    for line in lines:
+        assert LOG_LINE.match(line), line
+    return [LOG_LINE.sub('', line, count=1) for line in lines]
+
+
+NOTICE_TIMESTAMP = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z ')
+STATUS_LINE = re.compile(
+    NOTICE_TIMESTAMP.pattern
+    + r'(?:(?:Scanning|Scanned) \S.*: \d+ files?, \d+ folders? \(.*\) listed'
+    + r'|Checking \d+ files? already in |Checked \d+ of \d+ files? already in '
+    + r'|(?:Moving|Moved|Downloading|Downloaded|Verifying|Verified): \d+ of \d+ files?, )'
+)
+
+
+def stderr_lines(stderr: str) -> list[str]:
+    """The lines of a command's stderr but its status lines, each notice without its timestamp: the notices, then
+    the result line."""
+    return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines() if not STATUS_LINE.match(line)]
+
+
+def status_lines(stderr: str) -> list[str]:
+    """The status lines of a command's stderr, without their timestamps."""
+    return [NOTICE_TIMESTAMP.sub('', line, count=1) for line in stderr.splitlines() if STATUS_LINE.match(line)]
+
+
+# Installed as `sitecustomize` in a child process: every `pread` sleeps 50 ms first, and leaves a marker named after
+# the inode it reads in the folder `READ_GATE`.
+_SLOW_READS = """
+import os, pathlib, time
+
+_gate, _pread = pathlib.Path(os.environ['READ_GATE']), os.pread
+
+
+def pread(fd, size, offset):
+    (_gate / str(os.fstat(fd).st_ino)).touch()
+    time.sleep(0.05)
+    return _pread(fd, size, offset)
+
+
+os.pread = pread
+"""
+
+
+def slow_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Make every `pread` of the child processes started from now on sleep 50 ms first and leave a marker named after
+    the inode it reads in the folder returned."""
+    site, gate = tmp_path / 'site', tmp_path / 'gate'
+    site.mkdir()
+    gate.mkdir()
+    (site / 'sitecustomize.py').write_text(_SLOW_READS)
+    monkeypatch.setenv('PYTHONPATH', os.pathsep.join(filter(None, [str(site), os.environ.get('PYTHONPATH')])))
+    monkeypatch.setenv('READ_GATE', str(gate))
+    return gate

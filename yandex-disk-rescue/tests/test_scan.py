@@ -1,5 +1,6 @@
 """Tests for `yandex-disk-rescue scan` against the fake Disk API, with the real manifest in the XDG state directory."""
 
+import json
 import os
 import signal
 import subprocess
@@ -8,12 +9,13 @@ from datetime import UTC
 
 import pytest
 from fake_disk_server import Delay, FakeResponse
+from mirror_tree import log_messages, stderr_lines
 from typer.testing import CliRunner
 from yandex_disk_rescue import scanning
 from yandex_disk_rescue.api import Resource
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.manifest import Manifest
-from yandex_disk_rescue.paths import state_dir
+from yandex_disk_rescue.paths import log_path, state_dir
 from yandex_disk_rescue.units import format_size
 
 runner = CliRunner()
@@ -82,6 +84,7 @@ def test_first_scan_records_the_tree_and_summarizes_it(disk):
         '  disk:/Photos/old.bmp\n'
         'First scan of disk:/\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert _rows() == _tree_rows(disk)
     assert all(r.headers['authorization'] == f'OAuth {TOKEN}' for r in disk.requests)
@@ -104,6 +107,7 @@ def test_a_rescan_lists_exactly_what_was_added_changed_and_removed(disk):
         '  ~ disk:/Docs/readme.txt\n'
         '  - disk:/Photos/old.bmp\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert _rows() == _tree_rows(disk)
 
@@ -119,9 +123,16 @@ def test_entries_whose_names_are_not_valid_unicode_are_reported_and_not_recorded
         'Not recorded, the name is not valid Unicode: 2\n  disk:/Bad\\udc81\n  disk:/Docs/bad\\udc80.txt\n'
     ) in result.stdout
     assert result.stdout.startswith(f'Scanned disk:/: 6 files, 4 folders, {format_size(6013)}\n')
+    assert sorted(stderr_lines(result.stderr)) == [
+        'disk:/Bad\\udc81 left out: the name is not valid Unicode',
+        'disk:/Docs/bad\\udc80.txt left out: the name is not valid Unicode',
+    ]
     left_out = {'disk:/Docs/bad\udc80.txt', 'disk:/Bad\udc81', 'disk:/Bad\udc81/inside.txt'}
     assert _rows() == [r for r in _tree_rows(disk) if r.path not in left_out]
     assert 'disk:/Bad\udc81' not in [r.params.get('path') for r in disk.requests]
+
+    document = json.loads(_scan('--json').stdout)
+    assert document['unencodable'] == ['disk:/Bad\udc81', 'disk:/Docs/bad\udc80.txt']
 
 
 def test_a_folder_scan_records_the_folder_itself_and_leaves_the_rest_alone(disk):
@@ -157,6 +168,7 @@ def test_long_path_lists_are_cut_after_twenty_entries(disk):
         + '  … and 5 more\n'
         'First scan of disk:/Bulk\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
     assert second.exit_code == 0, second.output
     assert second.stdout.splitlines()[23:] == [
@@ -165,7 +177,41 @@ def test_long_path_lists_are_cut_after_twenty_entries(disk):
         '  … and 4 more changed',
         '  - disk:/Bulk/00.raw',
         f'Manifest: {_manifest_path()}',
+        f'Log: {log_path()}',
     ]
+    logged = log_messages()
+    assert logged[-1] == 'scan completed (exit 0)'
+    changes = logged.index('Changes since the last scan: 0 added, 24 changed, 1 removed')
+    assert logged[changes:-1] == [
+        'Changes since the last scan: 0 added, 24 changed, 1 removed',
+        *(f'  ~ disk:/Bulk/{index:02}.raw' for index in range(1, 25)),
+        '  - disk:/Bulk/00.raw',
+    ]
+    for index in range(1, 47):
+        disk.add_file(f'disk:/Bulk/{index:02}.raw', b'again', md5=None, sha256=None)
+
+    third = _scan('--json', 'disk:/Bulk')
+
+    assert third.exit_code == 0, third.output
+    document = json.loads(third.stdout)
+    assert (document['command'], document['root'], document['files'], document['folders']) == (
+        'scan',
+        'disk:/Bulk',
+        46,
+        0,
+    )
+    assert document['size'] == 46 * len(b'again')
+    assert document['without_checksum'] == {
+        'count': 46,
+        'sample': [f'disk:/Bulk/{index:02}.raw' for index in range(1, 21)],
+    }
+    assert document['first_scan'] is False
+    assert document['added'] == [f'disk:/Bulk/{index:02}.raw' for index in range(25, 47)]
+    assert document['changed'] == [f'disk:/Bulk/{index:02}.raw' for index in range(1, 25)]
+    assert (document['removed'], document['vanished'], document['unencodable']) == ([], [], [])
+    report = stderr_lines(third.stderr)
+    assert report[0].startswith('Scanned disk:/Bulk: 46 files, 0 folders, ')
+    assert '  … and 2 more added' in report
 
 
 @pytest.mark.parametrize(
@@ -211,10 +257,10 @@ def test_a_folder_failing_past_the_retries_names_it_and_keeps_the_previous_scan(
     result = _scan('--api-retries', '1')
 
     assert result.exit_code == 1
-    assert result.stderr == (
+    assert stderr_lines(result.stderr) == [
         'Error: Could not list disk:/Photos/2024: Yandex Disk API returned HTTP 503: Injected HTTP 503 '
-        '(after 2 attempts)\n'
-    )
+        '(after 2 attempts)'
+    ]
     assert 'Traceback' not in result.output
     assert _rows() == previous
 
@@ -251,7 +297,7 @@ def test_a_scan_stopped_mid_walk_keeps_the_previous_scan(disk, stop):
 
     if stop == signal.SIGINT:
         assert child.returncode == 130, stderr
-        assert stderr == 'Interrupted; the manifest holds the last completed scan.\n'
+        assert stderr_lines(stderr) == ['Interrupted; the manifest holds the last completed scan.']
         assert stdout == ''
     else:
         assert child.returncode == -signal.SIGKILL
@@ -297,7 +343,9 @@ def test_a_folder_deleted_during_the_scan_is_reported_and_recorded_as_removed(di
         '  - disk:/Photos/2024/b.jpg\n'
         '  - disk:/Photos/2024/c.jpg\n'
         f'Manifest: {_manifest_path()}\n'
+        f'Log: {log_path()}\n'
     )
+    assert stderr_lines(result.stderr) == ['disk:/Photos/2024 disappeared during the scan; it is recorded as removed']
     disk.remove('disk:/Photos/2024')
     assert _rows() == _tree_rows(disk)
 
@@ -387,8 +435,8 @@ def test_a_vanished_sub_folder_is_reported_once_under_its_vanished_parent(disk, 
 @pytest.mark.parametrize(
     ('answer', 'message'),
     [
-        (404, "Error: Remote path 'disk:/Photos' does not exist.\n"),
-        (_now_a_file('disk:/Photos'), "Error: Remote path 'disk:/Photos' is a file, not a folder.\n"),
+        (404, "Error: Remote path 'disk:/Photos' does not exist."),
+        (_now_a_file('disk:/Photos'), "Error: Remote path 'disk:/Photos' is a file, not a folder."),
     ],
     ids=['deleted', 'replaced-by-a-file'],
 )
@@ -399,5 +447,5 @@ def test_the_scanned_folder_itself_vanishing_fails_the_scan(disk, answer, messag
 
     result = _scan('disk:/Photos')
 
-    assert (result.exit_code, result.stderr) == (1, message)
+    assert (result.exit_code, stderr_lines(result.stderr)) == (1, [message])
     assert _rows() == previous

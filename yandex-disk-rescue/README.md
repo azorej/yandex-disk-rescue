@@ -37,8 +37,9 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | Size above which a file is downloaded as segments, 1 to 65536 MiB (default 256). Same as `--download-segment-threshold-mib`. |
 | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | Existing folder, an absolute path outside DEST, below which `download` keeps DEST's partial files (in `<folder>/<key>/`) and copies each finished one to DEST; empty counts as unset (default: partial files in DEST). Same as `--partial-dir`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
+| `YANDEX_DISK_RESCUE_PROGRESS_INTERVAL` | Seconds between two status lines of `scan`, `download` and `verify`, on stderr and in the log file, 1 to 3600 (default 60). Same as `--progress-interval`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
-| `XDG_STATE_HOME` | Parent of the state directory holding the manifest (default `~/.local/state`). |
+| `XDG_STATE_HOME` | Parent of the state directory holding the manifest and the log file (default `~/.local/state`). |
 
 ## Manifest
 
@@ -118,18 +119,19 @@ yandex-disk-rescue/
 │   │                 #   (config-file values as Click's default_map), the `auth` commands, registration of
 │   │                 #   the commands in `commands/`
 │   ├── commands/
-│   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary and Ctrl+C message
+│   │   ├── scan.py   # The `scan` command: token, client, manifest, the scan engine, its summary, its JSON object and
+│   │   │             #   Ctrl+C message
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
 │   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
-│   │   │             #   retry set (`--retry-failed`), its start line, the move line, the partial-folder line
-│   │   │             #   with its room once measured, summary,
-│   │   │             #   exit code
+│   │   │             #   retry set (`--retry-failed`), its start line, the move line and the move's status
+│   │   │             #   lines, the partial-folder line with its room once measured, summary, JSON object
+│   │   │             #   (the report's, with the scan, the files to download, the move and the room), exit code
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
-│   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, exit code
-│   │                 #   and Ctrl+C message; no token, no network
+│   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, JSON
+│   │                 #   object with the pass, exit code and Ctrl+C message; no token, no network
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
 │   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
-│   │                 #   commit, the summary lines
+│   │                 #   commit, the summary lines and `scan_document`, the scan's JSON object
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
 │   │                 #   over the retry set (failed, quarantined or partial files, files with a verify finding,
 │   │                 #   failed folders) and the folders
@@ -159,14 +161,15 @@ yandex-disk-rescue/
 │   │                 #   lines (with the partial files that could not be deleted once their file was
 │   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
-│   │                 #   stay on the event loop
+│   │                 #   stay on the event loop; `mirror_document`, the run's JSON object
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
 │   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each
 │   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded;
 │   │                 #   a finding with a quarantined repair stays under its finding, with the repair);
 │   │                 #   stopping when the destination itself becomes unreadable; the pass's cursor, committed
 │   │                 #   every `CURSOR_SECONDS` and when it stops, so a later part reads only the files after
-│   │                 #   it while the report covers the whole pass; the summary lines
+│   │                 #   it while the report covers the whole pass; the summary lines and
+│   │                 #   `verify_document`, the check's JSON object
 │   ├── disk_threads.py # DiskThreads — the run's dedicated worker threads; a cancelled caller waits for its call
 │   │                 #   in flight, so no descriptor is closed under a running call
 │   ├── destination.py # The destination folder: argument checks (DEST and `--partial-dir`), the run lock and
@@ -185,9 +188,36 @@ yandex-disk-rescue/
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
 │   │                 #   an open file and setting its times; the free space of a folder's filesystem
-│   ├── units.py      # format_size — binary-unit byte counts for command output
+│   ├── console.py    # The output of scan, download and verify: `-v`/`-q`/`--no-progress`/`--json`, the report
+│   │                 #   lines on stdout (on stderr with `--json`), the run wrapped in `command_output` (log file
+│   │                 #   and notice handlers attached for the run, its start and end records, the Ctrl+C line,
+│   │                 #   `LogFileError`, and with `--json` the one JSON document: the common keys, then the
+│   │                 #   report object `Output.report` was given, or `error` alone), the start lines and the
+│   │                 #   full summary logged, the `Manifest:` and `Log:` lines, and `Output.progress`, which reports one phase:
+│   │                 #   its status-line thread (to the log file always, to stderr off a terminal unless
+│   │                 #   `--no-progress` or `-q`) and on a terminal its live view; the one logged warning once
+│   │                 #   stderr is off; whether stderr is a terminal
+│   │                 #   (a tty, `TERM` neither dumb nor unknown); the engines and the API client log their own
+│   │                 #   records (failures, findings, per-file outcomes, passes, throttling) through
+│   │                 #   `logging.getLogger`
+│   ├── view.py       # The live view of one phase, drawn with rich `Live` on stderr: the status line, a bar (a
+│   │                 #   spinner for a scan), up to 10 files in progress with their speed or state, the file
+│   │                 #   `verify` reads; notices and report lines printed above it; cleared when the phase ends
+│   ├── progress.py   # Thread-safe progress states the engines update (ScanProgress, MoveProgress for the move of
+│   │                 #   partial files to a new partial folder, MirrorProgress with one ActiveFile per file in
+│   │                 #   progress, its state from waiting for room to copying to DEST, its speed over the last
+│   │                 #   10 s and how far its copy to DEST got, VerifyProgress), their snapshots and status lines;
+│   │                 #   speed over the last minute, ETA over the last 15 minutes; no I/O
+│   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
+│   │                 #   one notice when a write fails) and the notices on stderr (timestamped off a terminal),
+│   │                 #   sent through the live view while one is shown; a write to stderr that fails turns
+│   │                 #   stderr off for the run (`sys.stderr` then discards everything) instead of raising
+│   ├── units.py      # format_size and format_duration — binary-unit byte counts and durations for command output
+│   ├── display.py    # display_line and display_text — text with every control character and lone surrogate
+│   │                 #   escaped (`\x1b`, `\x0a`, `\udcxx`), applied where the report, stderr, the live view and
+│   │                 #   the log file are written
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
-│   ├── paths.py      # XDG config and state directories, the manifest path
+│   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
 │   │                 #   failure and quarantine records, verify findings, the verify pass and the folder of the
@@ -220,7 +250,8 @@ yandex-disk-rescue/
     │                       #   `/dev/shm`, another filesystem than `dest`'s)
     ├── mirror_tree.py      # The tree the download and verify tests mirror; running `download`, running a command
     │                       #   in a child process and waiting on it, the local path of a Disk file, the replaced
-    │                       #   and quarantine run folders, a corrupted copy of bytes
+    │                       #   and quarantine run folders, a corrupted copy of bytes, the messages of the log file,
+    │                       #   the lines of stderr without the notice timestamps
     ├── fake_disk_server.py # Real-socket fake Disk API and download host: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
     │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
@@ -237,6 +268,7 @@ yandex-disk-rescue/
     ├── test_download.py
     ├── test_local_names.py
     ├── test_manifest.py
+    ├── test_output.py
     ├── test_rate_limiter.py
     ├── test_scan.py
     ├── test_transfer.py

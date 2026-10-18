@@ -60,6 +60,7 @@ and the local names stay on the event loop thread.
 import asyncio
 import hashlib
 import itertools
+import logging
 import os
 import stat
 import time
@@ -92,7 +93,8 @@ from yandex_disk_rescue.manifest import (
     UnencodableEntry,
     VerifiedBy,
 )
-from yandex_disk_rescue.scanning import display_path, listed
+from yandex_disk_rescue.progress import ActiveFile, MirrorProgress, MoveProgress, Outcome
+from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
 from yandex_disk_rescue.units import format_size
 
 PASS_PAUSE_SECONDS = 5.0
@@ -109,6 +111,7 @@ _CHANGED = 'changed in the cloud since the scan; rerun with --scan-max-age 0 to 
 _QUARANTINE_HINT = (
     'Download them again with --retry-failed (add --scan-max-age 0 if they changed on the Disk since the scan).'
 )
+_log = logging.getLogger(__name__)
 
 
 class FileFailed(Exception):
@@ -179,11 +182,13 @@ class PartialMove:
 
 @dataclass(frozen=True)
 class QuarantinedFile:
-    """A file whose quarantined copy at `copy` (relative to the destination) stands for it in this run."""
+    """A file whose quarantined copy at `copy` (relative to the destination) stands for it in this run: quarantined
+    for `reason`, and `last_retry`, the failure of the last attempt to fetch it again, if any."""
 
     path: str
     reason: str
     copy: PurePosixPath
+    last_retry: str | None
 
 
 @dataclass
@@ -370,20 +375,20 @@ class PartialRoom:
         return cls(destination, capacity, {entry_id: allocated for entry_id, allocated in idle.items() if allocated})
 
     @asynccontextmanager
-    async def turn(self, entry_id: int, size: int) -> AsyncIterator[None]:
+    async def turn(self, entry_id: int, size: int, progress: ActiveFile) -> AsyncIterator[None]:
         """Hold a turn of the room for the `size`-byte file of `entry_id` once it is admitted, until the context is
-        left.
+        left; `progress` shows the file as waiting for room while it waits.
 
         Raises `FileFailed` when the turn needs a reservation and `size` exceeds the capacity, and `FileDeferred` when
         the turn does not fit and no admitted turn is running.
         """
-        await self._admitted(entry_id, size)
+        await self._admitted(entry_id, size, progress)
         try:
             yield
         finally:
             self._end(entry_id)
 
-    async def _admitted(self, entry_id: int, size: int) -> None:
+    async def _admitted(self, entry_id: int, size: int, progress: ActiveFile) -> None:
         if self._reservation(entry_id, size) == 0:
             self._reserved[entry_id] = 0
             self._changes += 1
@@ -397,6 +402,10 @@ class PartialRoom:
         waiter = (entry_id, size, admitted)
         self._waiting.append(waiter)
         self._admit()
+        waits = not admitted.done()
+        if waits:
+            self._log_wait(progress.path, self._reservation(entry_id, size))
+            progress.state('waiting for room')
         try:
             await admitted
         except asyncio.CancelledError:
@@ -406,6 +415,28 @@ class PartialRoom:
             elif not admitted.cancelled() and admitted.exception() is None:
                 self._end(entry_id)
             raise
+        if waits:
+            progress.state('waiting for a connection')
+
+    def _log_wait(self, path: str, reservation: int) -> None:
+        available = max(self.capacity - self._counted, 0)
+        if reservation <= available:
+            ahead = len(self._waiting) - 1
+            _log.debug(
+                '%s waits for its turn of the partial folder %s behind %d %s waiting for room',
+                path,
+                self.folder,
+                ahead,
+                'file' if ahead == 1 else 'files',
+            )
+        else:
+            _log.debug(
+                '%s waits for room in the partial folder %s (%s needed, %s available)',
+                path,
+                self.folder,
+                format_size(reservation),
+                format_size(available),
+            )
 
     def _reservation(self, entry_id: int, size: int) -> int:
         return max(0, size - self._idle.get(entry_id, 0))
@@ -554,9 +585,11 @@ class _FileTurns:
 
 class MirrorRun:
     """One run over a mirror: names are assigned, the staged copies and stray partial files a stopped run left
-    deleted, the files this run will attempt counted, and the move of the partial files from the folder the mirror
-    records planned (`partial_move`, `None` when it is this run's folder) on construction; `run` then makes that move
-    and walks the run's entries in path order.
+    deleted, the verified files already in the destination checked, the files this run will attempt counted, and the
+    move of the partial files from the folder the mirror records planned (`partial_move`, `None` when it is this run's
+    folder) on construction; `move_partials` then makes that move, and `run` walks the run's entries in path order.
+    The check and `run` report to `progress`: the check as it runs, then every file the run attempts, each settling
+    once (deferred files settle in a later pass).
 
     With `retry_failed`, the run covers only the retry set: the files with a failure record, a quarantine record, a
     `verify` finding or a `partial` download record, and the folders with a failure record. Its walk visits them and
@@ -570,9 +603,12 @@ class MirrorRun:
     its scan, because its name is not valid Unicode, is a failure of the run, and has no record.
     """
 
-    def __init__(self, mirror: Mirror, destination: Destination, *, retry_failed: bool) -> None:
+    def __init__(
+        self, mirror: Mirror, destination: Destination, *, retry_failed: bool, progress: MirrorProgress
+    ) -> None:
         self._mirror = mirror
         self._destination = destination
+        self._progress = progress
         entries = _assign_local_names(mirror)
         self._names = LocalNames(mirror, entries)
         self._entries = _retry_walk(entries, self._names) if retry_failed else entries
@@ -583,18 +619,18 @@ class MirrorRun:
         with _fatal_errors(destination.path):
             self._in_progress = [e.entry_id for e in in_progress]
             destination.keep_partials(self._in_progress)
-            self._current = {
-                e.entry_id for e in self._entries if e.entry_id not in self._held and _is_current(e, destination)
-            }
+            self._current = self._check(destination)
         self._partial_folder = destination.partial_folder if destination.separate_partials else None
         self._source: PreviousPartials | None = None
-        self._moved: list[tuple[int, tuple[Segment, ...], int]] = []
+        self._moved: list[tuple[MirrorEntry, tuple[Segment, ...], int]] = []
+        self._move_done = False
         self.partial_move = self._plan_move(in_progress)
         pending = [
             e
             for e in self._entries
             if e.resource.kind == 'file' and e.entry_id not in self._current and e.entry_id not in self._held
         ]
+        self._pending = {e.entry_id for e in pending}
         self.pending_files = len(pending)
         self.pending_size = sum(e.resource.size or 0 for e in pending)
 
@@ -615,42 +651,91 @@ class MirrorRun:
             return None
         for entry in in_progress:
             if entry.download is not None and (held := source.size(entry.entry_id)) is not None:
-                self._moved.append((entry.entry_id, entry.download.segments, held))
+                self._moved.append((entry, entry.download.segments, held))
         self._source = source
         size = sum(s.confirmed - s.start for _, segments, held in self._moved for s in _movable(segments, held))
         return PartialMove(source.path, destination.partial_folder, len(self._moved), size, missing=False)
 
-    async def _move_partials(self, threads: DiskThreads) -> None:
-        """Carry out `partial_move`: each download's partial file in turn, then the deletion of what is left in the
-        recorded folder, then the record of this run's folder. A run stopped on the way keeps the recorded folder, so
-        the next run moves the partial files still there, writing their copies in this run's folder again. This run's
-        folder is recorded also when there is nothing to move."""
-        if self.partial_move is not None and self._source is not None:
-            for entry_id, segments, held in self._moved:
-                with _fatal_errors(self._destination.partial_folder):
-                    await self._move_partial(entry_id, segments, held, self._source, threads)
-            await threads.run(self._source.remove_leftovers)
+    async def move_partials(self, progress: MoveProgress) -> None:
+        """Carry out `partial_move`, reporting it to `progress`: each download's partial file in turn, then the deletion
+        of what is left in the recorded folder, then the record of this run's folder. A run stopped on the way keeps the
+        recorded folder, so the next run moves the partial files still there, writing their copies in this run's folder
+        again. This run's folder is recorded also when there is nothing to move. `run` starts only once this is done."""
+        move = self.partial_move
+        if move is not None and self._source is not None:
+            started = time.monotonic()
+            if move.downloads:
+                progress.start(move.downloads, move.size)
+            with DiskThreads(1) as threads:
+                for entry, segments, held in self._moved:
+                    with _fatal_errors(self._destination.partial_folder):
+                        await self._move_partial(entry, segments, held, self._source, threads, progress)
+                    progress.moved()
+                await threads.run(self._source.remove_leftovers)
+            if move.downloads:
+                _log.info(
+                    'Moved the partial files of %d downloads in progress (%s) from %s to %s in %.1f s',
+                    move.downloads,
+                    format_size(move.size),
+                    move.source,
+                    move.target,
+                    time.monotonic() - started,
+                )
         if self._mirror.partial_folder != self._partial_folder:
             self._mirror.record_partial_folder(self._partial_folder)
+        self._move_done = True
 
     async def _move_partial(
-        self, entry_id: int, segments: tuple[Segment, ...], held: int, source: PreviousPartials, threads: DiskThreads
+        self,
+        entry: MirrorEntry,
+        segments: tuple[Segment, ...],
+        held: int,
+        source: PreviousPartials,
+        threads: DiskThreads,
+        progress: MoveProgress,
     ) -> None:
-        """Copy the bytes the journal confirms of the `held`-byte partial file of `entry_id` in `source` to the same
+        """Copy the bytes the journal confirms of the `held`-byte partial file of `entry` in `source` to the same
         offsets of its partial file here, emptied first; a segment whose confirmed bytes are not all held is reset to
         its start in the journal instead. The copy is made durable before the source is deleted."""
+        entry_id = entry.entry_id
         movable = _movable(segments, held)
         kept = [s if s in movable else Segment(s.start, s.end, s.start, None) for s in segments]
         if kept != list(segments):
             self._mirror.checkpoint(entry_id, kept)
         with source.partial(entry_id) as old, self._destination.partial(entry_id) as new:
+
+            def write(offset: int, chunk: bytes) -> None:
+                new.write(offset, chunk)
+                progress.copied(len(chunk))
+
             await threads.run(new.truncate, 0)
             for segment in movable:
                 chunks = _read_errors(old.chunks(segment.start, segment.confirmed), source.path / str(entry_id))
-                await _feed(new.write, chunks, threads, segment.start)
+                await _feed(write, chunks, threads, segment.start)
             await threads.run(new.sync)
         await threads.run(self._destination.sync_partial_folder)
         await threads.run(source.remove, entry_id)
+        moved = sum(segment.confirmed - segment.start for segment in movable)
+        _log.debug(
+            '%s: partial file moved from %s to %s (%s confirmed)',
+            entry.resource.path,
+            source.path,
+            self._destination.partial_folder,
+            format_size(moved),
+        )
+
+    def _check(self, destination: Destination) -> set[int]:
+        """The files whose verified copy is still in place, by an `lstat` of each candidate."""
+        candidates = [e for e in self._entries if e.entry_id not in self._held and _verified_now(e)]
+        if not candidates:
+            return set()
+        self._progress.start_checking(len(candidates), str(destination.path))
+        current = set()
+        for entry in candidates:
+            if _in_place(entry, destination):
+                current.add(entry.entry_id)
+            self._progress.checked()
+        return current
 
     async def run(
         self,
@@ -661,8 +746,10 @@ class MirrorRun:
         passes: int,
         room_measured: Callable[[PartialRoom], None],
     ) -> MirrorReport:
-        """Move the partial files as `partial_move` says, before any fetch. With separate partials, then measure the
-        room of the partial folder and pass it to `room_measured`; every file fetched takes a turn of it.
+        """With separate partials, measure the room of the partial folder and pass it to `room_measured`; every file
+        fetched takes a turn of it. The caller starts the transfer phase of the run's progress first
+        (`MirrorProgress.start_transferring`), so whatever shows it opens on that phase. Raises `RuntimeError` when
+        `move_partials` has not run.
 
         Walk the entries in path order, then resume the files deferred by a transient failure in later passes, at
         most `passes` in all (0: until none is left), each after a pause of `PASS_PAUSE_SECONDS` or the longest wait
@@ -679,20 +766,25 @@ class MirrorRun:
 
         The disk work goes to worker threads of this run's own, shut down when the run ends, also on cancellation,
         once every file's turn has ended."""
+        if not self._move_done:
+            raise RuntimeError('the partial files must be moved before the run')
         report = MirrorReport(remote_root=self._mirror.remote_root, destination=str(self._destination.path))
         with DiskThreads(content.connections + _SPARE_THREADS) as threads:
-            await self._move_partials(threads)
             room = None
             if self._destination.separate_partials:
                 room = await threads.run(PartialRoom.measure, self._destination, self._in_progress)
                 room_measured(room)
             tools = _RunTools(client, content, threads, asyncio.Lock(), asyncio.Lock(), room, report, policy)
             changes = _changes(room)
+            _log_pass(1, passes, self.pending_files, self.pending_size, pause=None)
             deferred = await self._first_pass(tools)
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes, changes=changes)
         report.replaced_folder = self._destination.replaced_folder
-        report.failed += [Failure(display_path(e.path), unencodable_reason(e)) for e in self._mirror.unencodable()]
+        for unencodable in self._mirror.unencodable():
+            reason = unencodable_reason(unencodable)
+            _log.warning('%s failed: %s', unencodable.path, reason)
+            report.failed.append(Failure(unencodable.path, reason))
         self._in_path_order(report)
         return report
 
@@ -705,14 +797,17 @@ class MirrorRun:
                 local = self._names[listed_entry.entry_id]
                 entry = replace(listed_entry, local_path=local)
                 if local.name != entry.resource.path.rpartition('/')[2]:
-                    report.renamed.append((entry.resource.path, local))
+                    _note_renamed(report, entry, local)
                 if entry.entry_id in self._held:
-                    report.quarantined.append(held_copy(entry, entry.failure))
+                    held = held_copy(entry, entry.failure)
+                    _log.debug('%s held in quarantine: kept at %s', entry.resource.path, held.copy)
+                    report.quarantined.append(held)
                 elif reason := _blocked_by(local, blocked):
                     self._fail(report, entry, reason)
                 elif entry.resource.kind == 'dir':
                     await self._make_folder(entry, local, blocked, tools)
                 elif entry.entry_id in self._current:
+                    _log.debug('%s verified already: skipped', entry.resource.path)
                     report.skipped += 1
                     _note_verified(report, entry, _recorded_method(entry))
                     self._succeeded(entry)
@@ -745,11 +840,11 @@ class MirrorRun:
                 with _local_errors(destination, local, 'write'):
                     made, local = await _create(entry, local, make_folder, self._names, destination)
                     if local != entry.local_path:
-                        report.renamed.append((entry.resource.path, local))
+                        _note_renamed(report, entry, local)
                     if made:
                         return None, local
                     await threads.run(destination.move_aside, local)
-                    report.moved_aside.append(local)
+                    _note_moved_aside(report, destination, local)
                     if await make_folder(local):
                         return None, local
             return f'{local} was created again as something other than a folder while it was being moved aside', local
@@ -765,8 +860,12 @@ class MirrorRun:
         used = 1
         while deferred and not _stuck_for_room(deferred, tools.room, changes) and (passes == 0 or used < passes):
             waits = [failure.retry_after for _, failure in deferred if failure.retry_after is not None]
-            await asyncio.sleep(max([PASS_PAUSE_SECONDS, *waits]))
+            pause = max([PASS_PAUSE_SECONDS, *waits])
             used += 1
+            _log_pass(used, passes, len(deferred), sum(e.resource.size or 0 for e, _ in deferred), pause=pause)
+            self._progress.pausing(used, pause)
+            await asyncio.sleep(pause)
+            self._progress.resumed()
             changes = _changes(tools.room)
             remaining: list[tuple[MirrorEntry, FileDeferred]] = []
             async with _FileTurns(tools.content.connections) as turns:
@@ -785,14 +884,28 @@ class MirrorRun:
     ) -> None:
         """One file's turn in a pass; a deferred file is added to `deferred`."""
         if (later := await self._download(entry, tools)) is not None:
+            _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
+            self._progress.defer(entry.entry_id)
             deferred.append((entry, later))
 
     def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str) -> None:
+        path = entry.resource.path
+        outcome: Outcome
         if is_held(entry):
-            report.quarantined.append(held_copy(entry, reason))
+            held = held_copy(entry, reason)
+            _log.warning('%s failed again: %s; its quarantined copy stays at %s', path, reason, held.copy)
+            report.quarantined.append(held)
+            outcome = 'quarantined'
         else:
+            _log.warning('%s failed: %s', path, reason)
             report.failed.append(Failure(entry.resource.path, reason))
+            outcome = 'failed'
         self._mirror.record_failure(entry.entry_id, reason)
+        self._settle(entry, outcome)
+
+    def _settle(self, entry: MirrorEntry, outcome: Outcome) -> None:
+        if entry.entry_id in self._pending:
+            self._progress.settle(entry.entry_id, entry.resource.size or 0, outcome)
 
     def _succeeded(self, entry: MirrorEntry) -> None:
         """Drop the failure a folder found in place, or a file skipped as current, had when the run started; placing
@@ -817,6 +930,9 @@ class MirrorRun:
     async def _download(self, entry: MirrorEntry, tools: _RunTools) -> FileDeferred | None:
         """Mirror one file into the report; the failure when it is deferred to a later pass instead."""
         report = tools.report
+        path = entry.resource.path
+        size = entry.resource.size or 0
+        started = time.monotonic()
         try:
             outcome = await download_file(
                 entry,
@@ -830,6 +946,7 @@ class MirrorRun:
                 names=self._names,
                 policy=tools.policy,
                 room=tools.room,
+                progress=self._progress.begin(entry.entry_id, path, size),
             )
         except FileDeferred as deferred:
             return deferred
@@ -837,22 +954,38 @@ class MirrorRun:
             self._fail(report, entry, failed.reason)
             return None
         except FileQuarantined as quarantined:
-            report.quarantined.append(QuarantinedFile(entry.resource.path, quarantined.reason, quarantined.copy))
+            _log.warning('%s quarantined: %s; kept at %s', path, quarantined.reason, quarantined.copy)
+            report.quarantined.append(
+                QuarantinedFile(entry.resource.path, quarantined.reason, quarantined.copy, last_retry=None)
+            )
             if quarantined.partial_left is not None:
                 report.partials_left.append(quarantined.partial_left)
+            self._settle(entry, 'quarantined')
             return None
+        self._settle(entry, 'downloaded')
         if outcome.partial_left is not None:
             report.partials_left.append(outcome.partial_left)
         if outcome.adopted:
+            _log.info('%s adopted: the copy at %s matches (verified by %s)', path, outcome.local, outcome.verified_by)
             report.skipped += 1
             report.adopted.append(entry.resource.path)
         else:
+            seconds = time.monotonic() - started
+            speed = format_size(round(size / max(seconds, 0.001)))
+            _log.info(
+                '%s downloaded: %s in %.1f s, %s/s, verified by %s',
+                path,
+                format_size(size),
+                seconds,
+                speed,
+                outcome.verified_by,
+            )
             report.downloaded += 1
-            report.downloaded_size += entry.resource.size or 0
+            report.downloaded_size += size
         if outcome.local != entry.local_path:
-            report.renamed.append((entry.resource.path, outcome.local))
+            _note_renamed(report, entry, outcome.local)
         if outcome.moved_aside:
-            report.moved_aside.append(outcome.local)
+            _note_moved_aside(report, self._destination, outcome.local)
         _note_verified(report, entry, outcome.verified_by)
 
 
@@ -869,9 +1002,10 @@ async def download_file(
     names: LocalNames,
     policy: TransferPolicy,
     room: PartialRoom | None,
+    progress: ActiveFile,
 ) -> FileOutcome:
-    """Make the file `entry` verified at its local path and record it; the only state it touches is the mirror's
-    records, the destination and `names`. Its disk work runs in `threads`.
+    """Make the file `entry` verified at its local path and record it, reporting what it does to `progress`; the only
+    state it touches is the mirror's records, the destination and `names`. Its disk work runs in `threads`.
 
     With `room`, a file that is not adopted takes a turn of the room before its partial file is opened, held until it
     is placed, quarantined or stopped.
@@ -906,13 +1040,15 @@ async def download_file(
             if reason := _alias(entry, local, existing, mirror, destination):
                 raise FileFailed(reason)
             if entry.finding is None:
-                verified_by = await _adopt(entry, local, identity, existing, mirror, destination, threads, placement)
+                verified_by = await _adopt(
+                    entry, local, identity, existing, mirror, destination, threads, placement, progress
+                )
                 if verified_by is not None:
-                    left = await _remove_recorded_partial(entry.entry_id, destination, threads)
+                    left = await _remove_recorded_partial(entry, destination, threads)
                     if left is None and room is not None:
                         room.release(entry.entry_id)
                     return FileOutcome(local, verified_by, adopted=True, moved_aside=False, partial_left=left)
-    async with nullcontext() if room is None else room.turn(entry.entry_id, identity.size):
+    async with nullcontext() if room is None else room.turn(entry.entry_id, identity.size, progress):
         with _local_errors(destination, local, 'write'):
             verified_by = await _fetch_verified(
                 entry,
@@ -925,12 +1061,13 @@ async def download_file(
                 mirror=mirror,
                 destination=destination,
                 policy=policy,
+                progress=progress,
             )
             local, moved_aside = await _place_verified(
                 entry, local, identity, verified_by, mirror, destination, names, threads, placement
             )
             separate = destination.separate_partials
-            left = await _remove_recorded_partial(entry.entry_id, destination, threads) if separate else None
+            left = await _remove_recorded_partial(entry, destination, threads) if separate else None
     return FileOutcome(local, verified_by, adopted=False, moved_aside=moved_aside, partial_left=left)
 
 
@@ -1005,6 +1142,7 @@ async def _adopt(
     destination: Destination,
     threads: DiskThreads,
     placement: asyncio.Lock,
+    progress: ActiveFile,
 ) -> VerifiedBy | None:
     """Hash the regular file `existing` at `local` and, when it matches `identity`, give it the cloud mtime and
     record it as verified; `None` when it is not such a file or does not match.
@@ -1020,7 +1158,9 @@ async def _adopt(
         opened = file.stat()
         if not stat.S_ISREG(opened.st_mode) or opened.st_ino != existing.st_ino:
             return None
+        progress.state('hashing')
         await _feed(digest.update, file.chunks(), threads, 0)
+        progress.state('waiting for a connection')
         if digest.mismatch(identity) is not None:
             return None
         async with placement:
@@ -1100,6 +1240,7 @@ async def _fetch_verified(
     mirror: Mirror,
     destination: Destination,
     policy: TransferPolicy,
+    progress: ActiveFile,
 ) -> VerifiedBy:
     """Fetch the file into its partial file, keeping the confirmed bytes already there when they can be resumed, give
     it the cloud mtime, durably, and verify it.
@@ -1125,13 +1266,17 @@ async def _fetch_verified(
             destination=destination,
             threads=threads,
             policy=policy,
+            progress=progress,
         )
         if len(streams) > 1:
+            progress.state('preallocating')
             await _preallocate(partial, identity.size, threads)
         else:
             await threads.run(partial.truncate, streams[0].written)
+        progress.state('waiting for a connection')
         journal = _Journal(
             entry.entry_id,
+            entry.resource.path,
             identity,
             streams,
             mirror=mirror,
@@ -1148,13 +1293,14 @@ async def _fetch_verified(
             content=content,
             threads=threads,
             retries=policy.retries,
+            progress=progress,
         )
         await fetch.run()
         if destination.separate_partials:
             await journal.take()
-            digest = await _copy_to_destination(entry.entry_id, identity, partial, destination, threads, copying)
+            digest = await _copy_to_destination(entry, identity, partial, destination, threads, copying, progress)
         else:
-            digest = await _file_digest(journal, partial, threads, identity.size)
+            digest = await _file_digest(journal, partial, threads, identity.size, progress)
             await threads.run(partial.finish, _mtime_ns(identity.modified))
     if (reason := digest.mismatch(identity)) is None:
         return _method(identity)
@@ -1162,33 +1308,43 @@ async def _fetch_verified(
         copy = await threads.run(destination.quarantine, entry.entry_id, _local_path(entry))
     mirror.record_quarantined(entry.entry_id, identity, copy, reason)
     separate = destination.separate_partials
-    left = await _remove_recorded_partial(entry.entry_id, destination, threads) if separate else None
+    left = await _remove_recorded_partial(entry, destination, threads) if separate else None
     raise FileQuarantined(reason, copy, left)
 
 
 async def _copy_to_destination(
-    entry_id: int,
+    entry: MirrorEntry,
     identity: RemoteIdentity,
     partial: PartialFile,
     destination: Destination,
     threads: DiskThreads,
     copying: asyncio.Lock,
+    progress: ActiveFile,
 ) -> Digest:
     """Copy the finished partial file to its staged copy in the destination, in order, one chunk per thread call,
     under `copying`; then give the copy the cloud mtime, durably. The digest of the bytes copied."""
+    path = entry.resource.path
+    if copying.locked():
+        _log.debug('%s waits for the copy of another file to %s', path, destination.path)
+        progress.state('waiting for the copy')
     digest = Digest()
     async with copying:
-        with destination.copy_target(entry_id) as target:
-            await _feed(digest.update, _copied(partial.chunks(0, identity.size), target), threads, 0)
+        progress.state('copying')
+        started = time.monotonic()
+        with destination.copy_target(entry.entry_id) as target:
+            await _feed(digest.update, _copied(partial.chunks(0, identity.size), target, progress), threads, 0)
             await threads.run(target.finish, _mtime_ns(identity.modified))
+        _log.debug('%s copied to %s in %.1f s', path, destination.path, time.monotonic() - started)
     return digest
 
 
-def _copied(chunks: Iterator[bytes], target: PartialFile) -> Iterator[bytes]:
-    """`chunks`, the bytes from offset 0 on, each written to `target` at its offset before it is passed on."""
+def _copied(chunks: Iterator[bytes], target: PartialFile, progress: ActiveFile) -> Iterator[bytes]:
+    """`chunks`, the bytes from offset 0 on, each written to `target` at its offset and counted in `progress` before
+    it is passed on."""
     offset = 0
     for chunk in chunks:
         target.write(offset, chunk)
+        progress.copied(len(chunk))
         yield chunk
         offset += len(chunk)
 
@@ -1203,6 +1359,7 @@ async def _resume(
     destination: Destination,
     threads: DiskThreads,
     policy: TransferPolicy,
+    progress: ActiveFile,
 ) -> list[_Stream]:
     """The streams of this turn, one per segment of the journal, each starting after the bytes of its segment kept,
     once the entry's record is a `partial` one for `identity`.
@@ -1234,12 +1391,19 @@ async def _resume(
         return _streams((), size)
     held = partial.size()
     streams = _streams(record.segments, size)
+    path = entry.resource.path
     for position, segment in enumerate(record.segments):
         if segment.start < segment.confirmed <= held:
             stream = streams[position]
+            progress.state('hashing')
             await stream.rehash(partial, segment.confirmed, threads)
             if stream.sha256 != segment.digest:
+                _log.debug('%s: segment at byte %d does not match its checkpoint; fetched again', path, segment.start)
                 streams[position] = _Stream.of(segment, size)
+            else:
+                kept = segment.confirmed - segment.start
+                _log.debug('%s: segment at byte %d resumed with %d bytes kept', path, segment.start, kept)
+                progress.kept(kept)
     if [stream.written for stream in streams] != [segment.confirmed for segment in record.segments]:
         mirror.checkpoint(entry.entry_id, [stream.segment() for stream in streams])
     return streams
@@ -1272,13 +1436,16 @@ async def _preallocate(partial: PartialFile, size: int, threads: DiskThreads) ->
         await threads.run(partial.truncate, length)
 
 
-async def _file_digest(journal: _Journal, partial: PartialFile, threads: DiskThreads, size: int) -> Digest:
+async def _file_digest(
+    journal: _Journal, partial: PartialFile, threads: DiskThreads, size: int, progress: ActiveFile
+) -> Digest:
     """The digest of the whole fetched file: the one computed as it arrived when it was fetched as one stream;
     otherwise, after a checkpoint, the digest of the partial file read back in full."""
     match journal.streams:
         case [_Stream(hasher=Digest() as digest)]:
             return digest
     await journal.take()
+    progress.state('reading back')
     digest = Digest()
     await _feed(digest.update, partial.chunks(0, size), threads, 0)
     return digest
@@ -1288,8 +1455,9 @@ class _Stream:
     """One segment `[start, end)` of a file in one turn.
 
     Its bytes `[start, written)` are in the partial file, and `sha256` is their SHA-256 (`None` while there are none).
-    Both change together on the event loop once a write has returned, so a checkpoint taken while a write is still in
-    flight never claims its bytes. `hasher` goes on hashing the bytes written next: for a segment that is the whole
+    Both change together on the event loop once a write has returned, also when the task is cancelled while it runs,
+    so a checkpoint taken while a write is still in flight never claims its bytes and one taken on cancellation claims
+    every byte written. `hasher` goes on hashing the bytes written next: for a segment that is the whole
     file, the file's `Digest`.
     """
 
@@ -1320,8 +1488,13 @@ class _Stream:
         self.sha256 = self.hasher.sha256()
 
     async def write(self, partial: PartialFile, threads: DiskThreads, offset: int, chunk: bytes) -> None:
-        sha256 = await threads.run(_write_hashed, self.hasher, partial, offset, chunk)
-        self.written, self.sha256 = offset + len(chunk), sha256
+        """Write `chunk` at `offset` and hash it; a write that returned is counted in `written` and `sha256` also when
+        the task is cancelled while it runs."""
+
+        def advance(sha256: str) -> None:
+            self.written, self.sha256 = offset + len(chunk), sha256
+
+        await threads.run_then(_write_hashed, self.hasher, partial, offset, chunk, then=advance)
 
 
 def _write_hashed(digest: Digest | _RangeDigest, partial: PartialFile, offset: int, chunk: bytes) -> str:
@@ -1344,6 +1517,7 @@ class _Journal:
     def __init__(
         self,
         entry_id: int,
+        path: str,
         identity: RemoteIdentity,
         streams: list[_Stream],
         *,
@@ -1354,6 +1528,7 @@ class _Journal:
     ) -> None:
         self.streams = streams
         self._entry_id = entry_id
+        self._path = path
         self._identity = identity
         self._mirror = mirror
         self._partial = partial
@@ -1381,6 +1556,8 @@ class _Journal:
             await self._threads.run(self._partial.sync)
             self._mirror.checkpoint(self._entry_id, segments)
             self._confirmed = {segment.start: segment.confirmed for segment in segments}
+            confirmed = sum(segment.confirmed - segment.start for segment in segments)
+            _log.debug('%s: checkpoint, %d of %d bytes confirmed', self._path, confirmed, self._identity.size)
             self._taken = time.monotonic()
 
     def restart(self) -> _Stream:
@@ -1421,6 +1598,7 @@ class _Link:
                 return True
             if generation > 1:
                 return False
+            _log.debug('%s: the download host rejected the link; getting a new one', self._path)
             self._href = await _download_link(self._client, self._path)
             self._generation += 1
             return True
@@ -1442,7 +1620,9 @@ class _FileFetch:
         content: api.ContentClient,
         threads: DiskThreads,
         retries: int,
+        progress: ActiveFile,
     ) -> None:
+        self._path = path
         self._identity = identity
         self._partial = partial
         self._journal = journal
@@ -1450,6 +1630,7 @@ class _FileFetch:
         self._content = content
         self._threads = threads
         self._retries = retries
+        self._progress = progress
 
     async def run(self) -> None:
         """Fetch every pending stream of the journal.
@@ -1469,8 +1650,10 @@ class _FileFetch:
             task = asyncio.current_task()
             if task is not None and task.cancelling():
                 raise asyncio.CancelledError from None
+            _log.debug('%s: the download host ignored a range; fetching the whole file as one stream', self._path)
             stream = self._journal.restart()
             await self._threads.run(self._partial.truncate, 0)
+            self._progress.cut()
             await self._fetch([stream])
 
     async def _fetch(self, streams: list[_Stream]) -> None:
@@ -1498,11 +1681,15 @@ class _FileFetch:
 
         async def write(offset: int, chunk: bytes) -> None:
             await stream.write(self._partial, self._threads, offset, chunk)
+            self._progress.wrote(len(chunk))
             await self._journal.written(stream)
 
         attempt_number = 1
         while True:
             before = stream.written
+            _log.debug(
+                '%s: fetching bytes %d to %d of %d (attempt %d)', self._path, before, stream.end, size, attempt_number
+            )
             try:
                 await self._attempt(link, stream, write)
             except api.LinkExpiredError as exc:
@@ -1519,6 +1706,7 @@ class _FileFetch:
                 if stream.written == before or attempt_number > self._retries:
                     reason = exc.reason if attempt_number == 1 else f'{exc.reason} (after {attempt_number} attempts)'
                     return FileDeferred(reason, retry_after=exc.retry_after)
+                _log.debug('%s: %s; resuming at once from byte %d', self._path, exc.reason, stream.written)
                 attempt_number += 1
             except api.TransferError as exc:
                 raise FileFailed(exc.reason) from None
@@ -1528,13 +1716,28 @@ class _FileFetch:
     async def _attempt(
         self, link: Callable[[], Awaitable[str]], stream: _Stream, write: Callable[[int, bytes], Awaitable[None]]
     ) -> None:
-        """One fetch of the rest of `stream` from the link `link()` returns; an attempt that ends with a transfer error
-        or a cancellation takes a checkpoint first."""
+        """One fetch of the rest of `stream` from the link `link()` returns, counted as a connection of the file from
+        when it has its link until it ends; an attempt that ends with a transfer error or a cancellation takes a
+        checkpoint first."""
+        connected = False
+
+        async def connection() -> str:
+            nonlocal connected
+            href = await link()
+            connected = True
+            self._progress.connected()
+            return href
+
         try:
-            await self._content.fetch(link, start=stream.written, end=stream.end, size=self._identity.size, write=write)
+            await self._content.fetch(
+                connection, start=stream.written, end=stream.end, size=self._identity.size, write=write
+            )
         except api.TransferError, asyncio.CancelledError:
             await self._journal.take()
             raise
+        finally:
+            if connected:
+                self._progress.disconnected()
 
 
 async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]:
@@ -1551,46 +1754,76 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
     return [task.result() for task in tasks]
 
 
-def mirror_summary(report: MirrorReport) -> list[str]:
+def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
     files, renamed entries, what was moved aside, quarantined files with their reasons and copies, and failures with
-    their reasons."""
+    their reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
         f'{len(report.failed)} failed'
     ]
     if report.passes is not None:
-        used, limit = report.passes
-        lines.append(f'Passes: {used} of {limit or "unlimited"}')
+        used, most = report.passes
+        lines.append(f'Passes: {used} of {most or "unlimited"}')
     if report.adopted:
         lines.append(f'Already on disk and verified: {len(report.adopted)}')
-        lines += listed('', report.adopted, len(report.adopted), '')
+        lines += listed('', report.adopted, len(report.adopted), '', limit=limit)
     if report.size_only:
         lines.append(f'Verified by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', report.size_only, len(report.size_only), '')
+        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
     if report.renamed:
         lines.append(f'Renamed for the destination: {len(report.renamed)}')
         shown = [f'{remote} -> {local}' for remote, local in report.renamed]
-        lines += listed('', shown, len(shown), '')
+        lines += listed('', shown, len(shown), '', limit=limit)
     if report.moved_aside:
         lines.append(f'Moved aside to {report.replaced_folder}/: {len(report.moved_aside)}')
         shown = [str(local) for local in report.moved_aside]
-        lines += listed('', shown, len(shown), '')
+        lines += listed('', shown, len(shown), '', limit=limit)
     if report.quarantined:
         lines.append(f'Quarantined: {len(report.quarantined)}')
-        shown = [f'{held.path}: {held.reason}; kept at {held.copy}' for held in report.quarantined]
-        lines += listed('', shown, len(shown), '')
+        shown = [quarantined_line(held) for held in report.quarantined]
+        lines += listed('', shown, len(shown), '', limit=limit)
         lines.append(_QUARANTINE_HINT)
     if report.failed:
         lines.append(f'Failed: {len(report.failed)}')
         shown = [f'{failure.path}: {failure.reason}' for failure in report.failed]
-        lines += listed('', shown, len(shown), '')
+        lines += listed('', shown, len(shown), '', limit=limit)
     if report.partials_left:
         lines.append(f'Partial files not deleted: {len(report.partials_left)}')
         shown = [f'{left.path}: {left.reason}' for left in report.partials_left]
-        lines += listed('', shown, len(shown), '')
+        lines += listed('', shown, len(shown), '', limit=limit)
     return lines
+
+
+def mirror_document(report: MirrorReport) -> dict[str, object]:
+    """The JSON object of a run: the counts of the summary's head line (`skipped` includes `adopted`), the passes,
+    and every list in full."""
+    passes = None if report.passes is None else {'used': report.passes[0], 'limit': report.passes[1]}
+    return {
+        'remote_root': report.remote_root,
+        'destination': report.destination,
+        'counts': {
+            'downloaded': report.downloaded,
+            'downloaded_size': report.downloaded_size,
+            'skipped': report.skipped,
+            'adopted': len(report.adopted),
+            'size_only': len(report.size_only),
+            'renamed': len(report.renamed),
+            'moved_aside': len(report.moved_aside),
+            'quarantined': len(report.quarantined),
+            'failed': len(report.failed),
+        },
+        'passes': passes,
+        'adopted': report.adopted,
+        'size_only': report.size_only,
+        'renamed': [{'path': remote, 'local': str(local)} for remote, local in report.renamed],
+        'moved_aside': [str(local) for local in report.moved_aside],
+        'replaced_folder': None if report.replaced_folder is None else str(report.replaced_folder),
+        'quarantined': [quarantined_document(held) for held in report.quarantined],
+        'failed': [{'path': failure.path, 'reason': failure.reason} for failure in report.failed],
+        'partials_left': [{'path': str(left.path), 'reason': left.reason} for left in report.partials_left],
+    }
 
 
 def _assign_local_names(mirror: Mirror) -> list[MirrorEntry]:
@@ -1627,21 +1860,40 @@ def held_copy(entry: MirrorEntry, last_retry: str | None) -> QuarantinedFile:
     """The report of a file held by its quarantine record, with the failure of its last retry, if any."""
     if entry.quarantine is None:
         raise ValueError(f'{entry.resource.path} has no quarantine record')
-    reason = entry.quarantine.reason if last_retry is None else f'{entry.quarantine.reason}; last retry: {last_retry}'
-    return QuarantinedFile(entry.resource.path, reason, entry.quarantine.copy)
+    return QuarantinedFile(entry.resource.path, entry.quarantine.reason, entry.quarantine.copy, last_retry)
 
 
-def _is_current(entry: MirrorEntry, destination: Destination) -> bool:
-    """Whether the entry is a file verified for its current identity, with no finding, whose placed copy has the
-    recorded `lstat`.
+def quarantined_line(held: QuarantinedFile) -> str:
+    """How a summary lists the quarantined file `held`: its path and reason, its last retry, and its copy."""
+    return f'{held.path}: {quarantined_reason(held)}; kept at {held.copy}'
 
-    A placed copy that cannot be looked at is not current: the file's own turn meets the error and reports it.
-    """
+
+def quarantined_reason(held: QuarantinedFile) -> str:
+    """The quarantine reason of `held`, followed by `; last retry: <failure>` when a retry failed."""
+    return held.reason if held.last_retry is None else f'{held.reason}; last retry: {held.last_retry}'
+
+
+def quarantined_document(held: QuarantinedFile) -> dict[str, object]:
+    """The JSON object of the quarantined file `held`."""
+    return {'path': held.path, 'reason': held.reason, 'last_retry': held.last_retry, 'copy': str(held.copy)}
+
+
+def _verified_now(entry: MirrorEntry) -> bool:
+    """Whether the entry is a file verified for its current identity, with no finding."""
     record = entry.download
     if entry.resource.kind != 'file' or record is None or record.state != 'verified' or entry.finding is not None:
         return False
-    if record.identity != RemoteIdentity.of(entry.resource):
-        return False
+    return record.identity == RemoteIdentity.of(entry.resource)
+
+
+def _in_place(entry: MirrorEntry, destination: Destination) -> bool:
+    """Whether the placed copy of the verified file `entry` has the recorded `lstat`.
+
+    A placed copy that cannot be looked at is not in place: the file's own turn meets the error and reports it.
+    """
+    record = entry.download
+    if record is None:
+        raise ValueError(f'{entry.resource.path} has no download record')
     try:
         placed = destination.lstat(_local_path(entry))
     except OSError as exc:
@@ -1674,14 +1926,23 @@ async def _download_link(client: api.DiskClient, path: str) -> str:
         raise FileFailed(exc.reason) from None
 
 
-async def _remove_recorded_partial(entry_id: int, destination: Destination, threads: DiskThreads) -> PartialLeft | None:
+async def _remove_recorded_partial(
+    entry: MirrorEntry, destination: Destination, threads: DiskThreads
+) -> PartialLeft | None:
     """Delete the partial file of a file whose outcome is recorded; the file left behind when an error that does not
     stop the run kept it. The outcome stands either way: the next run deletes a stray partial file that is a regular
     file."""
     try:
-        await threads.run(destination.remove_partial, entry_id)
+        await threads.run(destination.remove_partial, entry.entry_id)
     except OSError as exc:
-        return PartialLeft(Path(exc.filename), exc.strerror)
+        left = PartialLeft(Path(exc.filename), exc.strerror)
+        _log.warning(
+            '%s: partial file %s not deleted: %s; the outcome stands',
+            entry.resource.path,
+            left.path,
+            left.reason,
+        )
+        return left
     return None
 
 
@@ -1737,6 +1998,23 @@ def _blocked_by(local: PurePosixPath, blocked: dict[PurePosixPath, str]) -> str 
 def _note_verified(report: MirrorReport, entry: MirrorEntry, verified_by: VerifiedBy) -> None:
     if verified_by == 'size':
         report.size_only.append(entry.resource.path)
+
+
+def _note_renamed(report: MirrorReport, entry: MirrorEntry, local: PurePosixPath) -> None:
+    _log.info('%s renamed for the destination: %s', entry.resource.path, local)
+    report.renamed.append((entry.resource.path, local))
+
+
+def _note_moved_aside(report: MirrorReport, destination: Destination, local: PurePosixPath) -> None:
+    _log.info('%s moved aside to %s/', local, destination.replaced_folder)
+    report.moved_aside.append(local)
+
+
+def _log_pass(number: int, passes: int, files: int, size: int, *, pause: float | None) -> None:
+    start = 'starts' if pause is None else f'starts in {pause:g} s'
+    limit = passes or 'unlimited'
+    noun = 'file' if files == 1 else 'files'
+    _log.info('Pass %d of %s over %d %s (%s) %s', number, limit, files, noun, format_size(size), start)
 
 
 def _method(identity: RemoteIdentity) -> VerifiedBy:

@@ -8,9 +8,10 @@ account to local storage. It is a headless analogue of the Windows app
 > (`yandex-disk-rescue auth`), scanning the remote tree into a local
 > manifest (`yandex-disk-rescue scan`) and verified, parallel, resumable
 > mirroring with segmented downloads of large files
-> (`yandex-disk-rescue download`) and an offline, resumable integrity check
-> of a mirror (`yandex-disk-rescue verify`) work. Further features are being built;
-> planned work is tracked in GitHub issues.
+> (`yandex-disk-rescue download`), an offline, resumable integrity check
+> of a mirror (`yandex-disk-rescue verify`), and their progress (a live view
+> on a terminal, status lines elsewhere), log file and `--json` reports work. Further features
+> are being built; planned work is tracked in GitHub issues.
 
 ## Goals
 
@@ -26,7 +27,8 @@ account to local storage. It is a headless analogue of the Windows app
   SHA-256. Failures are reported, never silently skipped, and a copy that
   fails the check is kept in quarantine, never deleted. `verify` re-hashes a
   mirror later, offline, and the next `download` repairs what it finds.
-- **CLI only.** Scriptable, cron- and systemd-friendly, no GUI.
+- **CLI only.** Scriptable, [cron- and systemd-friendly](#running-unattended),
+  no GUI.
 
 This is an independent, unofficial tool. It is not affiliated with Yandex.
 
@@ -70,7 +72,8 @@ Then set its ClientID with the `client_id` option (`--client-id ID`, see
 ### Automation
 
 For cron, systemd or CI, set `YANDEX_DISK_RESCUE_TOKEN` (for example with a
-systemd `EnvironmentFile=`) instead of running `auth login`.
+systemd `EnvironmentFile=`) instead of running `auth login`. The rest of the
+setup is in [Running unattended](#running-unattended).
 
 ### Where the token comes from
 
@@ -142,6 +145,7 @@ Changes since the last scan: 5 added, 2 changed, 1 removed
   ~ disk:/Photos/edited.jpg
   - disk:/Photos/gone.jpg
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 The counts and the size cover everything below the scanned folder. Files
@@ -268,7 +272,8 @@ resume — happens on that disk, not on DEST:
   When a run's folder differs from it — the option turned on or off, or
   `PATH` changed — the run first moves the downloads in progress there,
   printing `Moving the confirmed bytes (<size>) of N downloads in progress
-  from <old> to <new>`. Only the bytes the journals confirm are copied, one
+  from <old> to <new>` and `Moving:` status lines (see
+  [Output and logs](#output-and-logs)). Only the bytes the journals confirm are copied, one
   file at a time; the rest (bytes past the last checkpoint, a segmented
   file's zero-fill) is never read and is fetched again. Each copy is flushed
   to the disk before its old file is deleted, and the old folder is deleted
@@ -458,6 +463,7 @@ Download them again with --retry-failed (add --scan-max-age 0 if they changed on
 Failed: 1
   disk:/Photos/gone.jpg: removed from the Disk after the scan
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 Every list is in path order, whatever the order the files finished in, and
@@ -679,6 +685,7 @@ Quarantined: 1
 Not downloaded: 1
   disk:/Photos/new.jpg: not downloaded yet
 Manifest: /home/user/.local/state/yandex-disk-rescue/manifest.sqlite3
+Log: /home/user/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
 ```
 
 Every list is in path order and shows at most 20 entries, then `… and N
@@ -710,12 +717,472 @@ counts as intact, and the files after the cursor are read as usual.
 `verify --restart DEST` drops the pass in progress and starts a new one over
 every file.
 
+## Output and logs
+
+`scan`, `download` and `verify` write to two channels:
+
+- **stdout** carries the report: the start lines, the scan summary, the
+  final summary, then the `Manifest:` and `Log:` lines. Nothing else is ever
+  written there, so `> report.txt` keeps exactly the report. With `--json` it
+  carries one JSON document instead (see [JSON reports](#json-reports)).
+- **stderr** carries the progress and the notices as they happen, then
+  the `Error: …` or `Interrupted; …` line a run ends with.
+
+The progress is a live view when stderr is a terminal, and status lines
+anywhere else. stderr counts as a terminal when it is a tty and `TERM` is set
+and neither `dumb` nor `unknown`; `TERM=dumb` thus gives status lines on a
+terminal too. Where stdout goes plays no part: `download … > report.txt` on a
+terminal shows the live view, and the file gets the report alone.
+
+**The live view.** On a terminal each slow phase is drawn in place and
+redrawn twice a second:
+
+```
+Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without
+data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  disk:/Photos/2024/IMG_2041.jpg               2.1 MiB of 4.0 MiB (52.5%)  612.0 KiB/s
+  …/Videos/2019/Summer/holiday-full.mkv        1.1 GiB of 16.5 GiB (6.7%)  no data for 9 s
+  disk:/Docs/archive.zip                       320.0 MiB of 320.0 MiB (100.0%)  copying 41.2%
+  disk:/Music/live.flac                        0 B of 512.3 MiB (0.0%)  waiting for a connection
+  … and 10 more
+```
+
+- The first lines are the phase's status line (described below); then comes a
+  bar of its bytes (of the files checked, in `download`'s check), or a spinner
+  in front of the status line while a scan lists folders.
+- During the passes of `download`, up to 10 files in progress follow, each
+  with its path (shortened from the left to fit), the bytes its partial file
+  holds of its size, and its speed over the last 10 s (`…` during its first
+  second of data) or its state:
+  `waiting for room` (in the partial folder), `waiting for a connection`
+  (none of its connections is open: a segment waits for a free one, or the
+  file for a new download link), `no data for N s` (a connection open but no
+  data for 5 s or more),
+  `preallocating`, `hashing` (a local copy), `reading back` (a segmented
+  file), `waiting for the copy` (of another file to DEST) and `copying N%`
+  (to DEST, with `--partial-dir`). `… and N more` counts the rest.
+- In `verify`, the file being read follows the bar, with the bytes read of
+  its size.
+- Notices and report lines written while a phase runs are printed above the
+  view, literally: a name such as `[red]x[/red].txt` shows as it is.
+- The view is cleared when its phase ends, also when the run stops with an
+  error or Ctrl+C, and the cursor is shown again. What stays on the terminal
+  is the report, the notices and the result line.
+
+**Status lines.** Off a terminal, each slow phase writes one status line every
+`progress_interval` seconds (default 60; see
+[Configuration](#configuration)), then a last line when it ends, also when
+the run stops with an error or Ctrl+C. A multi-day run under `nohup` thus
+writes one line a minute:
+
+```
+2026-10-17T09:30:14.002Z Scanning disk:/: 45120 files, 3200 folders (812.3 GiB) listed, 1024 folders to list
+2026-10-17T09:44:05.310Z Scanned disk:/: 133521 files, 9800 folders (2.1 TiB) listed in 14 min 5 s
+2026-10-17T09:45:05.311Z Checking 133521 files already in /mnt/backup: 40210 checked
+2026-10-17T09:50:17.020Z Checked 133521 of 133521 files already in /mnt/backup in 6 min 12 s
+2026-10-17T09:51:17.021Z Moving: 1 of 3 files, 1.2 GiB of 3.5 GiB (34.3%), 210.0 MiB/s, ETA 11 s
+2026-10-17T09:51:28.402Z Moved: 3 of 3 files, 3.5 GiB in 17 s, average 210.8 MiB/s
+2026-10-17T10:50:17.021Z Downloading: 1234 of 133521 files, 12.3 GiB of 2.1 TiB (0.6%), 3.9 MiB/s, ETA 6 d 7 h; 20 active, 3 without data; 5 to retry, 3 failed, 0 quarantined; pass 1 of 7
+2026-10-23T18:01:40.512Z Downloaded: 133521 of 133521 files, 2.1 TiB in 6 d 9 h, average 4.0 MiB/s; 0 to retry, 3 failed, 0 quarantined; 2 of 7 passes
+2026-10-24T09:00:01.733Z Verifying: 1234 of 98000 files, 120.5 GiB of 2.0 TiB (5.9%), 110.2 MiB/s, ETA 5 h 2 min; 2 problems; reading disk:/big.mkv (1.2 GiB of 4.0 GiB)
+2026-10-24T14:10:03.004Z Verified: 98000 of 98000 files, 2.0 TiB in 5 h 10 min, average 112.4 MiB/s; 2 problems
+```
+
+- The phases are the scan's listing (in `scan`, and in `download` when it
+  scans), `download`'s check of the files already verified in DEST (only
+  when there are any), its move of the downloads in progress to a new
+  partial folder (only when the folder changed and some hold confirmed
+  bytes; `Moving` counts those files and their confirmed bytes), the passes
+  of `download`, and `verify`.
+- `Downloading` and `Verifying` count the files of the start line
+  (`Downloading N files`, `Verifying N files`, or the files `left` of a
+  continued pass). A file is done once it is downloaded or adopted, failed or
+  quarantined; until then it counts the bytes its partial file holds,
+  resumed bytes included. Failed folders, files held in quarantine and names
+  that are not valid Unicode are in the summary but not in these counts.
+- The speed is the rate over the last minute, and the ETA divides the bytes
+  left by the rate over the last 15 minutes (`ETA unknown` while it is 0).
+  Both count only the bytes this run moved. During the first second of a
+  phase there is no speed yet: the line leaves it out and says `ETA unknown`.
+- `N active, M without data`: the files in progress, and those of them with
+  a connection open but no data for 5 s or more. `to retry` counts the
+  files deferred to a later pass; between passes the line ends with
+  `pass 2 of 7 starts in 4 s`.
+- The last line of a phase gives how many of its files it got through
+  (fewer than all when an error stopped it), the time it took and the
+  average speed.
+
+Every status line also goes to the log file, on a terminal too.
+
+`--no-progress` shows no live view and writes no status lines to stderr; the
+notices stay. Use it under cron, where periodic lines are noise. Off a
+terminal, nothing the tool writes contains escape codes or carriage returns,
+whatever `FORCE_COLOR` or `TTY_COMPATIBLE` say.
+
+A name on the Disk can hold any character. In the report, the notices, the
+status lines, the live view, the error line and the log file, each control
+character of a name (an escape, a carriage return, a newline, any other C0 or
+C1 control, U+2028 or U+2029) is shown as its escape, such as `\x1b` or
+`\x0a`, and a lone surrogate (a name that is not valid Unicode) as `\udcxx`,
+whether the name appears as a path or inside a reason that quotes the local
+file: a hostile name cannot move the cursor, recolour the terminal or forge a
+line of the report or the log.
+
+A notice is one line, `<UTC time> <message>` (on a terminal, the message
+alone):
+
+```
+2026-10-17T09:31:02.417Z disk:/Photos/gone.jpg failed: removed from the Disk after the scan
+2026-10-17T09:35:40.002Z disk:/Photos/bad.jpg quarantined: MD5 mismatch (expected …, got …); kept at .yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg
+```
+
+By default stderr shows a notice for each file or folder that fails or is
+quarantined in this run, each `verify` finding made in this run (`missing`,
+`modified` or `corrupt`), each folder that disappeared during a scan, each
+entry left out because its name is not valid Unicode, and each partial file
+that could not be deleted once its file's outcome was recorded (`<path>:
+partial file <file> not deleted: <reason>; the outcome stands`). Files `verify` lists
+from the manifest (not downloaded, or held in quarantine) get no notice; the
+summary lists them.
+
+- `-v` / `--verbose` also shows each file downloaded (size, time, average
+  speed, how it was verified), adopted, renamed or moved aside, each
+  deferral to a later pass (also for room in the partial folder), each pass
+  starting, the end of a move of partial files to a new partial folder, the
+  start and commit of a scan, and each Disk API throttling response and
+  retry. It also logs DEBUG records to the log file.
+- `-q` / `--quiet` leaves only the final `Error: …` or `Interrupted; …` line
+  on stderr (and the log-file warning described below): no live view, no
+  status lines and no notices.
+- Neither changes stdout, and giving both is a usage error (exit `2`).
+
+**The log file.** Every run of `scan`, `download` and `verify` appends to
+`$XDG_STATE_HOME/yandex-disk-rescue/yandex-disk-rescue.log`
+(`~/.local/state/yandex-disk-rescue/yandex-disk-rescue.log` when
+`XDG_STATE_HOME` is unset or not an absolute path), whatever `-q` says:
+
+```
+2026-10-17T09:30:00.123Z INFO download[12345] download started: version 0.1.0, pid 12345; remote_path=disk:/Photos, dest=/mnt/backup, …
+2026-10-17T09:41:12.456Z INFO download[12345] Summary:
+2026-10-17T09:41:12.456Z INFO download[12345] Mirrored disk:/Photos to /mnt/backup: 1234 downloaded (12.3 GiB), …
+2026-10-17T09:41:12.457Z INFO download[12345] download completed (exit 0)
+```
+
+- Each line starts with the UTC time, the level, the command and its pid;
+  every line of a summary or a traceback gets that prefix too, so `grep`
+  always shows when and which run wrote a line.
+- A run logs its start (the version and every argument and option value,
+  `partial_dir` included), its start lines (`Downloading N files …`,
+  `Moving the confirmed bytes …`, `The partial folder of the last run … is
+  missing …`, `Partial files in …`), its full summary with every list complete (no `… and N more`), and its
+  end: `completed (exit 0)`, `failed (exit N): <error>`,
+  `interrupted (exit 130)`, or an unexpected error with its traceback.
+- In between it logs every notice, every `-v` record and every status line,
+  whatever the console flags (`-q` and `--no-progress` included). With `-v`
+  it also logs DEBUG records: each file skipped as verified already or held
+  in quarantine, each file `verify` found intact or listed from the
+  manifest, each transfer attempt and immediate retry, each link refresh,
+  each resumed segment with the bytes kept, the fallback to one stream, each
+  checkpoint, each folder listed, and with `--partial-dir` each partial file
+  moved to the new partial folder, each file waiting for room there (or for
+  its turn behind files that wait for room), each file waiting for the copy
+  of another to DEST, and each copy to DEST with its time.
+- The file is rotated at 10 MiB, keeping five older files (`.1` is the most
+  recent, `.5` the oldest). Every file is mode 0600 in the 0700 state
+  directory.
+- The log never holds the OAuth token or a download link.
+- A usage error (exit `2` before the command starts, such as a wrong number
+  of paths or `-v` with `-q`) writes nothing to the log.
+
+A log file that cannot be opened stops the command before it does anything:
+`Error: Could not open the log file <path>: <reason>.` (exit `1`). A write
+that fails later (the state disk full, an I/O error) never stops the run:
+stderr gets one `Warning: could not write the log file <path>: <reason>;
+logging to it is off for this run.`, even with `-q`, and the report ends with
+`Log: <path> (incomplete: <reason>)`. Likewise a write to stderr that fails
+(a `2> file` on a full disk, a terminal that went away) never stops the run
+and never changes its exit code: stderr is off for the rest of the run (no
+live view, status lines, notices or `Error: …` line), the log gets one warning
+`Could not write to stderr: <reason>; stderr is off for this run.`, and keeps
+getting every record and status line.
+
+### JSON reports
+
+`--json` on `scan`, `download` or `verify` prints the run's report as one JSON
+document on stdout, written once the command ends and every other line is
+out. The human report then goes to stderr, where the notices and status
+lines are (with `-q`, nowhere); the `Error: …` or `Interrupted; …` line and
+the exit codes stay as they are. stdout holds that document and nothing else,
+whatever the exit code:
+
+```bash
+yandex-disk-rescue download -q --json disk:/Photos /mnt/backup > run.json
+jq '.counts, [.failed[].path]' run.json
+```
+
+Every document starts with the same keys:
+
+| Key | Value |
+|---|---|
+| `schema_version` | `1`; it changes only when a key changes meaning or goes away |
+| `command` | `scan`, `download` or `verify` |
+| `version` | The tool's version |
+| `started_at`, `finished_at` | UTC times, `2026-10-17T09:30:00.123Z` |
+| `manifest`, `log` | The paths of the manifest and the log file |
+| `log_incomplete` | Why the log file missed records (the `Log: … (incomplete: …)` reason), else `null` |
+| `exit_code` | The process's exit code |
+| `error` | `{"message": "…"}`, the text of the `Error:` (or `Interrupted;`) line; only when `exit_code` is not `0` |
+
+A command that got as far as its report adds the report's keys, also when it
+then exits `1` because files failed, were quarantined or have problems. A
+command that ended with no report (a token Yandex rejects, a log file that
+cannot be opened, an unreadable DEST, `--no-scan` with no scan, a DEST that is
+not a mirror, Ctrl+C) prints the common keys alone, with `error`. A usage
+error (exit `2` before the command starts) prints no JSON.
+
+Every list is complete, sizes are integers in bytes, and paths are the Disk's
+own, control characters included (JSON escapes them); a name that is not
+valid Unicode keeps its lone surrogate as a `\udcxx` escape. The one sample
+is `scan`'s `without_checksum.sample`, the 20 smallest paths, with the full
+`count`.
+
+`scan`:
+
+```json
+{
+  "schema_version": 1, "command": "scan", "…": "…",
+  "root": "disk:/Photos", "files": 1203, "folders": 41, "size": 8573190144,
+  "without_checksum": {"count": 2, "sample": ["disk:/Photos/a.heic", "disk:/Photos/b.heic"]},
+  "vanished": [], "unencodable": [], "first_scan": false,
+  "added": ["disk:/Photos/new.jpg"], "changed": [], "removed": ["disk:/Photos/old.jpg"]
+}
+```
+
+`download` (`skipped` includes `adopted`, as in the summary's first line;
+`passes` is `null` until a transient failure defers a file; `scan` is the
+scan object above with `reused: false`, or `{"reused": true, "root",
+"completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
+the move of the downloads in progress to a new partial folder, `null` when
+there is none, and `partial_room` the room measured in a separate partial
+folder):
+
+```json
+{
+  "schema_version": 1, "command": "download", "…": "…",
+  "exit_code": 1, "error": {"message": "1 failed and 1 quarantined; see the lists above."},
+  "remote_root": "disk:/Photos", "destination": "/mnt/backup", "retry_failed": false,
+  "scan": {"reused": true, "root": "disk:/Photos", "completed_at": "2026-10-17T09:20:11.004Z"},
+  "to_download": {"files": 12, "size": 104857600},
+  "counts": {"downloaded": 10, "downloaded_size": 94371840, "skipped": 1191, "adopted": 0, "size_only": 0,
+             "renamed": 0, "moved_aside": 0, "quarantined": 1, "failed": 1},
+  "passes": {"used": 2, "limit": 7},
+  "adopted": [], "size_only": [], "renamed": [{"path": "disk:/Photos/a?b.jpg", "local": "a_b~1f2e3d4c.jpg"}],
+  "moved_aside": [], "replaced_folder": null,
+  "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
+                   "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
+  "failed": [{"path": "disk:/Photos/gone.jpg", "reason": "removed from the Disk after the scan"}],
+  "partials_left": [],
+  "partial_dir": "/mnt/fast",
+  "partial_move": {"source": "/mnt/old/0a1b2c3d4e5f6a7b", "target": "/mnt/fast/0a1b2c3d4e5f6a7b",
+                   "downloads": 2, "size": 750000, "missing": false},
+  "partial_room": {"folder": "/mnt/fast/0a1b2c3d4e5f6a7b", "available": 53687091200}
+}
+```
+
+`last_retry` is the failure of the last attempt to fetch a quarantined file
+again (the summary's `; last retry: …`), `null` when none failed.
+
+`verify` (`pass` is the pass the run belongs to: when it started, whether
+this run `continued` an interrupted one, and the files and bytes this run
+read; `counts` cover the whole pass):
+
+```json
+{
+  "schema_version": 1, "command": "verify", "…": "…",
+  "destination": "/mnt/backup", "remote_root": "disk:/Photos",
+  "counts": {"intact": 1199, "size_only": 2, "missing": 1, "modified": 0, "corrupt": 1, "quarantined": 1,
+             "not_downloaded": 0, "problems": 3},
+  "size_only": ["disk:/Photos/a.heic", "disk:/Photos/b.heic"],
+  "missing": [{"path": "disk:/Photos/x.jpg", "reason": "x.jpg is missing", "repair_quarantined": null}],
+  "modified": [],
+  "corrupt": [{"path": "disk:/Photos/y.jpg", "reason": "MD5 mismatch (expected …, got …)",
+               "repair_quarantined": {"reason": "MD5 mismatch (expected …, got …)",
+                                      "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/y.jpg"}}],
+  "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
+                   "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
+  "not_downloaded": [],
+  "pass": {"started_at": "2026-10-24T09:00:00.512Z", "continued": true, "files_read": 400, "size_read": 2147483648}
+}
+```
+
+`repair_quarantined` is set when the download meant to repair a finding was
+quarantined (the summary's `; repair quarantined: …; kept at …`).
+
+## Running unattended
+
+A long mirror runs for days, so it usually runs without a terminal. Off a
+terminal, stderr gets a timestamped status line every `progress_interval`
+seconds (default 60) instead of the live view, and every run appends to the
+[log file](#output-and-logs) whatever the flags. The examples run as an
+ordinary user who has run `yandex-disk-rescue auth login` once (or who sets
+`YANDEX_DISK_RESCUE_TOKEN`; see [Automation](#automation)). systemd and cron
+need the command's absolute path, which `command -v yandex-disk-rescue`
+prints; the examples assume `~/.local/bin/yandex-disk-rescue`.
+
+When DEST is a slow disk (a USB hard disk, a network share), add
+`--partial-dir` with a folder on a fast local disk, or set `partial_dir` in
+the [config file](#configuration) so every way of running uses it (see
+[Partial files](#downloading)). Pick a persistent folder, not a `tmpfs` such
+as `/tmp` on many systems: the partial files must survive a reboot for the
+next run to resume them.
+
+### In the background with nohup
+
+```bash
+nohup yandex-disk-rescue download disk:/ /mnt/backup < /dev/null > download.out 2> download.err &
+tail -f download.err
+tail -f ~/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
+```
+
+- `download.out` gets the report as the run goes: the start lines, the scan
+  summary, then the final summary and the `Manifest:` and `Log:` lines. It
+  stays small.
+- `download.err` gets the status lines, the notices and the final `Error: …`
+  or `Interrupted; …` line, each with its UTC time. A status line is about 200
+  bytes, so each phase adds about 300 KB a day at the default interval;
+  `--progress-interval 600` writes one every 10 minutes instead.
+- The log file gets the same notices and status lines and the full summary.
+  It is rotated at 10 MiB and keeps five older files, so it never takes more
+  than 60 MiB.
+- `< /dev/null` keeps `nohup` from writing `nohup: ignoring input` into
+  `download.err`.
+
+`verify` runs the same way. Started from an interactive shell, `kill -INT
+<pid>` stops the run as Ctrl+C does: it takes its last checkpoints, prints
+`Interrupted; …` and exits with 130, and the next run continues from there.
+A background job that a script starts has SIGINT ignored, so there `kill
+-INT` does nothing. SIGTERM, the default of `kill`, ends the run at once
+with no last checkpoint; the next run still resumes, fetching again what
+arrived since the last checkpoint of each file in progress.
+
+### As a systemd user service
+
+`~/.config/systemd/user/yandex-disk-rescue.service`:
+
+```ini
+[Unit]
+Description=Mirror Yandex Disk to /mnt/backup
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/yandex-disk-rescue download -q --json disk:/ /mnt/backup
+StandardOutput=append:%h/yandex-disk-rescue.json
+StandardError=journal
+TimeoutStartSec=infinity
+KillSignal=SIGINT
+TimeoutStopSec=5min
+SuccessExitStatus=130
+```
+
+`~/.config/systemd/user/yandex-disk-rescue.timer`:
+
+```ini
+[Unit]
+Description=Mirror Yandex Disk to /mnt/backup every day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now yandex-disk-rescue.timer
+systemctl --user start --no-block yandex-disk-rescue.service   # a run now
+journalctl --user -u yandex-disk-rescue.service
+systemctl --user stop yandex-disk-rescue.service
+```
+
+- `ExecStart` takes the command's absolute path (`%h` is your home folder).
+  To pass the token by environment instead of the token file, add
+  `EnvironmentFile=%h/.config/yandex-disk-rescue/env` with a line
+  `YANDEX_DISK_RESCUE_TOKEN=…` in that file (mode `0600`).
+- `Type=oneshot` makes the unit active for as long as the run lasts.
+  `TimeoutStartSec=infinity` is needed because a oneshot's start timeout
+  would otherwise kill a run that lasts days. `systemctl start` waits for a
+  oneshot to finish, hence `--no-block`.
+- `KillSignal=SIGINT` makes `systemctl stop` (and a shutdown) stop the run
+  as Ctrl+C does, with its last checkpoints; the default, SIGTERM, ends it at
+  once. `TimeoutStopSec` is how long systemd waits after it before it sends
+  SIGKILL. `SuccessExitStatus=130` counts a stopped run as a clean stop, not a
+  failure.
+- `loginctl enable-linger` starts your user's systemd instance at boot and
+  keeps it after you log out, so the timer fires and the run goes on without
+  a login session.
+- The timer starts the service once a day, and `Persistent=true` catches up
+  a start missed while the machine was off. A run still going when the timer
+  fires again is not started a second time.
+- stdout, the JSON document, is appended to `~/yandex-disk-rescue.json`, one
+  document per run; with `--json` the human report goes to stderr, and `-q`
+  leaves nothing there but the final `Error: …` or `Interrupted; …` line (and
+  the log-file warning, if a log write fails). So the journal holds just
+  that. Without `-q` the journal also gets the notices and the human report;
+  add `--no-progress` then to keep the status line a minute out of it (the
+  log file still gets them).
+- Stopped with `systemctl stop`, the run still writes its JSON document,
+  with `exit_code` 130.
+- A run that exits `1` (files failed or were quarantined, or an error)
+  leaves the unit failed: `systemctl --user --failed` lists it, and
+  `OnFailure=` in `[Unit]` can start a unit that tells you.
+
+### From cron
+
+```bash
+# crontab -e: every day at 03:30
+30 3 * * * $HOME/.local/bin/yandex-disk-rescue download -q --json disk:/ /mnt/backup >> $HOME/yandex-disk-rescue.json
+```
+
+- The exit code is the signal: `0` when every file is verified, `1` when
+  files failed or were quarantined or the run hit an error (see
+  [Exit codes](#exit-codes)). cron does not look at it, but it mails what a
+  command writes, and with `-q` and stdout in a file a run writes nothing
+  but its `Error: …` line (and the log-file warning, if a log write fails).
+  So a mail arrives only for a run that did not exit `0`.
+- A run that starts while the last one still goes on exits `1` at once with
+  `Error: Another yandex-disk-rescue run is using …; wait for it to finish
+  and try again.`; the running one is not disturbed.
+- Each run appends one JSON document to the file.
+
+### Checking a run afterwards
+
+- **The summary.** The log file holds every run's full summary, every list
+  complete, and the end of each run, `completed (exit 0)` or `failed (exit N):
+  <error>`. `grep -E ' (WARNING|ERROR) ' <log>` lists every notice (each
+  file that failed or was quarantined, each `verify` finding) and the end of
+  every run that failed or was interrupted. Under `nohup`, the summary is
+  also in `download.out`.
+- **The JSON documents.** `jq` reads a file of appended documents as a stream:
+
+  ```bash
+  jq -c '{finished_at, exit_code, error: .error.message}' ~/yandex-disk-rescue.json   # one line per run
+  jq -s 'last | {counts, failed: [.failed[]?.path]}' ~/yandex-disk-rescue.json        # the latest run
+  ```
+
+  `jq` shows a name that is not valid Unicode with U+FFFD (`�`) in place of
+  each `\udcxx` escape. The file keeps the escape, and Python's `json`
+  module, for one, reads it back as the exact name.
+
 ## Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Success; for `download`, every file of the folder is verified at its final path; for `verify`, every file of the mirror is verified and intact |
-| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
 | `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers; for `verify` a DEST that is not an existing folder or is not a mirror recorded in the manifest |
 | `130` | Interrupted with Ctrl+C |
 
@@ -769,11 +1236,15 @@ first one that sets it wins:
 | `download_segment_threshold_mib` | `--download-segment-threshold-mib` (`download`) | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | `256` | 1 to 65536 (MiB); a larger file is downloaded as segments |
 | `partial_dir` | `--partial-dir` (`download`) | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | empty (partial files in DEST) | an absolute path of an existing folder outside DEST, or empty; see [Partial files](#downloading) |
 | `scan_max_age` | `--scan-max-age` (`download`) | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `60` | 0 to 10080 (min); a younger covering scan is reused, `0` always scans |
+| `progress_interval` | `--progress-interval` (`scan`, `download`, `verify`) | `YANDEX_DISK_RESCUE_PROGRESS_INTERVAL` | `60` | 1 to 3600 (s); seconds between two status lines on stderr and in the log file |
 | `client_id` | `--client-id` (`auth login`) | `YANDEX_DISK_RESCUE_CLIENT_ID` | the built-in app | 32 lowercase hex characters |
 
 The `api_*` options apply to every command that talks to the Disk API
 (`auth login`, `auth status`, `scan`, `download`); the `download_*` options,
-`partial_dir` and `scan_max_age` apply to `download` and `client_id` to `auth login`.
+`partial_dir` and `scan_max_age` apply to `download`, `progress_interval` to
+`scan`, `download` and `verify`, and `client_id` to `auth login`. `verify`
+never talks to the Disk API and takes no `api_*` option, and `auth logout`
+takes no option.
 `--partial-dir ''` keeps partial files in DEST whatever the config file says;
 an empty environment variable counts as unset, as for every option.
 
