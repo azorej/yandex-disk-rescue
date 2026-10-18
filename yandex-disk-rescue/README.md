@@ -160,7 +160,8 @@ yandex-disk-rescue/
 │   │                 #   finding without reading their copy, folders, things in the way, hard-link aliases) with up
 │   │                 #   to `download_connections` files in progress at once (files with failure records started
 │   │                 #   last, fewest failed turns first), after moving the confirmed bytes of the downloads in
-│   │                 #   progress when the partial folder changed since the last run and, with separate partial
+│   │                 #   progress when the partial folder changed since the last run (one whose old partial file
+│   │                 #   cannot be read starting again from byte 0) and, with separate partial
 │   │                 #   files, admission to the partial folder's room (measured once, idle partial files counting
 │   │                 #   what they allocate, each fetched file its full size, in the order files start: wait, defer
 │   │                 #   to the next pass, or fail a file larger than the room, and every file deferred for room at
@@ -226,8 +227,8 @@ yandex-disk-rescue/
 │   │                 #   another path), the free space of the partial folder,
 │   │                 #   the bytes each partial file allocates there and whether its filesystem keeps sparse
 │   │                 #   files (probed on open), reading existing files, whether the
-│   │                 #   destination itself or the partial folder is still readable (`reachable`,
-│   │                 #   `partial_folder_reachable`), a failed read of a partial file (`PartialReadError`),
+│   │                 #   destination itself, the partial folder or an earlier run's partial folder is still
+│   │                 #   readable (`reachable`, `partial_folder_reachable`), a failed read of a partial file (`PartialReadError`),
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
 │   │                 #   or staged copy into the run's `quarantine/` folder, placement, and the `previews/`
 │   │                 #   folder (saving a preview atomically, replacing an earlier one, removing it with the

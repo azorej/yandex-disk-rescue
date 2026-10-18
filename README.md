@@ -359,12 +359,22 @@ resume — happens on that disk, not on DEST:
   at the end (for DEST's own `partial/`, only the files in it). A run stopped
   during the move goes on with it on the next run, losing no confirmed byte.
   A confirmed range missing from an old file cut short (by hand, or by a
-  power cut on a disk that lost the end of a write) is fetched again. When
-  the recorded folder is gone and downloads were in progress, the run prints
-  `The partial folder of the last run, <old>, is missing; its downloads in
-  progress start again from their first byte.`, and they do. The recorded
-  folder reached under another path (a bind mount, a link on the way) is
-  the same folder: nothing is moved, and the new path is recorded.
+  power cut on a disk that lost the end of a write) is fetched again. An old
+  file whose confirmed bytes cannot be read (an I/O error, a bad sector) while
+  its folder still can is not carried over: its download starts again from
+  its first byte, with the same notice as a resume (`<path>: could not read
+  its partial file <file>: <reason>; downloading it again from its first
+  byte`), and counts as that file's one drop of the run. The move goes on
+  with the next file, and its last log line gives the bytes actually copied
+  and `, <k> dropped as unreadable`. An old folder that is gone, a
+  permission error, or running out of file descriptors or memory stops the
+  run with `Error: Could not read <path>: <reason>.`, and the next run moves
+  again. When the recorded folder is gone and downloads were in progress, the
+  run prints `The partial folder of the last run, <old>, is missing; its
+  downloads in progress start again from their first byte.`, and they do.
+  The recorded folder reached under another path (a bind mount, a link on
+  the way) is the same folder: nothing is moved, and the new path is
+  recorded.
 - Remounting DEST at another path makes it a new mirror with a new `<key>`;
   the old `PATH/<key>/` can then be deleted.
 
@@ -464,7 +474,9 @@ first byte, with a notice (`<path>: could not read its partial file <file>:
 <reason>; downloading it again from its first byte`); the other downloads go
 on from their checkpoints. This covers re-reading confirmed bytes, reading
 back a segmented file, and copying a finished file to DEST with
-`--partial-dir`; after the last two the file waits for the next pass. It
+`--partial-dir`; after the last two the file waits for the next pass. A
+partial file that cannot be read while it is moved to a new partial folder
+is not carried over, and its download starts again (see `--partial-dir`). It
 happens at most once per file per run: a second read error on the same
 partial file fails the file with `… (a second time in this run)`, a local
 failure that gets no preview, and so does a file whose partial file could not
@@ -1251,8 +1263,9 @@ interrupted preview step did not get to; `scan` is the
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
-there is none, `partial_room` the room measured in a separate partial
-folder, `sparse_partials` whether the partial folder's filesystem keeps
+there is none, with `downloads` and `size` the downloads and the confirmed
+bytes the move set out to copy, `partial_room` the room measured in a
+separate partial folder, `sparse_partials` whether the partial folder's filesystem keeps
 sparse files, without which new downloads are not segmented, and `previews`
 the `--previews/--no-previews` value):
 

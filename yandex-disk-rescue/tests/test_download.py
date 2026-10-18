@@ -3692,18 +3692,84 @@ def _dropped_notice(path: str, partial: Path, code: int) -> str:
     )
 
 
-def test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file(
-    disk, dest, partial_root, monkeypatch
+@pytest.mark.parametrize('code', [errno.EIO, errno.EBADMSG], ids=errno.errorcode.get)
+def test_an_unreadable_partial_file_being_moved_is_dropped_and_downloaded_again(
+    disk, dest, partial_root, monkeypatch, code
 ):
     big, segmented = _leave_two_partials(disk, dest, None)
-    _refuse_partial_reads(monkeypatch, big, errno.EBADMSG)
+    earlier = len(disk.requests)
 
-    result = run_download(*_partial_args(partial_root), str(dest))
+    with monkeypatch.context() as patch:
+        refused = _refuse_partial_reads(patch, big, code)
+        result = run_download('--json', *_partial_args(partial_root), *SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 0, result.output
+    notice = _dropped_notice(BIG_PATH, big, code)
+    assert stderr_lines(result.stderr).count(notice) == 1
+    assert refused == [0]
+    assert _fetches(disk, BIG_PATH, earlier) == [None]
+    assert sorted(_fetches(disk, SEGMENTED_PATH, earlier)) == _segment_tails(_SEGMENT_CUTS)
+    assert local_file(dest, BIG_PATH).read_bytes() == BIG
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+    assert not big.exists()
+    assert not segmented.exists()
+    assert _partials(dest, partial_root) == []
+    move = json.loads(result.stdout)['partial_move']
+    assert (move['downloads'], move['size']) == (2, 300_000 + sum(_SEGMENT_CUTS))
+    messages = log_messages()
+    assert messages.count(notice) == 1
+    [end] = [m for m in messages if m.startswith('Moved the partial files ')]
+    old, new = big.parent, _partial_folder(dest, partial_root)
+    assert re.fullmatch(
+        re.escape(f'Moved the partial files of 2 downloads in progress ({format_size(sum(_SEGMENT_CUTS))}) ')
+        + re.escape(f'from {old} to {new} in ')
+        + r'\d+\.\d s, 1 dropped as unreadable',
+        end,
+    )
+
+
+def test_a_partial_file_dropped_in_the_move_and_unreadable_again_fails_that_file(disk, dest, partial_root, monkeypatch):
+    big, _ = _leave_two_partials(disk, dest, None)
+    new = _partial_folder(dest, partial_root) / big.name
+    pread = os.pread
+
+    def failing(fd, size, offset):
+        if os.readlink(f'/proc/self/fd/{fd}') in {str(big), str(new)}:
+            raise OSError(errno.EIO, os.strerror(errno.EIO))
+        return pread(fd, size, offset)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, 'pread', failing)
+        result = run_download(*_partial_args(partial_root), *SEGMENTED_ARGS, str(dest))
 
     assert result.exit_code == 1
-    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(errno.EBADMSG)}.']
-    assert big.read_bytes()[:300_000] == BIG[:300_000]
-    assert segmented.exists()
+    assert stderr_lines(result.stderr).count(_dropped_notice(BIG_PATH, big, errno.EIO)) == 1
+    reason = f'could not read its partial file {new}: {os.strerror(errno.EIO)} (a second time in this run)'
+    assert f'Failed: 1\n  {BIG_PATH}: {reason}\n' in result.stdout
+    assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
+
+
+@pytest.mark.parametrize('code', [errno.EIO, errno.ENODEV], ids=errno.errorcode.get)
+def test_an_unreadable_partial_file_being_moved_from_a_folder_that_is_gone_stops_the_run(
+    disk, dest, partial_root, monkeypatch, code
+):
+    big, _ = _leave_two_partials(disk, dest, partial_root)
+    journals = _journals()
+    folder = _separate_folder(dest, partial_root)
+    gone = folder.with_name('gone')
+
+    def unplug() -> None:
+        if code == errno.EIO:
+            folder.rename(gone)
+
+    with monkeypatch.context() as patch:
+        _refuse_partial_reads(patch, big, code, before=unplug)
+        result = run_download(*SEGMENTED_ARGS, str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not read {big}: {os.strerror(code)}.']
+    assert _journals() == journals
+    assert not [message for message in log_messages() if 'could not read its partial file' in message]
 
 
 @pytest.mark.parametrize('file', ['one stream', 'segmented'])

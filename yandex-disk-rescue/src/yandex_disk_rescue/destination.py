@@ -794,6 +794,10 @@ class PreviousPartials:
     def stat(self) -> os.stat_result:
         return os.fstat(self._fd)
 
+    def reachable(self) -> bool:
+        """Whether the folder can still be read, as `_folder_reachable` probes it."""
+        return _folder_reachable(self.path)
+
     def size(self, entry_id: int) -> int | None:
         """The size of the partial file of `entry_id`; `None` when there is no regular file of that name."""
         name = str(entry_id)
