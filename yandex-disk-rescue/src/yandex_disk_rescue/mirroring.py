@@ -529,10 +529,10 @@ class HashHolds:
 @asynccontextmanager
 async def _hash_turn(hold: asyncio.Lock, path: str, progress: ActiveFile, state: TransferState) -> AsyncIterator[None]:
     """Hold `hold` while the file at `path` reads its bytes on disk, shown in `progress` as `state`; while another
-    file holds it, the file shows `waiting to hash`."""
+    file holds it, the file shows `waiting to hash`; an uncontended turn starts at once, so that state never shows."""
     if hold.locked():
         _log.debug("%s waits for another file's hash", path)
-        progress.state('waiting to hash')
+    progress.state('waiting to hash')
     async with hold:
         progress.state(state)
         yield

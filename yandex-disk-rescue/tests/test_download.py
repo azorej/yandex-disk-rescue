@@ -2766,7 +2766,8 @@ def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_by
     assert missing in log_messages()
     assert not [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert _fetches(disk, BIG_PATH, earlier) == [None]
-    # Its journal now keeps no byte, so it is planned again with this run's (default) segment threshold.
+    # Its journal keeps no byte once the partial folder is lost, so it is planned again with this run's (default)
+    # segment threshold.
     assert _fetches(disk, SEGMENTED_PATH, earlier) == [None]
     assert local_file(dest, BIG_PATH).read_bytes() == BIG
     assert local_file(dest, SEGMENTED_PATH).read_bytes() == SEGMENTED
