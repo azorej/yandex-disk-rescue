@@ -10,7 +10,9 @@ import typer
 from yandex_disk_rescue import api, auth, console, paths, settings
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.progress import ScanProgress
-from yandex_disk_rescue.scanning import ScanResult, resolve_scan_root, scan_summary, scan_tree
+from yandex_disk_rescue.scanning import ScanResult, resolve_scan_root, scan_document, scan_summary, scan_tree
+
+INTERRUPTED = 'Interrupted; the manifest holds the last completed scan.'
 
 
 def scan(
@@ -30,10 +32,15 @@ def scan(
     no_progress: console.NoProgress = False,
     verbose: console.Verbose = False,
     quiet: console.Quiet = False,
+    json_document: console.Json = False,
 ) -> None:
     """Record every file and folder under REMOTE_PATH in the manifest and summarize what changed."""
     options = console.output_options(
-        verbose=verbose, quiet=quiet, no_progress=no_progress, progress_interval=progress_interval
+        verbose=verbose,
+        quiet=quiet,
+        no_progress=no_progress,
+        progress_interval=progress_interval,
+        json_document=json_document,
     )
     root = api.normalize_remote_path(remote_path)
     limits = settings.api_limits(
@@ -47,16 +54,11 @@ def scan(
         'api_retries': api_retries,
         'api_url': api_url,
     }
-    with console.command_output('scan', options, details=details) as output:
+    with console.command_output('scan', options, details=details, interrupted=INTERRUPTED) as output:
         token = auth.get_token()
         manifest_path = paths.manifest_path()
-        try:
-            result = asyncio.run(
-                _run(token, root, output, base_url=api_url, limits=limits, manifest_path=manifest_path)
-            )
-        except KeyboardInterrupt:
-            typer.echo('Interrupted; the manifest holds the last completed scan.', err=True)
-            raise
+        result = asyncio.run(_run(token, root, output, base_url=api_url, limits=limits, manifest_path=manifest_path))
+        output.report(scan_document(result))
         output.summary(partial(scan_summary, result))
         output.footer(manifest_path)
 

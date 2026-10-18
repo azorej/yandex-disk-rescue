@@ -10,7 +10,7 @@ account to local storage. It is a headless analogue of the Windows app
 > mirroring with segmented downloads of large files
 > (`yandex-disk-rescue download`), an offline, resumable integrity check
 > of a mirror (`yandex-disk-rescue verify`), and their progress (a live view
-> on a terminal, status lines elsewhere) and log file work. Further features
+> on a terminal, status lines elsewhere), log file and `--json` reports work. Further features
 > are being built; planned work is tracked in GitHub issues.
 
 ## Goals
@@ -721,7 +721,8 @@ every file.
 
 - **stdout** carries the report: the start lines, the scan summary, the
   final summary, then the `Manifest:` and `Log:` lines. Nothing else is ever
-  written there, so `> report.txt` keeps exactly the report.
+  written there, so `> report.txt` keeps exactly the report. With `--json` it
+  carries one JSON document instead (see [JSON reports](#json-reports)).
 - **stderr** carries the progress and the notices as they happen, then
   the `Error: …` or `Interrupted; …` line a run ends with.
 
@@ -892,6 +893,118 @@ that fails later (the state disk full, an I/O error) never stops the run:
 stderr gets one `Warning: could not write the log file <path>: <reason>;
 logging to it is off for this run.`, even with `-q`, and the report ends with
 `Log: <path> (incomplete: <reason>)`.
+
+### JSON reports
+
+`--json` on `scan`, `download` or `verify` prints the run's report as one JSON
+document on stdout, written once the command ends and every other line is
+out. The human report then goes to stderr, where the notices and status
+lines are (with `-q`, nowhere); the `Error: …` or `Interrupted; …` line and
+the exit codes stay as they are. stdout holds that document and nothing else,
+whatever the exit code:
+
+```bash
+yandex-disk-rescue download -q --json disk:/Photos /mnt/backup > run.json
+jq '.counts, [.failed[].path]' run.json
+```
+
+Every document starts with the same keys:
+
+| Key | Value |
+|---|---|
+| `schema_version` | `1`; it changes only when a key changes meaning or goes away |
+| `command` | `scan`, `download` or `verify` |
+| `version` | The tool's version |
+| `started_at`, `finished_at` | UTC times, `2026-10-17T09:30:00.123Z` |
+| `manifest`, `log` | The paths of the manifest and the log file |
+| `log_incomplete` | Why the log file missed records (the `Log: … (incomplete: …)` reason), else `null` |
+| `exit_code` | The process's exit code |
+| `error` | `{"message": "…"}`, the text of the `Error:` (or `Interrupted;`) line; only when `exit_code` is not `0` |
+
+A command that got as far as its report adds the report's keys, also when it
+then exits `1` because files failed, were quarantined or have problems. A
+command that ended with no report (a token Yandex rejects, a log file that
+cannot be opened, an unreadable DEST, `--no-scan` with no scan, a DEST that is
+not a mirror, Ctrl+C) prints the common keys alone, with `error`. A usage
+error (exit `2` before the command starts) prints no JSON.
+
+Every list is complete, sizes are integers in bytes, and paths are the Disk's
+own, control characters included (JSON escapes them); a name that is not
+valid Unicode keeps its lone surrogate as a `\udcxx` escape. The one sample
+is `scan`'s `without_checksum.sample`, the 20 smallest paths, with the full
+`count`.
+
+`scan`:
+
+```json
+{
+  "schema_version": 1, "command": "scan", "…": "…",
+  "root": "disk:/Photos", "files": 1203, "folders": 41, "size": 8573190144,
+  "without_checksum": {"count": 2, "sample": ["disk:/Photos/a.heic", "disk:/Photos/b.heic"]},
+  "vanished": [], "unencodable": [], "first_scan": false,
+  "added": ["disk:/Photos/new.jpg"], "changed": [], "removed": ["disk:/Photos/old.jpg"]
+}
+```
+
+`download` (`skipped` includes `adopted`, as in the summary's first line;
+`passes` is `null` until a transient failure defers a file; `scan` is the
+scan object above with `reused: false`, or `{"reused": true, "root",
+"completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
+the move of the downloads in progress to a new partial folder, `null` when
+there is none, and `partial_room` the room measured in a separate partial
+folder):
+
+```json
+{
+  "schema_version": 1, "command": "download", "…": "…",
+  "exit_code": 1, "error": {"message": "1 failed and 1 quarantined; see the lists above."},
+  "remote_root": "disk:/Photos", "destination": "/mnt/backup", "retry_failed": false,
+  "scan": {"reused": true, "root": "disk:/Photos", "completed_at": "2026-10-17T09:20:11.004Z"},
+  "to_download": {"files": 12, "size": 104857600},
+  "counts": {"downloaded": 10, "downloaded_size": 94371840, "skipped": 1191, "adopted": 0, "size_only": 0,
+             "renamed": 0, "moved_aside": 0, "quarantined": 1, "failed": 1},
+  "passes": {"used": 2, "limit": 7},
+  "adopted": [], "size_only": [], "renamed": [{"path": "disk:/Photos/a?b.jpg", "local": "a_b~1f2e3d4c.jpg"}],
+  "moved_aside": [], "replaced_folder": null,
+  "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
+                   "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
+  "failed": [{"path": "disk:/Photos/gone.jpg", "reason": "removed from the Disk after the scan"}],
+  "partials_left": [],
+  "partial_dir": "/mnt/fast",
+  "partial_move": {"source": "/mnt/old/0a1b2c3d4e5f6a7b", "target": "/mnt/fast/0a1b2c3d4e5f6a7b",
+                   "downloads": 2, "size": 750000, "missing": false},
+  "partial_room": {"folder": "/mnt/fast/0a1b2c3d4e5f6a7b", "available": 53687091200}
+}
+```
+
+`last_retry` is the failure of the last attempt to fetch a quarantined file
+again (the summary's `; last retry: …`), `null` when none failed.
+
+`verify` (`pass` is the pass the run belongs to: when it started, whether
+this run `continued` an interrupted one, and the files and bytes this run
+read; `counts` cover the whole pass):
+
+```json
+{
+  "schema_version": 1, "command": "verify", "…": "…",
+  "destination": "/mnt/backup", "remote_root": "disk:/Photos",
+  "counts": {"intact": 1199, "size_only": 2, "missing": 1, "modified": 0, "corrupt": 1, "quarantined": 1,
+             "not_downloaded": 0, "problems": 3},
+  "size_only": ["disk:/Photos/a.heic", "disk:/Photos/b.heic"],
+  "missing": [{"path": "disk:/Photos/x.jpg", "reason": "x.jpg is missing", "repair_quarantined": null}],
+  "modified": [],
+  "corrupt": [{"path": "disk:/Photos/y.jpg", "reason": "MD5 mismatch (expected …, got …)",
+               "repair_quarantined": {"reason": "MD5 mismatch (expected …, got …)",
+                                      "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/y.jpg"}}],
+  "quarantined": [{"path": "disk:/Photos/bad.jpg", "reason": "MD5 mismatch (expected …, got …)",
+                   "last_retry": null, "copy": ".yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/bad.jpg"}],
+  "not_downloaded": [],
+  "pass": {"started_at": "2026-10-24T09:00:00.512Z", "continued": true, "files_read": 400, "size_read": 2147483648}
+}
+```
+
+`repair_quarantined` is set when the download meant to repair a finding was
+quarantined (the summary's `; repair quarantined: …; kept at …`).
 
 ## Exit codes
 

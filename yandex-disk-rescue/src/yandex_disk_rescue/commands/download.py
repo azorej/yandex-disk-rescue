@@ -14,11 +14,22 @@ import typer
 from yandex_disk_rescue import api, auth, console, paths, settings
 from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
+from yandex_disk_rescue.logs import timestamp
 from yandex_disk_rescue.manifest import Manifest, ScanTime
-from yandex_disk_rescue.mirroring import MirrorReport, MirrorRun, PartialRoom, TransferPolicy, mirror_summary
+from yandex_disk_rescue.mirroring import (
+    MirrorReport,
+    MirrorRun,
+    PartialMove,
+    PartialRoom,
+    TransferPolicy,
+    mirror_document,
+    mirror_summary,
+)
 from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, ScanProgress
-from yandex_disk_rescue.scanning import resolve_scan_root, scan_summary, scan_tree
+from yandex_disk_rescue.scanning import resolve_scan_root, scan_document, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
+
+INTERRUPTED = 'Interrupted; rerun to continue the download.'
 
 
 class FilesNotMirroredError(RescueError):
@@ -85,11 +96,16 @@ def download(
     no_progress: console.NoProgress = False,
     verbose: console.Verbose = False,
     quiet: console.Quiet = False,
+    json_document: console.Json = False,
 ) -> None:
     """Scan REMOTE_PATH unless a recent scan covers it, then mirror it into DEST: every file verified, verified files
     skipped on a rerun, or with --retry-failed only the failed, quarantined, unfinished and broken ones."""
     options = console.output_options(
-        verbose=verbose, quiet=quiet, no_progress=no_progress, progress_interval=progress_interval
+        verbose=verbose,
+        quiet=quiet,
+        no_progress=no_progress,
+        progress_interval=progress_interval,
+        json_document=json_document,
     )
     remote_path, dest = _split_locations(locations)
     root = api.normalize_remote_path(remote_path)
@@ -127,28 +143,32 @@ def download(
         'api_retries': api_retries,
         'api_url': api_url,
     }
-    with console.command_output('download', options, details=details) as output:
+    with console.command_output('download', options, details=details, interrupted=INTERRUPTED) as output:
         token = auth.get_token()
         manifest_path = paths.manifest_path()
-        try:
-            report = asyncio.run(
-                _run(
-                    token,
-                    root,
-                    destination,
-                    output,
-                    partial_dir=partial_folder,
-                    base_url=api_url,
-                    limits=limits,
-                    scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
-                    retry_failed=retry_failed,
-                    transfers=transfers,
-                    manifest_path=manifest_path,
-                )
+        report, facts = asyncio.run(
+            _run(
+                token,
+                root,
+                destination,
+                output,
+                partial_dir=partial_folder,
+                base_url=api_url,
+                limits=limits,
+                scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
+                retry_failed=retry_failed,
+                transfers=transfers,
+                manifest_path=manifest_path,
             )
-        except KeyboardInterrupt:
-            typer.echo('Interrupted; rerun to continue the download.', err=True)
-            raise
+        )
+        output.report(
+            {
+                **mirror_document(report),
+                'retry_failed': retry_failed,
+                'partial_dir': None if partial_folder is None else str(partial_folder),
+                **facts,
+            }
+        )
         output.summary(partial(mirror_summary, report))
         output.footer(manifest_path)
         if report.failed or report.quarantined:
@@ -227,25 +247,34 @@ async def _run(
     retry_failed: bool,
     transfers: _Transfers,
     manifest_path: Path,
-) -> MirrorReport:
+) -> tuple[MirrorReport, dict[str, object]]:
+    """The report of the run, and the JSON members it does not hold: the scan, the files to download, the move of
+    the partial files and the room measured in the partial folder."""
     async with api.DiskClient(token, base_url=base_url, limits=limits) as client:
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
         with Manifest.open(manifest_path) as manifest:
-            reused = scan_policy.reused(scan_root.path, manifest.last_scan(account.uid, scan_root.path))
+            last = manifest.last_scan(account.uid, scan_root.path)
+            reused = scan_policy.reused(scan_root.path, last)
             with Destination.open(destination_path, partial_dir=partial_dir) as destination:
                 mirror = manifest.mirror(account.uid, scan_root.path, destination.path)
-                if reused is None:
+                scan: dict[str, object]
+                if reused is None or last is None:
                     scan_progress = ScanProgress()
                     with output.progress(scan_progress):
                         scanned = await scan_tree(client, manifest, account, scan_root, scan_progress)
                     output.summary(partial(scan_summary, scanned))
+                    scan = {'reused': False, **scan_document(scanned)}
                 else:
                     output.headline(reused)
+                    scan = {'reused': True, 'root': last.root, 'completed_at': timestamp(last.completed_at.timestamp())}
                 progress = MirrorProgress()
                 with output.progress(progress):
                     run = MirrorRun(mirror, destination, retry_failed=retry_failed, progress=progress)
-                return await _mirror(client, run, destination, output, progress, transfers, retry_failed=retry_failed)
+                report, facts = await _mirror(
+                    client, run, destination, output, progress, transfers, retry_failed=retry_failed
+                )
+                return report, {'scan': scan, **facts}
 
 
 async def _mirror(
@@ -257,7 +286,7 @@ async def _mirror(
     transfers: _Transfers,
     *,
     retry_failed: bool,
-) -> MirrorReport:
+) -> tuple[MirrorReport, dict[str, object]]:
     files = 'file' if run.pending_files == 1 else 'files'
     size = format_size(run.pending_size)
     if retry_failed:
@@ -289,11 +318,29 @@ async def _mirror(
             segments=transfers.segments,
             segment_threshold=transfers.segment_threshold_mib * 2**20,
         )
+        room: dict[str, object] | None = None
+
+        def room_measured(measured: PartialRoom) -> None:
+            nonlocal room
+            available = max(measured.capacity, 0)
+            room = {'folder': str(measured.folder), 'available': available}
+            output.headline(f'Partial files in {measured.folder} ({format_size(available)} available)')
+
         with output.progress(progress):
-            return await run.run(
-                client, content, policy, passes=transfers.passes, room_measured=partial(_show_room, output)
-            )
+            report = await run.run(client, content, policy, passes=transfers.passes, room_measured=room_measured)
+    facts = {
+        'to_download': {'files': run.pending_files, 'size': run.pending_size},
+        'partial_move': None if move is None else _move_document(move),
+        'partial_room': room,
+    }
+    return report, facts
 
 
-def _show_room(output: console.Output, room: PartialRoom) -> None:
-    output.headline(f'Partial files in {room.folder} ({format_size(max(room.capacity, 0))} available)')
+def _move_document(move: PartialMove) -> dict[str, object]:
+    return {
+        'source': str(move.source),
+        'target': str(move.target),
+        'downloads': move.downloads,
+        'size': move.size,
+        'missing': move.missing,
+    }

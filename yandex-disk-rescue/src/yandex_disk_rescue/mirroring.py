@@ -183,11 +183,13 @@ class PartialMove:
 
 @dataclass(frozen=True)
 class QuarantinedFile:
-    """A file whose quarantined copy at `copy` (relative to the destination) stands for it in this run."""
+    """A file whose quarantined copy at `copy` (relative to the destination) stands for it in this run: quarantined
+    for `reason`, and `last_retry`, the failure of the last attempt to fetch it again, if any."""
 
     path: str
     reason: str
     copy: PurePosixPath
+    last_retry: str | None
 
 
 @dataclass
@@ -953,7 +955,9 @@ class MirrorRun:
             return None
         except FileQuarantined as quarantined:
             _log.warning('%s quarantined: %s; kept at %s', path, quarantined.reason, quarantined.copy)
-            report.quarantined.append(QuarantinedFile(entry.resource.path, quarantined.reason, quarantined.copy))
+            report.quarantined.append(
+                QuarantinedFile(entry.resource.path, quarantined.reason, quarantined.copy, last_retry=None)
+            )
             if quarantined.partial_left is not None:
                 report.partials_left.append(quarantined.partial_left)
             self._settle(entry, 'quarantined')
@@ -1764,10 +1768,7 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.quarantined:
         lines.append(f'Quarantined: {len(report.quarantined)}')
-        shown = [
-            f'{display_path(held.path)}: {held.reason}; kept at {display_path(str(held.copy))}'
-            for held in report.quarantined
-        ]
+        shown = [quarantined_line(held) for held in report.quarantined]
         lines += listed('', shown, len(shown), '', limit=limit)
         lines.append(_QUARANTINE_HINT)
     if report.failed:
@@ -1779,6 +1780,36 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         shown = [f'{left.path}: {left.reason}' for left in report.partials_left]
         lines += listed('', shown, len(shown), '', limit=limit)
     return lines
+
+
+def mirror_document(report: MirrorReport) -> dict[str, object]:
+    """The JSON object of a run: the counts of the summary's head line (`skipped` includes `adopted`), the passes,
+    and every list in full."""
+    passes = None if report.passes is None else {'used': report.passes[0], 'limit': report.passes[1]}
+    return {
+        'remote_root': report.remote_root,
+        'destination': report.destination,
+        'counts': {
+            'downloaded': report.downloaded,
+            'downloaded_size': report.downloaded_size,
+            'skipped': report.skipped,
+            'adopted': len(report.adopted),
+            'size_only': len(report.size_only),
+            'renamed': len(report.renamed),
+            'moved_aside': len(report.moved_aside),
+            'quarantined': len(report.quarantined),
+            'failed': len(report.failed),
+        },
+        'passes': passes,
+        'adopted': report.adopted,
+        'size_only': report.size_only,
+        'renamed': [{'path': remote, 'local': str(local)} for remote, local in report.renamed],
+        'moved_aside': [str(local) for local in report.moved_aside],
+        'replaced_folder': None if report.replaced_folder is None else str(report.replaced_folder),
+        'quarantined': [quarantined_document(held) for held in report.quarantined],
+        'failed': [{'path': failure.path, 'reason': failure.reason} for failure in report.failed],
+        'partials_left': [{'path': str(left.path), 'reason': left.reason} for left in report.partials_left],
+    }
 
 
 def _assign_local_names(mirror: Mirror) -> list[MirrorEntry]:
@@ -1815,8 +1846,22 @@ def held_copy(entry: MirrorEntry, last_retry: str | None) -> QuarantinedFile:
     """The report of a file held by its quarantine record, with the failure of its last retry, if any."""
     if entry.quarantine is None:
         raise ValueError(f'{entry.resource.path} has no quarantine record')
-    reason = entry.quarantine.reason if last_retry is None else f'{entry.quarantine.reason}; last retry: {last_retry}'
-    return QuarantinedFile(entry.resource.path, reason, entry.quarantine.copy)
+    return QuarantinedFile(entry.resource.path, entry.quarantine.reason, entry.quarantine.copy, last_retry)
+
+
+def quarantined_line(held: QuarantinedFile) -> str:
+    """How a summary lists the quarantined file `held`: its path and reason, its last retry, and its copy."""
+    return f'{display_path(held.path)}: {quarantined_reason(held)}; kept at {display_path(str(held.copy))}'
+
+
+def quarantined_reason(held: QuarantinedFile) -> str:
+    """The quarantine reason of `held`, followed by `; last retry: <failure>` when a retry failed."""
+    return held.reason if held.last_retry is None else f'{held.reason}; last retry: {held.last_retry}'
+
+
+def quarantined_document(held: QuarantinedFile) -> dict[str, object]:
+    """The JSON object of the quarantined file `held`."""
+    return {'path': held.path, 'reason': held.reason, 'last_retry': held.last_retry, 'copy': str(held.copy)}
 
 
 def _verified_now(entry: MirrorEntry) -> bool:

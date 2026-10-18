@@ -153,6 +153,25 @@ def scan_summary(result: ScanResult, *, limit: int | None = SHOWN_PATHS) -> list
     return lines
 
 
+def scan_document(result: ScanResult) -> dict[str, object]:
+    """The JSON object of a scan: its totals and every list in full, but the files without a checksum, of which it
+    has the count and the sample the summary shows."""
+    totals, diff = result.totals, result.diff
+    return {
+        'root': result.root,
+        'files': totals.files,
+        'folders': totals.folders,
+        'size': totals.size,
+        'without_checksum': {'count': totals.without_checksum.count, 'sample': totals.without_checksum.smallest},
+        'vanished': list(result.vanished),
+        'unencodable': [resource.path for resource in result.unencodable],
+        'first_scan': diff.first_scan,
+        'added': diff.added,
+        'changed': diff.changed,
+        'removed': diff.removed,
+    }
+
+
 def _shown(paths: Iterable[str]) -> list[str]:
     return [display_path(path) for path in paths]
 

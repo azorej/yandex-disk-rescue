@@ -4,6 +4,7 @@ destination, with the real manifest in the XDG state directory."""
 import errno
 import fcntl
 import hashlib
+import json
 import os
 import random
 import re
@@ -11,7 +12,7 @@ import signal
 import sqlite3
 import stat
 from contextlib import closing
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import PurePosixPath
 
 import pytest
@@ -34,6 +35,7 @@ from mirror_tree import (
 )
 from yandex_disk_rescue import localfs, verifying
 from yandex_disk_rescue.cli import app
+from yandex_disk_rescue.commands import verify as verify_command
 from yandex_disk_rescue.destination import ReadOnlyDestination
 from yandex_disk_rescue.manifest import Mirror
 from yandex_disk_rescue.paths import log_path, manifest_path
@@ -225,6 +227,26 @@ def test_each_kind_of_damage_is_reported_and_recorded_and_a_link_is_never_follow
         (CORRUPT, 'corrupt', corrupt_reason),
         (EDITED, 'modified', edited_reason),
     ]
+    document = json.loads(_verify('--json', str(dest)).stdout)
+    assert document['counts'] == {
+        'intact': 2,
+        'size_only': 1,
+        'missing': 1,
+        'modified': 2,
+        'corrupt': 1,
+        'quarantined': 0,
+        'not_downloaded': 0,
+        'problems': 4,
+    }
+    assert (document['missing'], document['modified'], document['corrupt']) == (
+        [{'path': README, 'reason': 'Docs/readme.txt is missing', 'repair_quarantined': None}],
+        [
+            {'path': CYRILLIC, 'reason': linked_reason, 'repair_quarantined': None},
+            {'path': EDITED, 'reason': edited_reason, 'repair_quarantined': None},
+        ],
+        [{'path': CORRUPT, 'reason': corrupt_reason, 'repair_quarantined': None}],
+    )
+    assert (document['exit_code'], document['error']) == (1, {'message': '4 problems found; see the lists above.'})
     assert linked.is_symlink()
     assert os.readlink(linked) == str(outside)
     assert outside.read_bytes() == b'not part of the mirror'
@@ -345,6 +367,17 @@ def test_a_file_with_a_finding_whose_repair_was_quarantined_is_listed_under_its_
     ) in again.stdout
     assert 'Quarantined:' not in again.stdout
     assert stderr_lines(again.stderr) == ['Error: 1 problem found; see the list above.']
+
+    as_json = _verify('--json', str(dest))
+
+    assert as_json.exit_code == 1
+    document = json.loads(as_json.stdout)
+    assert document['corrupt'] == [
+        {'path': CORRUPT, 'reason': finding, 'repair_quarantined': {'reason': quarantine_reason, 'copy': str(copy)}}
+    ]
+    assert (document['quarantined'], document['counts']['problems']) == ([], 1)
+    assert (document['exit_code'], document['error']) == (1, {'message': '1 problem found; see the list above.'})
+    assert as_json.stderr.splitlines()[-1] == 'Error: 1 problem found; see the list above.'
 
 
 def _md5_mismatch(expected: bytes, got: bytes) -> str:
@@ -619,6 +652,40 @@ def test_ctrl_c_keeps_the_pass_and_the_rerun_continues_it_reporting_what_an_unin
     assert resumed.stdout.splitlines()[1:] == uninterrupted.stdout.splitlines()[1:]
     assert f'Verified {dest} (disk:/Many): 38 intact, 0 missing, 0 modified, 2 corrupt,' in resumed.stdout
     assert [path for path, *_ in _findings()] == [EARLY, LATE]
+
+
+def test_json_of_a_continued_pass_says_so_and_counts_what_an_uninterrupted_pass_does(many, dest, tmp_path, monkeypatch):
+    gate = slow_reads(tmp_path, monkeypatch)
+    child = start_command('verify', '--json', str(dest))
+    try:
+        wait_until(lambda: len(list(gate.iterdir())) >= 20, child, 'read 20 files')
+        child.send_signal(signal.SIGINT)
+        stopped, _ = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+    monkeypatch.delenv('PYTHONPATH')
+    started, through = _verify_pass()
+
+    resumed = json.loads(_verify('--json', str(dest)).stdout)
+    uninterrupted = json.loads(_verify('--json', str(dest)).stdout)
+
+    assert child.returncode == 130
+    interrupted = json.loads(stopped)
+    assert (interrupted['exit_code'], interrupted['error']) == (130, {'message': verify_command.INTERRUPTED})
+    assert 'pass' not in interrupted
+    left = _after(through)
+    assert resumed['pass'] == {
+        'started_at': f'{started.astimezone(UTC):%Y-%m-%dT%H:%M:%S}.{started.microsecond // 1000:03d}Z',
+        'continued': True,
+        'files_read': len(left),
+        'size_read': 1024 * len(left),
+    }
+    assert uninterrupted['pass']['continued'] is False
+    assert (uninterrupted['pass']['files_read'], uninterrupted['pass']['size_read']) == (40, 40 * 1024)
+    assert resumed['counts'] == uninterrupted['counts']
+    assert resumed['counts']['corrupt'] == 2
+    assert resumed['corrupt'] == uninterrupted['corrupt']
 
 
 def test_the_cursor_is_committed_every_cursor_seconds_and_never_past_the_file_in_flight(many, dest, monkeypatch):

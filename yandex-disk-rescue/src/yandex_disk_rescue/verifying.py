@@ -46,6 +46,9 @@ from yandex_disk_rescue.mirroring import (
     QuarantinedFile,
     held_copy,
     is_held,
+    quarantined_document,
+    quarantined_line,
+    quarantined_reason,
     size_mismatch,
     unencodable_reason,
 )
@@ -70,8 +73,12 @@ class DestinationUnreadableError(RescueError):
 
 @dataclass(frozen=True)
 class Problem:
+    """A file listed for `reason`; under a finding, `repair` is its quarantine record for its current identity: the
+    download meant to repair it was quarantined."""
+
     path: str
     reason: str
+    repair: QuarantinedFile | None = None
 
 
 @dataclass
@@ -96,13 +103,10 @@ class VerifyReport:
         return sum(1 for problems in self._lists() if problems)
 
     def add(self, entry: MirrorEntry, finding: Finding) -> None:
-        """List `entry` under `finding`, with the reason and copy of its current quarantine record, if any."""
-        reason = finding.reason
-        if is_held(entry):
-            held = held_copy(entry, None)
-            reason = f'{reason}; repair quarantined: {held.reason}; kept at {held.copy}'
+        """List `entry` under `finding`, with its current quarantine record as its repair, if any."""
+        repair = held_copy(entry, None) if is_held(entry) else None
         {'missing': self.missing, 'modified': self.modified, 'corrupt': self.corrupt}[finding.kind].append(
-            Problem(entry.resource.path, reason)
+            Problem(entry.resource.path, finding.reason, repair)
         )
 
     def _lists(self) -> tuple[list[Problem] | list[QuarantinedFile], ...]:
@@ -211,17 +215,48 @@ def verify_summary(report: VerifyReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines += listed('', [display_path(path) for path in report.size_only], len(report.size_only), '', limit=limit)
     for title, problems in (('Missing', report.missing), ('Modified', report.modified), ('Corrupt', report.corrupt)):
         lines += _problem_lines(title, _problems(problems), limit)
-    lines += _problem_lines(
-        'Quarantined',
-        [f'{display_path(q.path)}: {q.reason}; kept at {display_path(str(q.copy))}' for q in report.quarantined],
-        limit,
-    )
+    lines += _problem_lines('Quarantined', [quarantined_line(held) for held in report.quarantined], limit)
     lines += _problem_lines('Not downloaded', _problems(report.not_downloaded), limit)
     return lines
 
 
+def verify_document(report: VerifyReport) -> dict[str, object]:
+    """The JSON object of a check: the counts of the summary's head line and the problems, and every list in full."""
+    return {
+        'destination': report.destination,
+        'remote_root': report.remote_root,
+        'counts': {
+            'intact': report.intact,
+            'size_only': len(report.size_only),
+            'missing': len(report.missing),
+            'modified': len(report.modified),
+            'corrupt': len(report.corrupt),
+            'quarantined': len(report.quarantined),
+            'not_downloaded': len(report.not_downloaded),
+            'problems': report.problems,
+        },
+        'size_only': report.size_only,
+        'missing': [_finding_document(problem) for problem in report.missing],
+        'modified': [_finding_document(problem) for problem in report.modified],
+        'corrupt': [_finding_document(problem) for problem in report.corrupt],
+        'quarantined': [quarantined_document(held) for held in report.quarantined],
+        'not_downloaded': [{'path': problem.path, 'reason': problem.reason} for problem in report.not_downloaded],
+    }
+
+
+def _finding_document(problem: Problem) -> dict[str, object]:
+    repair = None if problem.repair is None else {'reason': problem.repair.reason, 'copy': str(problem.repair.copy)}
+    return {'path': problem.path, 'reason': problem.reason, 'repair_quarantined': repair}
+
+
 def _problems(problems: list[Problem]) -> list[str]:
-    return [f'{display_path(problem.path)}: {problem.reason}' for problem in problems]
+    return [f'{display_path(problem.path)}: {problem.reason}{_repair(problem.repair)}' for problem in problems]
+
+
+def _repair(held: QuarantinedFile | None) -> str:
+    if held is None:
+        return ''
+    return f'; repair quarantined: {quarantined_reason(held)}; kept at {display_path(str(held.copy))}'
 
 
 def _problem_lines(title: str, shown: list[str], limit: int | None) -> list[str]:

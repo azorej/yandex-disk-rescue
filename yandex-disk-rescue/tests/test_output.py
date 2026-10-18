@@ -3,6 +3,7 @@ lines on stderr, the verbosity and progress flags and the log file in the XDG st
 
 import errno
 import fcntl
+import json
 import os
 import pty
 import re
@@ -25,12 +26,15 @@ from mirror_tree import (
     run_download,
     runner,
     slow_reads,
+    start_command,
     status_lines,
     stderr_lines,
+    wait_until,
 )
 from yandex_disk_rescue import localfs, logs, mirroring, progress
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.commands import scan as scan_command
+from yandex_disk_rescue.commands.download import INTERRUPTED
 from yandex_disk_rescue.paths import log_path, manifest_path, state_dir
 from yandex_disk_rescue.units import format_size
 
@@ -584,6 +588,10 @@ def test_control_characters_of_a_remote_name_are_escaped_in_the_report_the_notic
     assert f'{red} failed: removed from the Disk after the scan' in log_messages()
     assert f'  {red}: removed from the Disk after the scan' in log_messages()
 
+    disk.inject('GET', '/v1/disk/resources/download', 404, where={'path': RED})
+    document = json.loads(run_download('--json', '--retry-failed', str(dest)).stdout)
+    assert [failure['path'] for failure in document['failed']] == [RED]
+
 
 def test_the_live_view_shows_the_control_characters_of_a_remote_name_escaped(disk, dest):
     slow = 'disk:/\x1b[31mslow\r.bin'
@@ -624,3 +632,107 @@ def test_no_speed_shows_before_a_second_of_bytes_was_measured(monkeypatch):
         r'Downloading: 0 of 1 file, 1\.1 MiB of 10\.0 MiB \(10\.6%\), 1\.1 MiB/s, ETA 8 s; .*',
         later.status_line(final=False),
     )
+
+
+COMMON_KEYS = {
+    'schema_version',
+    'command',
+    'version',
+    'started_at',
+    'finished_at',
+    'manifest',
+    'log',
+    'log_incomplete',
+    'exit_code',
+}
+ISO_TIME = r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z'
+
+
+def _document(stdout: str) -> dict:
+    """The one JSON document `stdout` holds; `json.loads` fails on anything after it."""
+    document = json.loads(stdout)
+    assert stdout.endswith('}\n')
+    return document
+
+
+def test_json_of_a_clean_quiet_run_is_the_only_output(disk, dest):
+    result = run_download('--json', '-q', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert result.stderr == ''
+    document = _document(result.stdout)
+    assert COMMON_KEYS <= document.keys()
+    assert 'error' not in document
+    assert {key: document[key] for key in ('schema_version', 'command', 'version', 'exit_code')} == {
+        'schema_version': 1,
+        'command': 'download',
+        'version': '0.1.0',
+        'exit_code': 0,
+    }
+    assert re.fullmatch(ISO_TIME, document['started_at'])
+    assert document['started_at'] <= document['finished_at']
+    assert (document['manifest'], document['log'], document['log_incomplete']) == (
+        str(manifest_path()),
+        str(log_path()),
+        None,
+    )
+    assert document['counts']['downloaded'] == len(FILES)
+    assert document['scan']['reused'] is False
+    assert document['scan']['files'] == len(FILES)
+
+
+def test_json_with_a_token_yandex_rejects_is_an_error_document_alone(disk, dest):
+    disk.token = 'another token'
+
+    result = run_download('--json', str(dest))
+
+    assert result.exit_code == 1
+    document = _document(result.stdout)
+    assert document.keys() == COMMON_KEYS | {'error'}
+    assert document['exit_code'] == 1
+    assert f'Error: {document["error"]["message"]}' == stderr_lines(result.stderr)[-1]
+
+
+def test_json_with_a_log_file_that_cannot_be_opened_is_an_error_document_alone(disk, dest):
+    state_dir().parent.mkdir(parents=True)
+    state_dir().write_bytes(b'')
+
+    result = run_download('--json', str(dest))
+
+    assert result.exit_code == 1
+    document = _document(result.stdout)
+    assert document.keys() == COMMON_KEYS | {'error'}
+    reason = os.strerror(errno.EEXIST)
+    assert document['error'] == {'message': f'Could not open the log file {log_path()}: {reason}.'}
+    assert document['log_incomplete'] == reason
+    assert disk.requests == []
+
+
+def test_json_after_ctrl_c_is_an_error_document_with_exit_code_130(disk, dest):
+    disk.inject('GET', '/download', Delay(30), where={'path': 'disk:/Docs/readme.txt'})
+    child = start_command('download', '--json', '--download-timeout', '60', str(dest))
+    try:
+        wait_until(lambda: log_path().exists() and 'Pass 1 of 7' in log_path().read_text(), child, 'started pass 1')
+        child.send_signal(signal.SIGINT)
+        stdout, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    assert child.returncode == 130, stderr
+    document = _document(stdout)
+    assert document.keys() == COMMON_KEYS | {'error'}
+    assert (document['exit_code'], document['error']) == (130, {'message': INTERRUPTED})
+    assert stderr.splitlines()[-1] == INTERRUPTED
+    assert 'Downloading 6 files (' in stderr
+
+
+def test_json_on_a_terminal_prints_the_report_above_the_live_view_and_the_document_after_it(slow, dest):
+    code, stdout, shown = _Terminal('download', '--json', str(dest)).finish()
+
+    assert code == 0, shown
+    assert BAR in shown
+    assert re.search(rb'Downloading 6 files \([^)]+\) to ', shown)
+    assert _after_the_view(shown).startswith('Mirrored disk:/ to ')
+    document = _document(stdout)
+    assert (document['exit_code'], document['counts']['downloaded']) == (0, 6)

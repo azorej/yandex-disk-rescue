@@ -6,6 +6,7 @@ import errno
 import fcntl
 import hashlib
 import itertools
+import json
 import os
 import random
 import re
@@ -404,6 +405,14 @@ def test_a_quarantined_file_whose_retry_fails_is_still_listed_as_quarantined_wit
     assert shown in plain.stdout
     assert f'; kept at .yandex-disk-rescue/quarantine/{run.name}/Docs/readme.txt\n' in plain.stdout
     assert 'Failed' not in plain.stdout
+    assert json.loads(run_download('--json', str(dest)).stdout)['quarantined'] == [
+        {
+            'path': path,
+            'reason': reason,
+            'last_retry': 'the download host 127.0.0.1 returned HTTP 503',
+            'copy': f'.yandex-disk-rescue/quarantine/{run.name}/Docs/readme.txt',
+        }
+    ]
 
 
 def test_a_new_disk_version_of_a_quarantined_file_is_not_held(disk, dest):
@@ -506,6 +515,66 @@ def test_each_checksum_the_cloud_provides_is_checked_and_size_only_files_only_by
     assert not (dest / 'sha.bin').exists()
     assert (run / 'sha.bin').read_bytes() == content
     assert not (dest / 'short.bin').exists()
+
+
+def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and_quarantined_copy(
+    disk, dest, tmp_path, monkeypatch
+):
+    content = b'sha-checked'
+    disk.add_file('disk:/Checks/sha.bin', content, md5=None, sha256='0' * 64)
+    disk.add_file('disk:/Checks/size-only.bin', b'size only', md5=None, sha256=None)
+    disk.add_file('disk:/Checks/short.bin', b'0123456789', md5=None, sha256=None)
+    for _ in range(2):
+        disk.inject('GET', '/download', Truncate(after_bytes=4), where={'path': 'disk:/Checks/short.bin'})
+    args = ('--download-retries', '0', '--download-passes', '1', 'disk:/Checks')
+    human = run_download(*args, str(tmp_path / 'human'))
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'json-state'))
+
+    result = run_download('--json', *args, str(dest))
+
+    assert human.exit_code == result.exit_code == 1
+    document = json.loads(result.stdout)
+    head = re.search(r': (\d+) downloaded \((.+)\), (\d+) skipped, (\d+) quarantined, (\d+) failed\n', human.stdout)
+    counts = document['counts']
+    shown = (counts['downloaded'], format_size(counts['downloaded_size']), counts['skipped'])
+    assert shown + (counts['quarantined'], counts['failed']) == (int(head[1]), head[2], int(head[3]), 1, 1)
+    assert (int(head[4]), int(head[5])) == (1, 1)
+    assert counts == {
+        'downloaded': 1,
+        'downloaded_size': 9,
+        'skipped': 0,
+        'adopted': 0,
+        'size_only': 1,
+        'renamed': 0,
+        'moved_aside': 0,
+        'quarantined': 1,
+        'failed': 1,
+    }
+    assert (document['schema_version'], document['command'], document['exit_code']) == (1, 'download', 1)
+    assert document['error'] == {'message': '1 failed and 1 quarantined; see the lists above.'}
+    assert (document['remote_root'], document['destination'], document['retry_failed']) == (
+        'disk:/Checks',
+        str(dest),
+        False,
+    )
+    assert document['scan']['reused'] is False
+    assert (document['scan']['root'], document['scan']['files']) == ('disk:/Checks', 3)
+    assert document['to_download'] == {'files': 3, 'size': len(content) + len(b'size only') + 10}
+    assert document['passes'] == {'used': 1, 'limit': 1}
+    assert document['size_only'] == ['disk:/Checks/size-only.bin']
+    [quarantined] = document['quarantined']
+    assert quarantined['path'] == 'disk:/Checks/sha.bin'
+    assert quarantined['reason'].startswith('SHA-256 mismatch (expected ')
+    assert quarantined['last_retry'] is None
+    assert (dest / quarantined['copy']).read_bytes() == content
+    [failed] = document['failed']
+    assert failed['path'] == 'disk:/Checks/short.bin'
+    assert failed['reason'].startswith('the download failed: ')
+    assert (document['partial_dir'], document['partial_move'], document['partial_room']) == (None, None, None)
+    assert document['partials_left'] == []
+    report = stderr_lines(result.stderr)
+    assert report[report.index('Failed: 1') + 1] == f'  disk:/Checks/short.bin: {failed["reason"]}'
+    assert report[-1] == 'Error: 1 failed and 1 quarantined; see the lists above.'
 
 
 def test_names_are_mapped_for_the_destination_and_kept_on_a_rerun(disk, dest):
@@ -2153,9 +2222,24 @@ def test_a_move_of_partial_files_shows_its_status_lines_then_its_last_one(disk, 
 
     monkeypatch.setattr(os, 'pread', slow_first_read)
 
-    result = run_download('--progress-interval', '1', *_partial_args(partial_root), str(dest))
+    result = run_download('--json', '--progress-interval', '1', *_partial_args(partial_root), str(dest))
 
     assert result.exit_code == 0, result.output
+    document = json.loads(result.stdout)
+    folder = _partial_folder(dest, partial_root)
+    assert document['partial_dir'] == str(partial_root)
+    assert document['partial_move'] == {
+        'source': str(big.parent),
+        'target': str(folder),
+        'downloads': 2,
+        'size': 300_000 + sum(_SEGMENT_CUTS),
+        'missing': False,
+    }
+    assert document['partial_room']['folder'] == str(folder)
+    assert document['partial_room']['available'] > 0
+    assert f'Partial files in {folder} ({format_size(document["partial_room"]["available"])} available)' in (
+        stderr_lines(result.stderr)
+    )
     size = re.escape(format_size(300_000 + sum(_SEGMENT_CUTS)))
     lines = [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert lines[:-1]
@@ -2199,14 +2283,22 @@ def test_a_lost_partial_folder_is_reported_and_its_downloads_start_again_from_by
     shutil.rmtree(big.parent)
     earlier = len(disk.requests)
 
-    result = run_download(*_partial_args(new_root), str(dest))
+    result = run_download('--json', *_partial_args(new_root), str(dest))
 
     assert result.exit_code == 0, result.output
     missing = (
         f'The partial folder of the last run, {big.parent}, is missing; its downloads in progress start again from '
         'their first byte.'
     )
-    assert f'{missing}\n' in result.stdout
+    assert missing in stderr_lines(result.stderr)
+    document = json.loads(result.stdout)
+    move = document['partial_move']
+    assert (move['source'], move['target'], move['downloads'], move['missing']) == (
+        str(big.parent),
+        str(_partial_folder(dest, new_root)),
+        2,
+        True,
+    )
     assert missing in log_messages()
     assert not [line for line in status_lines(result.stderr) if line.startswith('Mov')]
     assert _fetches(disk, BIG_PATH, earlier) == [None]
@@ -2574,21 +2666,23 @@ def test_a_partial_file_that_cannot_be_deleted_once_its_file_is_recorded_is_repo
 
     monkeypatch.setattr(Mirror, record, recorded_then_obstructed)
 
-    result = run_download(*_partial_args(partial_root), 'disk:/Docs', str(dest))
+    result = run_download('--json', *_partial_args(partial_root), 'disk:/Docs', str(dest))
 
     [obstacle] = in_the_way
-    assert f'Partial files not deleted: 1\n  {obstacle}: {os.strerror(errno.EISDIR)}\n' in result.stdout
+    report = stderr_lines(result.stderr)
+    assert f'Partial files not deleted: 1\n  {obstacle}: {os.strerror(errno.EISDIR)}' in '\n'.join(report)
+    assert json.loads(result.stdout)['partials_left'] == [{'path': str(obstacle), 'reason': os.strerror(errno.EISDIR)}]
     notice = f'{path}: partial file {obstacle} not deleted: {os.strerror(errno.EISDIR)}; the outcome stands'
-    assert notice in stderr_lines(result.stderr)
+    assert notice in report
     assert notice in log_messages()
-    assert 'Failed' not in result.stdout
+    assert 'Failed' not in result.stderr
     if way == 'quarantined':
         assert result.exit_code == 1
-        assert '1 quarantined, 0 failed\n' in result.stdout
+        assert '1 quarantined, 0 failed\n' in result.stderr
     else:
         assert result.exit_code == 0, result.output
         assert (dest / 'readme.txt').read_bytes() == FILES[path]
-        assert ', 0 quarantined, 0 failed\n' in result.stdout
+        assert ', 0 quarantined, 0 failed\n' in result.stderr
     assert _failure_records() == []
     assert obstacle.is_dir()
 

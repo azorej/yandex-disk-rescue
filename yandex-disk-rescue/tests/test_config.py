@@ -88,7 +88,7 @@ def test_the_progress_interval_comes_from_the_flag_the_env_var_or_the_config_fil
 
     assert result.exit_code == 0, result.output
     [started] = [message for message in log_messages() if message.startswith('scan started: ')]
-    assert started.endswith(f', progress=True, progress_interval={interval}')
+    assert started.endswith(f', progress=True, progress_interval={interval}, json=False')
 
 
 def test_auth_status_reads_the_api_url_from_the_config_file(fake_disk_api, monkeypatch):

@@ -1,5 +1,6 @@
 """Tests for `yandex-disk-rescue scan` against the fake Disk API, with the real manifest in the XDG state directory."""
 
+import json
 import os
 import signal
 import subprocess
@@ -130,6 +131,9 @@ def test_entries_whose_names_are_not_valid_unicode_are_reported_and_not_recorded
     assert _rows() == [r for r in _tree_rows(disk) if r.path not in left_out]
     assert 'disk:/Bad\udc81' not in [r.params.get('path') for r in disk.requests]
 
+    document = json.loads(_scan('--json').stdout)
+    assert document['unencodable'] == ['disk:/Bad\udc81', 'disk:/Docs/bad\udc80.txt']
+
 
 def test_a_folder_scan_records_the_folder_itself_and_leaves_the_rest_alone(disk):
     assert _scan('/Photos/').exit_code == 0
@@ -183,6 +187,31 @@ def test_long_path_lists_are_cut_after_twenty_entries(disk):
         *(f'  ~ disk:/Bulk/{index:02}.raw' for index in range(1, 25)),
         '  - disk:/Bulk/00.raw',
     ]
+    for index in range(1, 47):
+        disk.add_file(f'disk:/Bulk/{index:02}.raw', b'again', md5=None, sha256=None)
+
+    third = _scan('--json', 'disk:/Bulk')
+
+    assert third.exit_code == 0, third.output
+    document = json.loads(third.stdout)
+    assert (document['command'], document['root'], document['files'], document['folders']) == (
+        'scan',
+        'disk:/Bulk',
+        46,
+        0,
+    )
+    assert document['size'] == 46 * len(b'again')
+    assert document['without_checksum'] == {
+        'count': 46,
+        'sample': [f'disk:/Bulk/{index:02}.raw' for index in range(1, 21)],
+    }
+    assert document['first_scan'] is False
+    assert document['added'] == [f'disk:/Bulk/{index:02}.raw' for index in range(25, 47)]
+    assert document['changed'] == [f'disk:/Bulk/{index:02}.raw' for index in range(1, 25)]
+    assert (document['removed'], document['vanished'], document['unencodable']) == ([], [], [])
+    report = stderr_lines(third.stderr)
+    assert report[0].startswith('Scanned disk:/Bulk: 46 files, 0 folders, ')
+    assert '  … and 2 more added' in report
 
 
 @pytest.mark.parametrize(
