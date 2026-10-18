@@ -266,7 +266,18 @@ file's full size. Once every segment is in, the whole file is read back and
 checked against its size and checksums (with `--partial-dir`, the copy to
 DEST is the check; below). A file at or below the threshold, and every file
 when `download_segments` is `1`, is fetched as one stream and checked as it
-arrives. The segments of a download are fixed when it starts: a download
+arrives. Segments need a partial folder whose filesystem keeps sparse files,
+which `download` checks when it starts (the log file says `Partial folder …
+keeps sparse files: yes` or `no`). On a filesystem without them (HFS+,
+exFAT, FAT), extending a file writes its zeros first, so there every new
+download is fetched as one stream, whatever `download_segments` says, and
+the run says so:
+
+```
+Partial files in /mnt/usb/.yandex-disk-rescue/partial cannot be sparse: new downloads are fetched as one stream each, not as segments.
+```
+
+The segments of a download are fixed when it starts: a download
 resumed by a later pass or a later run keeps them, even when the options
 changed since.
 
@@ -276,7 +287,8 @@ the file's id in the manifest. By default partial files are in
 moved to its final path. With `--partial-dir PATH` (`partial_dir` in the
 config file) they are kept below `PATH` instead, so all of their disk work —
 the writes of many files at once, the flush of every checkpoint, extending a
-segmented file to its full size, and re-reading the confirmed bytes on a
+segmented file to its full size (whether files are segmented then depends
+on `PATH`'s filesystem, not DEST's), and re-reading the confirmed bytes on a
 resume — happens on that disk, not on DEST:
 
 - `PATH` must be an existing folder outside DEST, given as an absolute path;
@@ -696,18 +708,17 @@ Many files written at once make a hard disk seek between them. When DEST is a
 hard disk (a USB one especially), set `partial_dir` to a folder on a fast
 local disk with free space for at least the largest file plus 1 GiB
 ([Partial files](#downloading)): the interleaved writes of the
-files in progress, the checkpoint flushes, the zeros written to extend a
-segmented file, and the re-reading of confirmed bytes on a resume all move
-there, and DEST only receives one sequential copy of each finished file.
+files in progress, the checkpoint flushes, extending segmented files, and the
+re-reading of confirmed bytes on a resume all move there, and DEST only
+receives one sequential copy of each finished file.
 
 Segments speed up one large file on a fast link whose single connection is the
 limit; a folder of small files gains nothing from them, since its files
-already download in parallel. They cost disk work in the partial folder: on a
-filesystem without sparse files (HFS+, exFAT, FAT), extending the partial file
-to its full size writes zeros first, so a segmented file is written twice
-(zeros, then data) and, with partial files in DEST, read once more for
-verification. With partial files on such a disk, prefer `download_segments = 1`
-or `2`, or set `partial_dir`. The defaults (4 segments above 256 MiB) are those
+already download in parallel. They need a partial folder with sparse files:
+on HFS+, exFAT or FAT, `download` fetches each new download as one stream by
+itself, so its partial file is only appended to. To get segments with such a
+DEST, set `partial_dir` to a folder on a filesystem with sparse files, such as
+ext4, XFS or Btrfs. The defaults (4 segments above 256 MiB) are those
 of the Windows [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
 A smaller `download_checkpoint_mib` means less fetched again after a crash or
@@ -1077,8 +1088,9 @@ lists the copies in DEST found unreadable and downloaded again, each with
 scan object above with `reused: false`, or `{"reused": true, "root",
 "completed_at"}`; `partial_dir` is the `--partial-dir` value, `partial_move`
 the move of the downloads in progress to a new partial folder, `null` when
-there is none, and `partial_room` the room measured in a separate partial
-folder):
+there is none, `partial_room` the room measured in a separate partial
+folder, and `sparse_partials` whether the partial folder's filesystem keeps
+sparse files, without which new downloads are not segmented):
 
 ```json
 {
@@ -1099,7 +1111,8 @@ folder):
   "partial_dir": "/mnt/fast",
   "partial_move": {"source": "/mnt/old/0a1b2c3d4e5f6a7b", "target": "/mnt/fast/0a1b2c3d4e5f6a7b",
                    "downloads": 2, "size": 750000, "missing": false},
-  "partial_room": {"folder": "/mnt/fast/0a1b2c3d4e5f6a7b", "available": 53687091200}
+  "partial_room": {"folder": "/mnt/fast/0a1b2c3d4e5f6a7b", "available": 53687091200},
+  "sparse_partials": true
 }
 ```
 

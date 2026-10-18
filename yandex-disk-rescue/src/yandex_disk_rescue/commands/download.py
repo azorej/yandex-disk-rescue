@@ -2,6 +2,7 @@
 verified, or retry only the files whose last attempt failed, was quarantined or never finished and those `verify`
 found broken, and summarize the run."""
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from functools import partial
@@ -29,6 +30,7 @@ from yandex_disk_rescue.scanning import resolve_scan_root, scan_document, scan_s
 from yandex_disk_rescue.units import format_size
 
 INTERRUPTED = 'Interrupted; rerun to continue the download.'
+_log = logging.getLogger(__name__)
 
 
 class FilesNotMirroredError(RescueError):
@@ -249,7 +251,7 @@ async def _run(
     manifest_path: Path,
 ) -> tuple[MirrorReport, dict[str, object]]:
     """The report of the run, and the JSON members it does not hold: the scan, the files to download, the move of
-    the partial files and the room measured in the partial folder."""
+    the partial files, the room measured in the partial folder and whether that folder keeps sparse files."""
     async with api.DiskClient(token, base_url=base_url, limits=limits) as client:
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
@@ -257,6 +259,8 @@ async def _run(
             last = manifest.last_scan(account.uid, scan_root.path)
             reused = scan_policy.reused(scan_root.path, last)
             with Destination.open(destination_path, partial_dir=partial_dir) as destination:
+                folder, sparse = destination.partial_folder, 'yes' if destination.sparse_partials else 'no'
+                _log.info('Partial folder %s keeps sparse files: %s', folder, sparse, extra=console.FILE_ONLY)
                 mirror = manifest.mirror(account.uid, scan_root.path, destination.path)
                 scan: dict[str, object]
                 if reused is None or last is None:
@@ -308,6 +312,11 @@ async def _mirror(
                 f'Moving the confirmed bytes ({format_size(move.size)}) of {move.downloads} {downloads} in progress '
                 f'from {move.source} to {move.target}'
             )
+    if transfers.segments > 1 and not destination.sparse_partials:
+        output.headline(
+            f'Partial files in {destination.partial_folder} cannot be sparse: new downloads are fetched as one stream '
+            'each, not as segments.'
+        )
     move_progress = MoveProgress()
     with output.progress(move_progress):
         await run.move_partials(move_progress)
@@ -333,6 +342,7 @@ async def _mirror(
         'to_download': {'files': run.pending_files, 'size': run.pending_size},
         'partial_move': None if move is None else _move_document(move),
         'partial_room': room,
+        'sparse_partials': destination.sparse_partials,
     }
     return report, facts
 

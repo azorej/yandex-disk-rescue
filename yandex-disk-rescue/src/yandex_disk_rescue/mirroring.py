@@ -18,11 +18,13 @@ anything else there is moved aside once the new version is verified. A copy that
 itself can is recorded as a `corrupt` finding and handled as such, so it is read at most once: no later pass or run
 reads it again. Paths with no cloud counterpart are never looked at.
 
-A file larger than the policy's segment threshold is downloaded as several segments, ranged fetches running in
-parallel into one partial file, which is preallocated to the file's size first and, with partial files in the
-destination, read back in full to be verified once every segment is in; any other file is one stream, there verified
-by the digest computed as it arrives. The segments are fixed when the download starts and kept by every later turn of
-it.
+A file larger than the policy's segment threshold, in a partial folder whose filesystem keeps sparse files, is
+downloaded as several segments, ranged fetches running in parallel into one partial file, which is preallocated to the
+file's size first and, with partial files in the destination, read back in full to be verified once every segment is
+in; any other file is one stream, there verified by the digest computed as it arrives. In a partial folder without
+sparse files (HFS+, exFAT, FAT), where extending a file writes its zeros first, a new download is always one stream,
+so its partial file is only appended to. The segments are fixed when the download starts and kept by every later turn
+of it.
 
 Every download keeps a checkpoint journal in the manifest: for each segment, the offset up to which its bytes were
 fsynced and the SHA-256 of those bytes. A checkpoint is taken every `checkpoint_bytes` a segment receives,
@@ -327,7 +329,7 @@ def size_mismatch(identity: RemoteIdentity, size: int) -> str:
 class TransferPolicy:
     """How files are fetched: up to `retries` immediate retries of each segment after new data in each pass, a
     checkpoint after every `checkpoint_bytes` a segment receives, and a new download of a file larger than
-    `segment_threshold` bytes split into `segments` segments."""
+    `segment_threshold` bytes split into `segments` segments in a partial folder with sparse files."""
 
     retries: int
     checkpoint_bytes: int
@@ -1090,8 +1092,9 @@ async def download_file(
     The entry's download record is read from `mirror` when the turn starts. A partial file whose `partial` record
     is for the entry's identity is resumed, segment by segment, from its journal's confirmed offsets after
     `client.resource` confirms the cloud file still has it and each segment's confirmed bytes hash to the recorded
-    digest; any other partial file is started again from byte 0 with the segments of `policy`. Checkpoints and
-    immediate retries follow `policy`, as described in the module.
+    digest; any other partial file is started again from byte 0 with the segments of `policy` (one segment in a
+    partial folder without sparse files). Checkpoints and immediate retries follow `policy`, as described in the
+    module.
 
     Raises `FileDeferred` when the transfer failed transiently and a later pass may finish it, `FileQuarantined`
     when the downloaded file failed verification, `FileFailed` when this file cannot be mirrored, `DestinationError`
@@ -1481,7 +1484,8 @@ async def _resume(
     A `partial` record for `identity` in the manifest now is kept once the cloud file is confirmed to still have that
     identity, with the segments it was started with. Each segment keeps the bytes its journal confirms when the
     partial file holds them and they hash to the recorded digest; otherwise that segment is reset to its start in
-    the journal. Any other record is replaced by a new `partial` one with the segments of `policy`'s plan.
+    the journal. Any other record is replaced by a new `partial` one with the segments of `policy`'s plan, one
+    segment in a partial folder without sparse files.
 
     Raises `FileFailed`, with the partial file and its record dropped, when the cloud file changed or is gone. That
     check runs for a journal confirming nothing too: an earlier attempt that received nothing usable may have met
@@ -1490,7 +1494,7 @@ async def _resume(
     size = identity.size
     record = mirror.download(entry.entry_id)
     if record is None or record.state != 'partial' or record.identity != identity:
-        segments = segment_plan(size, segments=policy.segments, threshold=policy.segment_threshold)
+        segments = segment_plan(size, segments=_segments(policy, destination), threshold=policy.segment_threshold)
         mirror.record_partial(entry.entry_id, identity, segments)
         return _streams(segments, size)
     try:
@@ -1521,6 +1525,12 @@ async def _resume(
     if [stream.written for stream in streams] != [segment.confirmed for segment in record.segments]:
         mirror.checkpoint(entry.entry_id, [stream.segment() for stream in streams])
     return streams
+
+
+def _segments(policy: TransferPolicy, destination: Destination) -> int:
+    """The segments of a new download's plan: `policy`'s in a partial folder with sparse files, one otherwise, so a
+    partial file is only appended to and its filesystem writes no zeros ahead of the data."""
+    return policy.segments if destination.sparse_partials else 1
 
 
 def _movable(segments: Sequence[Segment], held: int) -> list[Segment]:

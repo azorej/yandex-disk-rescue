@@ -17,7 +17,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager, closing, contextmanager
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from pathlib import Path, PurePosixPath
@@ -131,11 +131,12 @@ def _separate_folder(dest, partial_root):
 
 def _partials(dest, partial_root=None) -> list:
     """The partial files of `dest`: in its own partial folder, or in its folder below `partial_root`, without the
-    run's transient rename probes."""
+    run's transient probes."""
     folder = dest / '.yandex-disk-rescue' / 'partial' if partial_root is None else _separate_folder(dest, partial_root)
     if not folder.is_dir():
         return []
-    return sorted(path for path in folder.iterdir() if path.name not in destination_module._PROBE_NAMES)
+    transient = (*destination_module._PROBE_NAMES, destination_module._SPARSE_PROBE_NAME)
+    return sorted(path for path in folder.iterdir() if path.name not in transient)
 
 
 def _partial_sizes(dest) -> list[int]:
@@ -186,6 +187,52 @@ def _io_log(monkeypatch, calls: tuple[str, ...]) -> list[tuple[str, str, int, in
     for call in calls:
         monkeypatch.setattr(os, call, logged(call))
     return log
+
+
+@dataclass
+class ZeroFill:
+    """The zeros an emulated filesystem without sparse files wrote, by the name of the file it extended."""
+
+    written: dict[str, int] = field(default_factory=dict)
+
+
+@pytest.fixture
+def non_sparse(monkeypatch) -> Callable[[Path], ZeroFill]:
+    """`emulate(folder)` makes the files below `folder` behave as on a filesystem without sparse files (HFS+, exFAT,
+    FAT), as Linux `hfsplus` does: an `os.ftruncate` that extends a file, or an `os.pwrite` past its end, first writes
+    the zeros of the gap, one call at a time. There is no such filesystem an unprivileged test can mount; everything
+    else is real: the files, their `st_blocks`, the fake server and the CLI."""
+    ftruncate, pwrite = os.ftruncate, os.pwrite
+    lock = threading.Lock()
+
+    def emulate(folder: Path) -> ZeroFill:
+        zero_fill = ZeroFill()
+
+        def fill_to(fd: int, end: int) -> None:
+            path = os.readlink(f'/proc/self/fd/{fd}')
+            offset = os.fstat(fd).st_size
+            if not _below(path, folder) or end <= offset:
+                return
+            name = Path(path).name
+            zero_fill.written[name] = zero_fill.written.get(name, 0) + end - offset
+            while offset < end:
+                offset += pwrite(fd, bytes(min(MiB, end - offset)), offset)
+
+        def extending_ftruncate(fd: int, length: int) -> None:
+            with lock:
+                fill_to(fd, length)
+                ftruncate(fd, length)
+
+        def extending_pwrite(fd: int, data, offset: int) -> int:
+            with lock:
+                fill_to(fd, offset)
+                return pwrite(fd, data, offset)
+
+        monkeypatch.setattr(os, 'ftruncate', extending_ftruncate)
+        monkeypatch.setattr(os, 'pwrite', extending_pwrite)
+        return zero_fill
+
+    return emulate
 
 
 def _below(path: str, folder) -> bool:
@@ -594,6 +641,8 @@ def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and
     assert failed['path'] == 'disk:/Checks/short.bin'
     assert failed['reason'].startswith('the download failed: ')
     assert (document['partial_dir'], document['partial_move'], document['partial_room']) == (None, None, None)
+    assert document['sparse_partials'] is True
+    assert f'Partial folder {_own_partial_folder(dest)} keeps sparse files: yes' in log_messages()
     assert document['partials_left'] == []
     report = stderr_lines(result.stderr)
     assert report[report.index('Failed: 1') + 1] == f'  disk:/Checks/short.bin: {failed["reason"]}'
@@ -3431,6 +3480,77 @@ def test_a_file_above_the_segment_threshold_is_fetched_as_parallel_segments_tili
     assert local.stat().st_mtime_ns == _mtime_ns(MODIFIED)
     assert _partials(dest) == []
     assert _journal() == []
+
+
+def _own_partial_folder(dest) -> Path:
+    return dest.resolve() / '.yandex-disk-rescue' / 'partial'
+
+
+def _one_stream_headline(folder) -> str:
+    return f'Partial files in {folder} cannot be sparse: new downloads are fetched as one stream each, not as segments.'
+
+
+@pytest.mark.parametrize('partials', ['in-dest', 'separate'])
+def test_a_partial_folder_without_sparse_files_gets_each_file_as_one_stream_without_zero_fill(
+    segmented, dest, non_sparse, request, partials
+):
+    """DEST is on a filesystem without sparse files; with a partial folder, the partial files are on `/dev/shm`,
+    which keeps them."""
+    partial_root = request.getfixturevalue('partial_root') if partials == 'separate' else None
+    zero_fill = non_sparse(dest)
+
+    result = run_download('--json', *SEGMENTED_ARGS, *_partial_args(partial_root), 'disk:/Seg', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert (dest / 'large.bin').read_bytes() == SEGMENTED
+    assert _journal() == []
+    document = json.loads(result.stdout)
+    notices = stderr_lines(result.stderr)
+    if partial_root is None:
+        folder = _own_partial_folder(dest)
+        assert _fetches(segmented, SEGMENTED_PATH) == [None]
+        assert zero_fill.written == {destination_module._SPARSE_PROBE_NAME: MiB}
+        assert _one_stream_headline(folder) in notices
+        assert notices.index(_one_stream_headline(folder)) > notices.index(f'Downloading 1 file (4.0 MiB) to {dest}')
+        assert document['sparse_partials'] is False
+        assert f'Partial folder {folder} keeps sparse files: no' in log_messages()
+    else:
+        folder = _separate_folder(dest, partial_root)
+        assert sorted(_fetches(segmented, SEGMENTED_PATH)) == SEGMENT_RANGES
+        assert zero_fill.written == {}
+        assert not [line for line in notices if 'cannot be sparse' in line]
+        assert document['sparse_partials'] is True
+        assert f'Partial folder {folder} keeps sparse files: yes' in log_messages()
+
+
+def test_the_partial_folder_probe_reports_sparse_files_and_leaves_nothing_behind(dest, non_sparse):
+    with Destination.open(dest, partial_dir=None) as destination:
+        assert destination.sparse_partials is True
+        assert list(destination.partial_folder.iterdir()) == []
+    non_sparse(dest)
+
+    with Destination.open(dest, partial_dir=None) as destination:
+        assert destination.sparse_partials is False
+        assert list(destination.partial_folder.iterdir()) == []
+
+
+def test_a_probe_error_in_the_separate_partial_folder_names_that_folder(disk, dest, partial_root, monkeypatch):
+    folder = _separate_folder(dest, partial_root)
+    ftruncate = os.ftruncate
+
+    def full(fd: int, length: int) -> None:
+        if _below(os.readlink(f'/proc/self/fd/{fd}'), folder):
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+        ftruncate(fd, length)
+
+    monkeypatch.setattr(os, 'ftruncate', full)
+
+    result = run_download('--partial-dir', str(partial_root), str(dest))
+
+    assert result.exit_code == 1
+    assert stderr_lines(result.stderr) == [f'Error: Could not write {folder}: {os.strerror(errno.ENOSPC)}.']
+    assert _transfers(disk) == []
+    assert list(folder.iterdir()) == []
 
 
 def _segments_confirmed(at_least: int) -> bool:

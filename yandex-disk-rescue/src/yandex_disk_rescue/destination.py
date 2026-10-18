@@ -5,7 +5,8 @@ Partial files live in the destination's own `.yandex-disk-rescue/partial/`, or, 
 destination's own folder below it. In the first layout a finished partial file is itself placed or quarantined; in
 the second it is first copied to a staged copy in the destination's `partial/`, which is then placed or quarantined.
 The partial folder an earlier run used, either layout, opens to read and delete the partial files left there. The
-free space of the partial folder's filesystem and the bytes each partial file allocates there can be looked up.
+free space of the partial folder's filesystem and the bytes each partial file allocates there can be looked up, and
+opening the destination probes whether that filesystem keeps sparse files.
 
 All operations go through open folder descriptors and `localfs`, so none follows a symbolic link inside the
 destination; the destination itself may be a link and is resolved once. Final paths only ever receive a finished
@@ -21,7 +22,7 @@ import os
 import re
 import stat
 from collections.abc import Collection, Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from types import TracebackType
@@ -38,6 +39,8 @@ QUARANTINE_DIR_NAME = 'quarantine'
 _STAMP_FORMAT = '%Y-%m-%dT%H-%M-%SZ'
 _READ_SIZE = 1 << 20
 _PROBE_NAMES = ('probe', 'probe.renamed')
+_SPARSE_PROBE_NAME = 'probe.sparse'
+_SPARSE_PROBE_SIZE = 1 << 20
 _COPY_SUFFIX = '.copy'
 _COPY_NAME = re.compile(r'[0-9]+\.copy')
 _KEY_DIGITS = 16
@@ -239,7 +242,8 @@ class Destination(_Tree):
     `quarantine` move. Things moved aside go to `.yandex-disk-rescue/replaced/<run start, UTC>/`, and quarantined
     files to `.yandex-disk-rescue/quarantine/<run start, UTC>/`, each created on its first move under a name no
     earlier run took; `replaced_folder` and `quarantine_folder` are those folders relative to the destination once
-    they exist.
+    they exist. `sparse_partials` tells whether the filesystem of `partial_folder` keeps sparse files, as probed when
+    the destination opened.
 
     An error in the work directory or the partial folder that every file would meet (a full disk, an I/O error, a
     read-only filesystem, a permission error) raises `DestinationError` with the action that failed: `read`, `write`
@@ -258,6 +262,7 @@ class Destination(_Tree):
         partial_fd: int,
         *,
         separate: tuple[int, Path] | None,
+        sparse: bool,
         started: datetime,
     ) -> None:
         super().__init__(path, root_fd)
@@ -265,6 +270,7 @@ class Destination(_Tree):
         self._lock_fd = lock_fd
         self._partial_fd = partial_fd
         self._separate = separate
+        self._sparse = sparse
         self._started = started
         self._run_folders: dict[str, tuple[int, PurePosixPath]] = {}
         self._previous_fds: list[int] = []
@@ -273,10 +279,13 @@ class Destination(_Tree):
     def open(cls, path: Path, *, partial_dir: Path | None) -> Destination:
         """Create `path` if it is missing (its last component only), take the run lock in its work directory and
         check the filesystem supports the no-replace rename; with `partial_dir` (as `check_partial_dir` returns it),
-        create the destination's own folder below it if it is missing, named by `partial_folder_key`.
+        create the destination's own folder below it if it is missing, named by `partial_folder_key`. Then probe
+        whether the partial folder's filesystem keeps sparse files: a file there extended with `ftruncate` to 1 MiB
+        allocates less than 1 MiB. The probe file, `probe.sparse`, is deleted before `open` returns.
 
         Raises `RescueError` when another run holds the lock and `DestinationError` when the destination or the
-        folder below `partial_dir` cannot be written, or the destination lacks the no-replace rename.
+        folder below `partial_dir` cannot be written, or the destination lacks the no-replace rename; an error of the
+        probe names the partial folder.
         """
         started = datetime.now(UTC)
         fds: list[int] = []
@@ -290,13 +299,15 @@ class Destination(_Tree):
             _probe_noreplace(fds[3], resolved)
             if partial_dir is not None:
                 separate = _separate_folder(partial_dir, partial_folder_key(resolved))
+            own = (fds[3], resolved / WORK_DIR_NAME / PARTIAL_DIR_NAME)
+            sparse = _probe_sparse(*(own if separate is None else separate))
         except OSError as exc:
             _close_all(fds)
             raise DestinationError.of('write', path, exc) from None
         except BaseException:
-            _close_all(fds)
+            _close_all(fds if separate is None else [*fds, separate[0]])
             raise
-        return cls(resolved, *fds, separate=separate, started=started)
+        return cls(resolved, *fds, separate=separate, sparse=sparse, started=started)
 
     @property
     def partial_folder(self) -> Path:
@@ -307,6 +318,12 @@ class Destination(_Tree):
     def separate_partials(self) -> bool:
         """Whether partial files live below a partial folder of their own, not in the destination."""
         return self._separate is not None
+
+    @property
+    def sparse_partials(self) -> bool:
+        """Whether the filesystem of `partial_folder` keeps sparse files, so extending a partial file writes no
+        zeros."""
+        return self._sparse
 
     @property
     def replaced_folder(self) -> PurePosixPath | None:
@@ -866,6 +883,25 @@ def _probe_noreplace(partial_fd: int, destination: Path) -> None:
         raise unsupported
     for name in _PROBE_NAMES:
         os.unlink(name, dir_fd=partial_fd)
+
+
+def _probe_sparse(dir_fd: int, folder: Path) -> bool:
+    """Whether the filesystem of the open folder `dir_fd` at `folder` keeps sparse files: a file extended there with
+    `ftruncate` to `_SPARSE_PROBE_SIZE` bytes allocates fewer. Any error raises `DestinationError` naming `folder`."""
+    try:
+        with suppress(FileNotFoundError):
+            os.unlink(_SPARSE_PROBE_NAME, dir_fd=dir_fd)
+        flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(_SPARSE_PROBE_NAME, flags, 0o600, dir_fd=dir_fd)
+        try:
+            os.ftruncate(fd, _SPARSE_PROBE_SIZE)
+            allocated = os.fstat(fd).st_blocks * 512
+        finally:
+            os.close(fd)
+            os.unlink(_SPARSE_PROBE_NAME, dir_fd=dir_fd)
+    except OSError as exc:
+        raise DestinationError.of('write', folder, exc) from None
+    return allocated < _SPARSE_PROBE_SIZE
 
 
 def _touch(name: str, dir_fd: int) -> None:
