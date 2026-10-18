@@ -27,7 +27,8 @@ account to local storage. It is a headless analogue of the Windows app
   SHA-256. Failures are reported, never silently skipped, and a copy that
   fails the check is kept in quarantine, never deleted. `verify` re-hashes a
   mirror later, offline, and the next `download` repairs what it finds.
-- **CLI only.** Scriptable, cron- and systemd-friendly, no GUI.
+- **CLI only.** Scriptable, [cron- and systemd-friendly](#running-unattended),
+  no GUI.
 
 This is an independent, unofficial tool. It is not affiliated with Yandex.
 
@@ -71,7 +72,8 @@ Then set its ClientID with the `client_id` option (`--client-id ID`, see
 ### Automation
 
 For cron, systemd or CI, set `YANDEX_DISK_RESCUE_TOKEN` (for example with a
-systemd `EnvironmentFile=`) instead of running `auth login`.
+systemd `EnvironmentFile=`) instead of running `auth login`. The rest of the
+setup is in [Running unattended](#running-unattended).
 
 ### Where the token comes from
 
@@ -1008,6 +1010,164 @@ read; `counts` cover the whole pass):
 `repair_quarantined` is set when the download meant to repair a finding was
 quarantined (the summary's `; repair quarantined: …; kept at …`).
 
+## Running unattended
+
+A long mirror runs for days, so it usually runs without a terminal. Off a
+terminal, stderr gets a timestamped status line every `progress_interval`
+seconds (default 60) instead of the live view, and every run appends to the
+[log file](#output-and-logs) whatever the flags. The examples run as an
+ordinary user who has run `yandex-disk-rescue auth login` once (or who sets
+`YANDEX_DISK_RESCUE_TOKEN`; see [Automation](#automation)). systemd and cron
+need the command's absolute path, which `command -v yandex-disk-rescue`
+prints; the examples assume `~/.local/bin/yandex-disk-rescue`.
+
+When DEST is a slow disk (a USB hard disk, a network share), add
+`--partial-dir` with a folder on a fast local disk, or set `partial_dir` in
+the [config file](#configuration) so every way of running uses it (see
+[Partial files](#downloading)). Pick a persistent folder, not a `tmpfs` such
+as `/tmp` on many systems: the partial files must survive a reboot for the
+next run to resume them.
+
+### In the background with nohup
+
+```bash
+nohup yandex-disk-rescue download disk:/ /mnt/backup < /dev/null > download.out 2> download.err &
+tail -f download.err
+tail -f ~/.local/state/yandex-disk-rescue/yandex-disk-rescue.log
+```
+
+- `download.out` gets the report as the run goes: the start lines, the scan
+  summary, then the final summary and the `Manifest:` and `Log:` lines. It
+  stays small.
+- `download.err` gets the status lines, the notices and the final `Error: …`
+  or `Interrupted; …` line, each with its UTC time. A status line is about 200
+  bytes, so each phase adds about 300 KB a day at the default interval;
+  `--progress-interval 600` writes one every 10 minutes instead.
+- The log file gets the same notices and status lines and the full summary.
+  It is rotated at 10 MiB and keeps five older files, so it never takes more
+  than 60 MiB.
+- `< /dev/null` keeps `nohup` from writing `nohup: ignoring input` into
+  `download.err`.
+
+`verify` runs the same way. Started from an interactive shell, `kill -INT
+<pid>` stops the run as Ctrl+C does: it takes its last checkpoints, prints
+`Interrupted; …` and exits with 130, and the next run continues from there.
+A background job that a script starts has SIGINT ignored, so there `kill
+-INT` does nothing. SIGTERM, the default of `kill`, ends the run at once
+with no last checkpoint; the next run still resumes, fetching again what
+arrived since the last checkpoint of each file in progress.
+
+### As a systemd user service
+
+`~/.config/systemd/user/yandex-disk-rescue.service`:
+
+```ini
+[Unit]
+Description=Mirror Yandex Disk to /mnt/backup
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/yandex-disk-rescue download -q --json disk:/ /mnt/backup
+StandardOutput=append:%h/yandex-disk-rescue.json
+StandardError=journal
+TimeoutStartSec=infinity
+KillSignal=SIGINT
+TimeoutStopSec=5min
+SuccessExitStatus=130
+```
+
+`~/.config/systemd/user/yandex-disk-rescue.timer`:
+
+```ini
+[Unit]
+Description=Mirror Yandex Disk to /mnt/backup every day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+sudo loginctl enable-linger "$USER"
+systemctl --user daemon-reload
+systemctl --user enable --now yandex-disk-rescue.timer
+systemctl --user start --no-block yandex-disk-rescue.service   # a run now
+journalctl --user -u yandex-disk-rescue.service
+systemctl --user stop yandex-disk-rescue.service
+```
+
+- `ExecStart` takes the command's absolute path (`%h` is your home folder).
+  To pass the token by environment instead of the token file, add
+  `EnvironmentFile=%h/.config/yandex-disk-rescue/env` with a line
+  `YANDEX_DISK_RESCUE_TOKEN=…` in that file (mode `0600`).
+- `Type=oneshot` makes the unit active for as long as the run lasts.
+  `TimeoutStartSec=infinity` is needed because a oneshot's start timeout
+  would otherwise kill a run that lasts days. `systemctl start` waits for a
+  oneshot to finish, hence `--no-block`.
+- `KillSignal=SIGINT` makes `systemctl stop` (and a shutdown) stop the run
+  as Ctrl+C does, with its last checkpoints; the default, SIGTERM, ends it at
+  once. `TimeoutStopSec` is how long systemd waits after it before it sends
+  SIGKILL. `SuccessExitStatus=130` counts a stopped run as a clean stop, not a
+  failure.
+- `loginctl enable-linger` starts your user's systemd instance at boot and
+  keeps it after you log out, so the timer fires and the run goes on without
+  a login session.
+- The timer starts the service once a day, and `Persistent=true` catches up
+  a start missed while the machine was off. A run still going when the timer
+  fires again is not started a second time.
+- stdout, the JSON document, is appended to `~/yandex-disk-rescue.json`, one
+  document per run; with `--json` the human report goes to stderr, and `-q`
+  leaves nothing there but the final `Error: …` or `Interrupted; …` line (and
+  the log-file warning, if a log write fails). So the journal holds just
+  that. Without `-q` the journal also gets the notices and the human report;
+  add `--no-progress` then to keep the status line a minute out of it (the
+  log file still gets them).
+- Stopped with `systemctl stop`, the run still writes its JSON document,
+  with `exit_code` 130.
+- A run that exits `1` (files failed or were quarantined, or an error)
+  leaves the unit failed: `systemctl --user --failed` lists it, and
+  `OnFailure=` in `[Unit]` can start a unit that tells you.
+
+### From cron
+
+```bash
+# crontab -e: every day at 03:30
+30 3 * * * $HOME/.local/bin/yandex-disk-rescue download -q --json disk:/ /mnt/backup >> $HOME/yandex-disk-rescue.json
+```
+
+- The exit code is the signal: `0` when every file is verified, `1` when
+  files failed or were quarantined or the run hit an error (see
+  [Exit codes](#exit-codes)). cron does not look at it, but it mails what a
+  command writes, and with `-q` and stdout in a file a run writes nothing
+  but its `Error: …` line (and the log-file warning, if a log write fails).
+  So a mail arrives only for a run that did not exit `0`.
+- A run that starts while the last one still goes on exits `1` at once with
+  `Error: Another yandex-disk-rescue run is using …; wait for it to finish
+  and try again.`; the running one is not disturbed.
+- Each run appends one JSON document to the file.
+
+### Checking a run afterwards
+
+- **The summary.** The log file holds every run's full summary, every list
+  complete, and the end of each run, `completed (exit 0)` or `failed (exit N):
+  <error>`. `grep -E ' (WARNING|ERROR) ' <log>` lists every notice (each
+  file that failed or was quarantined, each `verify` finding) and the end of
+  every run that failed or was interrupted. Under `nohup`, the summary is
+  also in `download.out`.
+- **The JSON documents.** `jq` reads a file of appended documents as a stream:
+
+  ```bash
+  jq -c '{finished_at, exit_code, error: .error.message}' ~/yandex-disk-rescue.json   # one line per run
+  jq -s 'last | {counts, failed: [.failed[]?.path]}' ~/yandex-disk-rescue.json        # the latest run
+  ```
+
+  `jq` shows a name that is not valid Unicode with U+FFFD (`�`) in place of
+  each `\udcxx` escape. The file keeps the escape, and Python's `json`
+  module, for one, reads it back as the exact name.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -1073,7 +1233,9 @@ first one that sets it wins:
 The `api_*` options apply to every command that talks to the Disk API
 (`auth login`, `auth status`, `scan`, `download`); the `download_*` options,
 `partial_dir` and `scan_max_age` apply to `download`, `progress_interval` to
-`scan`, `download` and `verify`, and `client_id` to `auth login`.
+`scan`, `download` and `verify`, and `client_id` to `auth login`. `verify`
+never talks to the Disk API and takes no `api_*` option, and `auth logout`
+takes no option.
 `--partial-dir ''` keeps partial files in DEST whatever the config file says;
 an empty environment variable counts as unset, as for every option.
 
