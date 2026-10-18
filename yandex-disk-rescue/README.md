@@ -161,11 +161,11 @@ yandex-disk-rescue/
 │   │                 #   to `download_connections` files in progress at once (files with failure records started
 │   │                 #   last, fewest failed turns first), after moving the confirmed bytes of the downloads in
 │   │                 #   progress when the partial folder changed since the last run (one whose old partial file
-│   │                 #   cannot be read starting again from byte 0) and, with separate partial
-│   │                 #   files, admission to the partial folder's room (measured once, idle partial files counting
-│   │                 #   what they allocate, each fetched file its full size, in the order files start: wait, defer
-│   │                 #   to the next pass, or fail a file larger than the room, and every file deferred for room at
-│   │                 #   once when a pass changed nothing in it),
+│   │                 #   cannot be read starting again from byte 0) and, with separate partial files, admission to
+│   │                 #   the partial folder's room (measured once, idle partial files counting what they allocate,
+│   │                 #   each fetched file its full size, in the order files start: wait, defer to the next pass,
+│   │                 #   or fail a file larger than the room, and every file deferred for room at once when a pass
+│   │                 #   changed nothing in it),
 │   │                 #   one placement lock over each check-clear-place-record of a final path, one hash of
 │   │                 #   bytes on disk at a time per folder (re-hashing confirmed bytes, a read-back, a local
 │   │                 #   copy), the first run-stopping error raised as itself once the other files are
@@ -181,7 +181,7 @@ yandex-disk-rescue/
 │   │                 #   ignores a range;
 │   │                 #   verify, by reading a segmented file back, or with separate partial files by
 │   │                 #   copying the finished file to its staged copy in DEST, one copy of the run at a time,
-│   │                 #   hashing the bytes copied; a partial file that cannot be read while its folder can
+│   │                 #   hashing the bytes copied; a partial file that cannot be read while its folder can is
 │   │                 #   emptied and downloaded again from byte 0, at most once per file per run, the run
 │   │                 #   stopped when the folder is gone; quarantining a file that fails; move aside
 │   │                 #   what is in the way, place, record), the rejected-name conversion of a folder or
@@ -193,20 +193,20 @@ yandex-disk-rescue/
 │   │                 #   failure records written and counted as each turn fails (also one deferred to a
 │   │                 #   later pass) and dropped as entries succeed, with the silent streak of turns that got
 │   │                 #   no byte (throttling and turns deferred for a failed Disk API request neither count
-│   │                 #   nor break it) and the unavailable-on-Yandex-Disk
-│   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, each failure
-│   │                 #   flagged `on_yandex` when its cause is on Yandex's side, the summary lines (with the
-│   │                 #   previews saved and not saved or deleted, and the partial files that could not be deleted once
-│   │                 #   their file was recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
-│   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
-│   │                 #   stay on the event loop; `mirror_document`, the run's JSON object
+│   │                 #   nor break it) and the unavailable-on-Yandex-Disk reason once it spans `UNAVAILABLE_TURNS`
+│   │                 #   turns over `UNAVAILABLE_AGE`, each failure flagged `on_yandex` when its cause is on
+│   │                 #   Yandex's side, the summary lines (with the previews saved and not saved or deleted, and
+│   │                 #   the partial files that could not be deleted once their file was recorded); disk work
+│   │                 #   (hashing, writes, preallocation, fsync, placement) runs in the run's worker threads, one
+│   │                 #   bounded call at a time, while the manifest and local names stay on the event loop;
+│   │                 #   `mirror_document`, the run's JSON object
 │   ├── previews.py   # The preview step at the end of a download run: unfinished previews a crash left and the
 │   │                 #   previews of files now verified deleted, then, with `fetch`, Yandex's XXXL preview of
 │   │                 #   each file failed on Yandex's side fetched (unless one for its current version is
 │   │                 #   saved), saved in a worker thread and recorded, up to `api_concurrency` files at once
 │   │                 #   (without `fetch`, only those saved already are listed); per-file preview errors, a step
-│   │                 #   that a rejected token or a full, failing or unwritable disk ends, and Ctrl+C or SIGTERM ending only
-│   │                 #   the step (a save in progress finished and recorded first)
+│   │                 #   that a rejected token or a full, failing or unwritable disk ends, and Ctrl+C or SIGTERM
+│   │                 #   ending only the step (a save in progress finished and recorded first)
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
 │   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each
 │   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded;
@@ -224,17 +224,16 @@ yandex-disk-rescue/
 │   │                 #   `partial/<id>.copy` a separate partial file is copied to (each left by a stopped run
 │   │                 #   deleted at the start of the next), the partial folder an earlier run used (reading,
 │   │                 #   deleting its partial files and its leftovers, whether it is this run's folder under
-│   │                 #   another path), the free space of the partial folder,
-│   │                 #   the bytes each partial file allocates there and whether its filesystem keeps sparse
-│   │                 #   files (probed on open), reading existing files, whether the
-│   │                 #   destination itself, the partial folder or an earlier run's partial folder is still
-│   │                 #   readable (`reachable`, `partial_folder_reachable`), a failed read of a partial file (`PartialReadError`),
-│   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
-│   │                 #   or staged copy into the run's `quarantine/` folder, placement, and the `previews/`
-│   │                 #   folder (saving a preview atomically, replacing an earlier one, removing it with the
-│   │                 #   folders it emptied), never through a link; which errors stop the run;
-│   │                 #   the read-only destination `verify` opens (lookups, reading files, the run lock when a
-│   │                 #   lock file exists, whether the destination itself is still readable)
+│   │                 #   another path), the free space of the partial folder, the bytes each partial file allocates
+│   │                 #   there and whether its filesystem keeps sparse files (probed on open), reading existing
+│   │                 #   files, whether the destination itself, the partial folder or an earlier run's partial
+│   │                 #   folder is still readable (`reachable`, `partial_folder_reachable`), a failed read of a
+│   │                 #   partial file (`PartialReadError`), folder creation, moving aside into the run's
+│   │                 #   `replaced/` folder, moving a partial file or staged copy into the run's `quarantine/`
+│   │                 #   folder, placement, and the `previews/` folder (saving a preview atomically, replacing an
+│   │                 #   earlier one, removing it with the folders it emptied), never through a link; which errors
+│   │                 #   stop the run; the read-only destination `verify` opens (lookups, reading files, the run
+│   │                 #   lock when a lock file exists, whether the destination itself is still readable)
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
 │   │                 #   folder or a file, mkdir, renameat2(RENAME_NOREPLACE) through ctypes; reading a chunk of
 │   │                 #   an open file and setting its times; the free space of a folder's filesystem

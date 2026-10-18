@@ -189,7 +189,7 @@ bytes of that one file. The issue allows either.
       this run)`;
     - `_preview_requests(disk) == []`;
     - the journal confirms nothing, and the other files are downloaded.
-  - `test_an_unreadable_partial_file_on_a_folder_that_is_gone_stops_the_run[EIO|ENODEV]`, partial files in DEST:
+  - `test_an_unreadable_partial_file_stops_the_run_when_every_file_would_fail[EIO|ENODEV]`, partial files in DEST:
     - For `EIO`, the injector first renames DEST away (as
       `test_an_unreadable_local_copy_on_a_disk_that_is_gone_stops_the_run` does), so `partial_folder_reachable()`
       really fails. For `ENODEV` it raises directly.
@@ -265,16 +265,19 @@ bytes of that one file. The issue allows either.
     `PartialReadError`.
 - **Behaviour to lock** (`yandex-disk-rescue/tests/test_download.py`):
   - Replace `test_an_error_reading_a_partial_file_being_moved_stops_the_run_naming_that_file` with
-    `test_an_unreadable_partial_file_being_moved_is_dropped_and_downloaded_again[EIO|EBADMSG]`. The setup is
-    `_leave_two_partials(disk, dest, None)`, with reads of `BIG`'s old partial file refused. The rerun passes
+    `test_an_unreadable_partial_file_being_moved_is_dropped_and_downloaded_again[EIO|EBADMSG-first|later]`. The setup
+    is `_leave_two_partials(disk, dest, None)`, with the first read of `BIG`'s old partial file refused (`first`), or
+    the reads of `SEGMENTED`'s past its first segment, once that segment is copied (`later`). The rerun passes
     `--partial-dir partial_root` and `SEGMENTED_ARGS`. Assertions:
     - exit 0, and the notice naming the old path once;
-    - `_fetches(BIG_PATH, earlier) == [None]`, and `SEGMENTED` fetches the four tails after `_SEGMENT_CUTS` (its
-      confirmed bytes were moved);
+    - the dropped file is fetched from its first byte, and the other one fetches only the tails after its confirmed
+      bytes (they were moved);
     - both files intact; the old folder holds no partial file, and `_partials(dest, partial_root) == []`;
     - with `--json`, `partial_move` reports `downloads: 2` and `size: 300_000 + sum(_SEGMENT_CUTS)` (the plan);
     - `log_messages()` has `Moved the partial files of 2 downloads in progress (<format_size(sum(_SEGMENT_CUTS))>)
-      from … to … in … s, 1 dropped as unreadable`.
+      from … to … in … s, 1 dropped as unreadable` (the other file's confirmed bytes), and the final `Moved:` status
+      line gives the same figure: a dropped file's bytes copied before the failure are taken back from the move's
+      progress (`MoveProgress.dropped`).
   - `test_a_partial_file_dropped_in_the_move_and_unreadable_again_fails_that_file`: the same setup, with every
     `pread` of `BIG`'s partial file refused, both the old one and the new one in `partial_root`. Since `BIG` is one
     stream, its only later read is its copy to DEST. Exit 1; `Failed: 1\n  disk:/Big/big.bin: could not read its

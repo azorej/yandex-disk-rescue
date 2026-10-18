@@ -949,19 +949,24 @@ class MirrorRun:
         copied; `None` when the old file could not be read.
 
         A read of the old file that fails while `source` is still reachable drops the download: a journal confirming
-        nothing is recorded, the new file is cut to 0 bytes, and the old file is deleted as a moved one is, so a crash
-        anywhere leaves a journal that trusts nothing; the entry joins the run's drops. A read failing as every other
-        file's would (see `_unreadable_drops`) stops the run, and the recorded folder is moved again by the next run."""
+        nothing is recorded, the new file is cut to 0 bytes, its bytes are taken back from `progress`, and the old file
+        is deleted as a moved one is, so a crash anywhere leaves a journal that trusts nothing; the entry joins the
+        run's drops. A read failing as every other file's would (see `_unreadable_drops`) stops the run, and the
+        recorded folder is moved again by the next run."""
         entry_id = entry.entry_id
         movable = _movable(segments, held)
         kept = [s if s in movable else Segment(s.start, s.end, s.start, None) for s in segments]
         if kept != list(segments):
             self._mirror.checkpoint(entry_id, kept)
-        moved: int | None = sum(segment.confirmed - segment.start for segment in movable)
+        size = sum(segment.confirmed - segment.start for segment in movable)
+        moved: int | None = size
+        copied = 0
         with source.partial(entry_id) as old, self._destination.partial(entry_id) as new:
 
             def write(offset: int, chunk: bytes) -> None:
+                nonlocal copied
                 new.write(offset, chunk)
+                copied += len(chunk)
                 progress.copied(len(chunk))
 
             await threads.run(new.truncate, 0)
@@ -972,6 +977,7 @@ class MirrorRun:
                 await _unreadable_drops(exc, entry, source.reachable, threads, self._dropped)
                 self._mirror.checkpoint(entry_id, [Segment(s.start, s.end, s.start, None) for s in segments])
                 await threads.run(new.truncate, 0)
+                progress.dropped(size, copied)
                 moved = None
             await threads.run(new.sync)
         await threads.run(self._destination.sync_partial_folder)

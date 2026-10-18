@@ -201,14 +201,14 @@ class MoveSnapshot:
 
 class MoveProgress:
     """The move of the partial files of downloads in progress to this run's partial folder: the files moved so far
-    and the confirmed bytes copied."""
+    and the confirmed bytes carried over. The speeds count every byte copied, also those of a file dropped later."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         now = time.monotonic()
         self._started_at = now
         self._started = False
-        self._files = self._size = self._moved = self._moved_size = 0
+        self._files = self._size = self._moved = self._moved_size = self._written = 0
         self._rate = _Rate(now, horizon=ETA_SECONDS)
 
     def start(self, files: int, size: int) -> None:
@@ -222,7 +222,15 @@ class MoveProgress:
         """`size` more confirmed bytes were copied to this run's partial folder."""
         with self._lock:
             self._moved_size += size
-            self._rate.note(time.monotonic(), self._moved_size)
+            self._written += size
+            self._rate.note(time.monotonic(), self._written)
+
+    def dropped(self, size: int, copied: int) -> None:
+        """A partial file of `size` confirmed bytes was dropped after `copied` of them were copied: none of them is
+        carried over any more."""
+        with self._lock:
+            self._size -= size
+            self._moved_size -= copied
 
     def moved(self) -> None:
         """One more partial file was moved."""
@@ -239,7 +247,7 @@ class MoveProgress:
                 moved=self._moved,
                 moved_size=self._moved_size,
                 elapsed=now - self._started_at,
-                speeds=Speeds.of(self._rate, now, self._started_at, self._moved_size),
+                speeds=Speeds.of(self._rate, now, self._started_at, self._written),
             )
 
 
