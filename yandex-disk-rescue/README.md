@@ -37,6 +37,7 @@ Tests: `mise run test -- yandex-disk-rescue/tests`.
 | `YANDEX_DISK_RESCUE_DOWNLOAD_SEGMENT_THRESHOLD_MIB` | Size above which a file is downloaded as segments, 1 to 65536 MiB (default 256). Same as `--download-segment-threshold-mib`. |
 | `YANDEX_DISK_RESCUE_PARTIAL_DIR` | Existing folder, an absolute path outside DEST, below which `download` keeps DEST's partial files (in `<folder>/<key>/`) and copies each finished one to DEST; empty counts as unset (default: partial files in DEST). Same as `--partial-dir`. |
 | `YANDEX_DISK_RESCUE_SCAN_MAX_AGE` | `download` reuses a covering scan younger than this, 0 to 10080 min (default 60; 0 always scans). Same as `--scan-max-age`. |
+| `YANDEX_DISK_RESCUE_PREVIEWS` | Whether `download` fetches Yandex's preview of each file that failed on Yandex's side: `true`/`false`, `1`/`0`, `yes`/`no` (default `true`). Same as `--previews/--no-previews`. |
 | `YANDEX_DISK_RESCUE_PROGRESS_INTERVAL` | Seconds between two status lines of `scan`, `download` and `verify`, on stderr and in the log file, 1 to 3600 (default 60). Same as `--progress-interval`. |
 | `XDG_CONFIG_HOME` | Parent of the config directory holding the token file and `config.toml` (default `~/.config`). |
 | `XDG_STATE_HOME` | Parent of the state directory holding the manifest and the log file (default `~/.local/state`). |
@@ -93,8 +94,13 @@ mirror up by its destination without creating one.
   `record_quarantined` keep it; `record_verified` (a new copy placed or adopted there), `Mirror.clear_finding` and
   removing the entry drop it. `Mirror.record_finding` replaces any earlier one, and
   `MirrorEntry.finding` reads it.
-- A rescan never touches names, records, failures, quarantine records or findings; removing an entry from the
-  manifest deletes them all.
+- A preview record (`previews`) holds the preview image saved for a file not downloaded: its path relative to the
+  destination, its byte size, its content type, the preview size it was asked for, and the remote identity it was
+  taken for. `Mirror.record_preview` replaces any earlier one and `Mirror.forget_preview` drops it; every other
+  record (`record_partial`, `checkpoint`, `record_verified`, `forget`, `record_failure`, `record_quarantined`,
+  `record_finding` and the `clear_*` calls) keeps it. `MirrorEntry.preview` reads it as a `PreviewRecord`.
+- A rescan never touches names, records, failures, quarantine records, findings or preview records; removing an
+  entry from the manifest deletes them all.
 - A verify pass (`verify_passes`, one row per mirror) is the `verify` in progress on the mirror: when it started and
   the Disk path of the last file whose check is committed (`checked_through`, `None` before the first).
   `Mirror.verify_pass` reads it, `Mirror.start_verify_pass` replaces it with a new one, `Mirror.checked_through`
@@ -135,9 +141,11 @@ yandex-disk-rescue/
 │   │   ├── download.py # The `download` command: arguments, whether to scan (`--scan-max-age`, `--no-scan`),
 │   │   │             #   destination and partial folder (`--partial-dir`), mirror run of every entry or of the
 │   │   │             #   retry set (`--retry-failed`), its start line, the move line and the move's status
-│   │   │             #   lines, the partial-folder line with its room once measured, summary, JSON object
-│   │   │             #   (the report's, with the scan, the files to download, the move and the room), exit code
-│   │   │             #   and interrupt message
+│   │   │             #   lines, the partial-folder line with its room once measured, the preview step once the
+│   │   │             #   transfers ended normally (fetching only with `--previews`; its `Saving the previews …`
+│   │   │             #   line and status lines), summary,
+│   │   │             #   JSON object (the report's, with the scan, the files to download, the move and the room),
+│   │   │             #   exit code and interrupt message
 │   │   └── verify.py # The `verify` command: the read-only destination, the existing manifest and its recorded
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, JSON
 │   │                 #   object with the pass, exit code and interrupt message; no token, no network
@@ -176,15 +184,24 @@ yandex-disk-rescue/
 │   │                 #   failure records written and counted as each turn fails (also one deferred to a
 │   │                 #   later pass) and dropped as entries succeed, with the silent streak of turns that got
 │   │                 #   no byte (throttling neither counts nor breaks it) and the unavailable-on-Yandex-Disk
-│   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, the summary
-│   │                 #   lines (with the partial files that could not be deleted once their file was
-│   │                 #   recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
+│   │                 #   reason once it spans `UNAVAILABLE_TURNS` turns over `UNAVAILABLE_AGE`, each failure
+│   │                 #   flagged `on_yandex` when its cause is on Yandex's side, the summary lines (with the
+│   │                 #   previews saved and not saved or deleted, and the partial files that could not be deleted once
+│   │                 #   their file was recorded); disk work (hashing, writes, preallocation, fsync, placement) runs in the
 │   │                 #   run's worker threads, one bounded call at a time, while the manifest and local names
 │   │                 #   stay on the event loop; `mirror_document`, the run's JSON object
+│   ├── previews.py   # The preview step at the end of a download run: unfinished previews a crash left and the
+│   │                 #   previews of files now verified deleted, then, with `fetch`, Yandex's XXXL preview of
+│   │                 #   each file failed on Yandex's side fetched (unless one for its current version is
+│   │                 #   saved), saved in a worker thread and recorded, up to `api_concurrency` files at once
+│   │                 #   (without `fetch`, only those saved already are listed); per-file preview errors, a step
+│   │                 #   that a rejected token or a full, failing or unwritable disk ends, and Ctrl+C or SIGTERM ending only
+│   │                 #   the step (a save in progress finished and recorded first)
 │   ├── verifying.py  # The verify engine: each file of a mirror in path order on the calling thread, re-hashed
 │   │                 #   when verified for its current identity (intact, missing, modified, corrupt, each
 │   │                 #   finding recorded at once) or listed from the manifest (quarantined, not downloaded;
-│   │                 #   a finding with a quarantined repair stays under its finding, with the repair);
+│   │                 #   a finding with a quarantined repair stays under its finding, with the repair; a file
+│   │                 #   not downloaded names its saved preview, and nothing below `previews/` is opened);
 │   │                 #   stopping when the destination itself becomes unreadable; the pass's cursor, committed
 │   │                 #   every `CURSOR_SECONDS` and when it stops, so a later part reads only the files after
 │   │                 #   it while the report covers the whole pass; the summary lines and
@@ -202,8 +219,9 @@ yandex-disk-rescue/
 │   │                 #   files (probed on open), reading existing files, whether the
 │   │                 #   destination itself is still readable (`reachable`),
 │   │                 #   folder creation, moving aside into the run's `replaced/` folder, moving a partial file
-│   │                 #   or staged copy into the run's `quarantine/` folder, and placement, never through a
-│   │                 #   link; which errors stop the run;
+│   │                 #   or staged copy into the run's `quarantine/` folder, placement, and the `previews/`
+│   │                 #   folder (saving a preview atomically, replacing an earlier one, removing it with the
+│   │                 #   folders it emptied), never through a link; which errors stop the run;
 │   │                 #   the read-only destination `verify` opens (lookups, reading files, the run lock when a
 │   │                 #   lock file exists, whether the destination itself is still readable)
 │   ├── localfs.py    # Destination syscalls relative to folder descriptors, never following links: lstat, open a
@@ -222,13 +240,14 @@ yandex-disk-rescue/
 │   │                 #   (a tty, `TERM` neither dumb nor unknown); the engines and the API client log their own
 │   │                 #   records (failures, findings, per-file outcomes, passes, throttling) through
 │   │                 #   `logging.getLogger`
-│   ├── view.py       # The live view of one phase, drawn with rich `Live` on stderr: the status line, a bar (a
-│   │                 #   spinner for a scan), up to 10 files in progress with their speed or state, the file
+│   ├── view.py       # The live view of one phase, drawn with rich `Live` on stderr: the status line, a bar (of
+│   │                 #   the files handled in the preview step, a spinner for a scan), up to 10 files in progress with their speed or state, the file
 │   │                 #   `verify` reads; notices and report lines printed above it; cleared when the phase ends
 │   ├── progress.py   # Thread-safe progress states the engines update (ScanProgress, MoveProgress for the move of
 │   │                 #   partial files to a new partial folder, MirrorProgress with one ActiveFile per file in
 │   │                 #   progress, its state from waiting for room to copying to DEST, its speed over the last
-│   │                 #   10 s and how far its copy to DEST got, VerifyProgress), their snapshots and status lines;
+│   │                 #   10 s and how far its copy to DEST got, PreviewProgress for the preview step,
+│   │                 #   VerifyProgress), their snapshots and status lines;
 │   │                 #   speed over the last minute, ETA over the last 15 minutes; no I/O
 │   ├── logs.py       # The handlers of the `yandex_disk_rescue` logger: the rotating 0600 log file (turned off with
 │   │                 #   one notice when a write fails) and the notices on stderr (timestamped off a terminal),
@@ -244,18 +263,20 @@ yandex-disk-rescue/
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
 │   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure and quarantine records, findings, the verify pass and the folder of the
-│   │                 #   partial files per destination)
+│   │                 #   failure and quarantine records, findings, preview records, the verify pass and the
+│   │                 #   folder of the partial files per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
-│   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option
+│   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option;
+│   │                 #   bool options as `--x/--no-x` flags
 │   ├── config.py     # The config file: reading and validating `config.toml` against the registry
 │   ├── auth.py       # OAuth token: the authorization URL, resolution (env var, then 0600 file), the header-safety check
 │   └── api/
 │       ├── client.py # DiskClient — every Disk API request: the account check, one resource, paged folder listing,
-│       │             #   download links; error mapping (401/403, other statuses, transport errors, malformed
-│       │             #   bodies) and bounded retries
+│       │             #   download links, a file's preview link and the preview itself (the token only to the
+│       │             #   API's origin and `downloader.disk.yandex.ru`, no redirects); error mapping (401/403,
+│       │             #   other statuses, transport errors, malformed bodies) and bounded retries
 │       ├── limiter.py # The AdaptiveLimiter every DiskClient request shares: pacing, concurrency cap, Retry-After
-│       ├── models.py # Parsing of account, resource, folder-page and download-link bodies
+│       ├── models.py # Parsing of account, resource, folder-page, preview-link and download-link bodies
 │       ├── remote_paths.py # `disk:/` path normalization
 │       ├── errors.py # The RescueError subclasses of failed API requests
 │       ├── user_agent.py # USER_AGENT — the User-Agent every request sends: tool name, version, project URL
@@ -284,7 +305,8 @@ yandex-disk-rescue/
     ├── fake_disk_server.py # Real-socket fake Disk API and download host (stdlib only), started by `serve()` for
     │                       #   the length of a `with` block: an in-memory tree (`add_dir`, `add_file`,
     │                       #   `remove`) served by built-in `GET /v1/disk/`, `GET /v1/disk/resources` and the
-    │                       #   download-link endpoint; `page_cap`, `account`, `token`; the download host
+    │                       #   download-link endpoint; `page_cap`, `account`, `token`; previews (`/preview`,
+    │                       #   which needs the token; `redirect_previews`); the download host
     │                       #   (`/download`, `/storage`: Range, 400 to any Authorization header) and its faults
     │                       #   (`corrupt` and `repair`, `expire_links`, `ignore_range`, `redirect_downloads`, `chunk_delay`);
     │                       #   `inject`ed faults (statuses, delays, `Truncate`), matched by query parameters and

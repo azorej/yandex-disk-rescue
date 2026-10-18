@@ -619,7 +619,11 @@ def test_json_reports_a_run_with_the_counts_of_its_summary_and_every_failure_and
         'quarantined': 1,
         'failed': 1,
         'unavailable': 0,
+        'preview_only': 0,
+        'preview_errors': 0,
+        'previews_pending': 0,
     }
+    assert (document['preview_only'], document['preview_errors']) == ([], [])
     assert (document['schema_version'], document['command'], document['exit_code']) == (1, 'download', 1)
     assert document['error'] == {'message': '1 failed and 1 quarantined; see the lists above.'}
     assert (document['remote_root'], document['destination'], document['retry_failed']) == (
@@ -2151,6 +2155,529 @@ def test_a_file_yandex_restores_is_fetched_by_the_next_plain_run(dead, dest):
     assert local_file(dest, DEAD_PATH).read_bytes() == DEAD
     assert _others_verified(dest, DEAD_PATH)
     assert _failure_records() == []
+
+
+PHOTO_PREVIEW = b'\xff\xd8\xff\xe0 the napkin, reduced'
+PREVIEW_FILE = '.yandex-disk-rescue/previews/Dead/napkin.jpg.preview.jpg'
+SAVED_ONLY = 'Saved only as a preview (a reduced image, not verified)'
+
+
+@pytest.fixture
+def photo(disk):
+    """The `disk` tree plus `DEAD_PATH` with a preview."""
+    disk.add_file(DEAD_PATH, DEAD, modified=MODIFIED, preview=PHOTO_PREVIEW)
+    return disk
+
+
+def _failing_run(fake, dest, *args: str):
+    """A run with one pass whose download host answers 503 for `DEAD_PATH`."""
+    fake.inject('GET', '/download', 503, where={'path': DEAD_PATH})
+    return run_download('--download-passes', '1', *args, str(dest))
+
+
+def _second_failed_photo(fake) -> str:
+    """Add a second photo with a preview whose download host answers 503, and return its path."""
+    second = 'disk:/Dead/second.jpg'
+    fake.add_file(second, b'second', modified=MODIFIED, preview=PHOTO_PREVIEW)
+    fake.inject('GET', '/download', 503, where={'path': second})
+    return second
+
+
+def _preview_requests(fake, since: int = 0) -> list[str]:
+    """The preview requests after the first `since`: `meta <path>` for a resource request with `preview_size`,
+    `fetch <path>` for a request to the preview host."""
+    return [
+        f'{"fetch" if r.path == "/preview" else "meta"} {r.params["path"]}'
+        for r in fake.requests[since:]
+        if r.path == '/preview' or (r.path == '/v1/disk/resources' and 'preview_size' in r.params)
+    ]
+
+
+def _preview_records() -> list[tuple[str, str, int, str, str]]:
+    """The (remote path, preview path, bytes, content type, size name) of every preview record in the manifest."""
+    with closing(sqlite3.connect(f'{manifest_path().as_uri()}?mode=ro', uri=True)) as connection:
+        return connection.execute(
+            'SELECT e.path, p.path, p.bytes, p.content_type, p.size_name FROM previews p'
+            ' JOIN entries e ON e.id = p.entry_id ORDER BY e.path'
+        ).fetchall()
+
+
+def _mentions_previews(stdout: str) -> bool:
+    return any(
+        line in stdout
+        for line in ('Saving the previews', SAVED_ONLY, 'Previews not saved or deleted', 'Previews interr')
+    )
+
+
+def _previews_folder(dest) -> Path:
+    return dest / '.yandex-disk-rescue' / 'previews'
+
+
+def test_a_failed_photo_gets_its_preview_saved_apart_and_the_summary_says_so(photo, dest, tmp_path, monkeypatch):
+    result = _failing_run(photo, dest)
+
+    assert result.exit_code == 1
+    assert f'Saving the previews of 1 failed file to {_previews_folder(dest)}\n' in result.stdout
+    assert (
+        f'Failed: 1\n  {DEAD_PATH}: {SERVICE_UNAVAILABLE}\n{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n'
+    ) in result.stdout
+    assert 'Previews not saved or deleted' not in result.stdout
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+    assert not local_file(dest, DEAD_PATH).exists()
+    assert _others_verified(dest, DEAD_PATH)
+    assert _preview_records() == [(DEAD_PATH, PREVIEW_FILE, len(PHOTO_PREVIEW), 'image/jpeg', 'XXXL')]
+    assert _preview_requests(photo) == [f'meta {DEAD_PATH}', f'fetch {DEAD_PATH}']
+    [meta] = [r for r in photo.requests if 'preview_size' in r.params]
+    assert meta.params['preview_size'] == 'XXXL'
+    [fetched] = [r for r in photo.requests if r.path == '/preview']
+    assert fetched.headers['authorization'] == f'OAuth {TOKEN}'
+    assert stderr_lines(result.stderr)[-1] == 'Error: 1 failed; see the list above.'
+    assert f'{DEAD_PATH}: preview saved at {PREVIEW_FILE} ({format_size(len(PHOTO_PREVIEW))})' in log_messages()
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'json-state'))
+
+    twin = _failing_run(photo, tmp_path / 'twin', '--json')
+
+    assert twin.exit_code == 1
+    document = json.loads(twin.stdout)
+    counts = document['counts']
+    assert (counts['failed'], counts['preview_only'], counts['preview_errors'], counts['previews_pending']) == (
+        1,
+        1,
+        0,
+        0,
+    )
+    assert document['preview_only'] == [{'path': DEAD_PATH, 'preview': PREVIEW_FILE, 'bytes': len(PHOTO_PREVIEW)}]
+    assert document['preview_errors'] == []
+    assert document['failed'] == [{'path': DEAD_PATH, 'reason': SERVICE_UNAVAILABLE, 'unavailable': False}]
+
+
+def test_a_failed_file_without_a_preview_ends_failed_with_no_preview_and_no_error(disk, dest):
+    archive = 'disk:/Dead/archive.zip'
+    disk.add_file(archive, b'PK\x03\x04 zipped', modified=MODIFIED)
+    disk.inject('GET', '/download', 503, where={'path': archive})
+
+    result = run_download('--download-passes', '1', str(dest))
+
+    assert result.exit_code == 1
+    assert f'Failed: 1\n  {archive}: {SERVICE_UNAVAILABLE}\nManifest: ' in result.stdout
+    assert SAVED_ONLY not in result.stdout
+    assert 'Previews not saved or deleted' not in result.stdout
+    assert _preview_requests(disk) == [f'meta {archive}']
+    assert f'{archive}: no preview on Yandex Disk' in log_messages()
+    assert not _previews_folder(dest).exists()
+    assert _preview_records() == []
+
+
+def test_a_preview_already_saved_for_the_current_version_is_not_fetched_again(photo, dest):
+    assert _failing_run(photo, dest).exit_code == 1
+    earlier = len(photo.requests)
+
+    again = _failing_run(photo, dest)
+
+    assert again.exit_code == 1
+    assert _preview_requests(photo, earlier) == []
+    assert f'{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n' in again.stdout
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+    (dest / PREVIEW_FILE).unlink()
+
+    lost = _failing_run(photo, dest)
+
+    assert lost.exit_code == 1
+    assert len(_preview_requests(photo, earlier)) == 2
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+
+
+def test_a_new_version_that_fails_too_replaces_the_preview_of_the_old_one(photo, dest):
+    assert _failing_run(photo, dest).exit_code == 1
+    png = b'\x89PNG a newer napkin'
+    photo.add_file(DEAD_PATH, DEAD * 2, modified=MODIFIED, preview=png, preview_type='image/png')
+
+    result = _failing_run(photo, dest, '--scan-max-age', '0')
+
+    assert result.exit_code == 1
+    newer = PREVIEW_FILE.removesuffix('.jpg') + '.png'
+    assert f'{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {newer}\n' in result.stdout
+    assert (dest / newer).read_bytes() == png
+    assert not (dest / PREVIEW_FILE).exists()
+    assert _preview_records() == [(DEAD_PATH, newer, len(png), 'image/png', 'XXXL')]
+
+
+@pytest.mark.parametrize('retry_failed', [False, True], ids=['plain', 'retry-failed'])
+def test_once_the_original_downloads_its_preview_is_deleted(photo, dest, retry_failed):
+    assert _failing_run(photo, dest).exit_code == 1
+    earlier = len(photo.requests)
+
+    result = run_download(*(['--retry-failed'] if retry_failed else []), str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert local_file(dest, DEAD_PATH).read_bytes() == DEAD
+    assert not _mentions_previews(result.stdout)
+    assert not (dest / PREVIEW_FILE).exists()
+    assert list(_previews_folder(dest).iterdir()) == []
+    assert _preview_records() == []
+    assert _preview_requests(photo, earlier) == []
+    assert f'{DEAD_PATH}: its preview {PREVIEW_FILE} deleted' in log_messages()
+
+
+def test_no_previews_still_deletes_the_preview_of_a_file_now_downloaded(photo, dest, tmp_path, monkeypatch):
+    assert _failing_run(photo, dest).exit_code == 1
+    _second_failed_photo(photo)
+    earlier = len(photo.requests)
+
+    kept = _failing_run(photo, dest, '--no-previews', '--scan-max-age', '0', '--json')
+
+    assert kept.exit_code == 1
+    document = json.loads(kept.stdout)
+    assert document['previews'] is False
+    assert document['preview_only'] == [{'path': DEAD_PATH, 'preview': PREVIEW_FILE, 'bytes': len(PHOTO_PREVIEW)}]
+    assert (document['counts']['failed'], document['preview_errors']) == (2, [])
+    assert _preview_requests(photo, earlier) == []
+    assert 'Saving the previews' not in kept.stderr
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+
+    result = run_download('--no-previews', str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert local_file(dest, DEAD_PATH).read_bytes() == DEAD
+    assert not _mentions_previews(result.stdout)
+    assert list(_previews_folder(dest).iterdir()) == []
+    assert _preview_records() == []
+    assert _preview_requests(photo, earlier) == []
+    assert f'{DEAD_PATH}: its preview {PREVIEW_FILE} deleted' in log_messages()
+    assert json.loads(_failing_run(photo, tmp_path / 'twin', '--json').stdout)['previews'] is True
+
+
+def test_a_preview_left_unfinished_by_a_crash_is_deleted_by_the_next_run(photo, dest, tmp_path, monkeypatch):
+    assert _failing_run(photo, dest).exit_code == 1
+    preview = dest / PREVIEW_FILE
+    unfinished = [preview.parent / '0123456789abcdef.preview-saving', _previews_folder(dest) / 'f.preview-saving']
+    for path in unfinished:
+        path.write_bytes(b'half a preview')
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (outside / 'kept.preview-saving').write_bytes(b'not ours')
+    (preview.parent / 'linked').symlink_to(outside)
+    (preview.parent / 'link.preview-saving').symlink_to(outside / 'kept.preview-saving')
+    (preview.parent / 'folder.preview-saving').mkdir()
+
+    result = _failing_run(photo, dest, '--no-previews')
+
+    assert result.exit_code == 1
+    assert not any(path.exists() for path in unfinished)
+    assert (outside / 'kept.preview-saving').read_bytes() == b'not ours'
+    assert (preview.parent / 'link.preview-saving').is_symlink()
+    assert (preview.parent / 'folder.preview-saving').is_dir()
+    assert preview.read_bytes() == PHOTO_PREVIEW
+    assert '2 unfinished previews deleted' in log_messages()
+    unfinished[0].write_bytes(b'half a preview')
+    unlink = os.unlink
+
+    def refused(name, *args, **kwargs):
+        if str(name).endswith('.preview-saving'):
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+        unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'unlink', refused)
+
+    unreadable = _failing_run(photo, dest, '--no-previews')
+
+    assert unreadable.exit_code == 1
+    assert unfinished[0].exists()
+    assert f'{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n' in unreadable.stdout
+    denied = os.strerror(errno.EACCES)
+    assert f'Could not delete the unfinished previews in {_previews_folder(dest)}: {denied}' in stderr_lines(
+        unreadable.stderr
+    )
+
+
+@pytest.mark.parametrize(
+    ('route', 'where', 'reason'),
+    [
+        (
+            '/v1/disk/resources',
+            {'preview_size': 'XXXL'},
+            'Could not read the preview: Yandex Disk API returned HTTP 500: Injected HTTP 500 (after 2 attempts)',
+        ),
+        ('/preview', None, 'Could not fetch the preview: the preview host returned HTTP 500 (after 2 attempts)'),
+    ],
+    ids=['metadata', 'image'],
+)
+def test_a_preview_that_cannot_be_fetched_is_reported_and_the_run_is_unchanged(
+    photo, dest, tmp_path, route, where, reason
+):
+    photo.inject('GET', route, *[500] * 10, where=where)
+
+    result = _failing_run(photo, dest, '--api-retries', '1')
+
+    assert result.exit_code == 1
+    assert (
+        f'Failed: 1\n  {DEAD_PATH}: {SERVICE_UNAVAILABLE}\nPreviews not saved or deleted: 1\n  {DEAD_PATH}: {reason}\n'
+        in (result.stdout)
+    )
+    assert SAVED_ONLY not in result.stdout
+    assert stderr_lines(result.stderr)[-2:] == [
+        f'{DEAD_PATH}: preview not saved: {reason}',
+        'Error: 1 failed; see the list above.',
+    ]
+    assert _others_verified(dest, DEAD_PATH)
+    assert _preview_records() == []
+    assert list(_previews_folder(dest).rglob('*')) == []
+    earlier = len(photo.requests)
+
+    healthy = run_download('disk:/Photos', str(tmp_path / 'healthy'))
+
+    assert healthy.exit_code == 0, healthy.output
+    assert not _mentions_previews(healthy.stdout)
+    assert _preview_requests(photo, earlier) == []
+
+
+@pytest.mark.parametrize('code', [errno.ENOSPC, errno.EACCES], ids=['full-disk', 'permission'])
+def test_an_error_in_the_previews_folder_while_saving_a_preview_ends_the_preview_step_only(
+    photo, dest, monkeypatch, code
+):
+    second = _second_failed_photo(photo)
+    fsync = os.fsync
+
+    def refused(fd: int) -> None:
+        if os.readlink(f'/proc/self/fd/{fd}').endswith('.preview-saving'):
+            raise OSError(code, os.strerror(code))
+        fsync(fd)
+
+    monkeypatch.setattr(os, 'fsync', refused)
+
+    result = _failing_run(photo, dest, '--api-concurrency', '1')
+
+    assert result.exit_code == 1
+    reason = f'could not use previews in {_previews_folder(dest)}: {os.strerror(code)}'
+    assert f'Previews not saved or deleted: 2\n  {DEAD_PATH}: {reason}\n  {second}: {reason}\n' in result.stdout
+    assert _preview_requests(photo) == [f'meta {DEAD_PATH}', f'fetch {DEAD_PATH}']
+    assert _preview_records() == []
+    assert list(_previews_folder(dest).rglob('*.preview*')) == []
+    assert stderr_lines(result.stderr)[-1] == 'Error: 2 failed; see the list above.'
+
+
+def test_a_token_rejected_while_asking_for_a_preview_ends_the_preview_step_only(photo, dest):
+    second = _second_failed_photo(photo)
+    photo.inject('GET', '/v1/disk/resources', 401, where={'preview_size': 'XXXL'})
+
+    result = _failing_run(photo, dest, '--api-concurrency', '1')
+
+    assert result.exit_code == 1
+    reason = "Yandex rejected the token (invalid, expired or revoked). Run 'yandex-disk-rescue auth login' to store a new one."
+    assert f'Previews not saved or deleted: 2\n  {DEAD_PATH}: {reason}\n  {second}: {reason}\n' in result.stdout
+    assert _preview_requests(photo) == [f'meta {DEAD_PATH}']
+    assert _preview_records() == []
+    assert stderr_lines(result.stderr)[-1] == 'Error: 2 failed; see the list above.'
+
+
+@pytest.mark.parametrize(
+    ('code', 'failing'),
+    [
+        (errno.EBUSY, f'could not delete the preview {PREVIEW_FILE}'),
+        (errno.EACCES, 'could not use previews in {previews}'),
+    ],
+    ids=['busy', 'permission'],
+)
+def test_a_preview_of_a_verified_file_that_cannot_be_deleted_keeps_its_record(photo, dest, monkeypatch, code, failing):
+    assert _failing_run(photo, dest).exit_code == 1
+    unlink = os.unlink
+
+    def refused(name, *args, **kwargs):
+        if str(name).endswith('.preview.jpg'):
+            raise OSError(code, os.strerror(code))
+        unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'unlink', refused)
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 0, result.output
+    assert local_file(dest, DEAD_PATH).read_bytes() == DEAD
+    reason = f'{failing.format(previews=_previews_folder(dest))}: {os.strerror(code)}'
+    assert f'Previews not saved or deleted: 1\n  {DEAD_PATH}: {reason}\n' in result.stdout
+    assert f'{DEAD_PATH}: {reason}' in stderr_lines(result.stderr)
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+    assert _preview_records() == [(DEAD_PATH, PREVIEW_FILE, len(PHOTO_PREVIEW), 'image/jpeg', 'XXXL')]
+    monkeypatch.setattr(os, 'unlink', unlink)
+
+    again = run_download(str(dest))
+
+    assert again.exit_code == 0, again.output
+    assert not _mentions_previews(again.stdout)
+    assert not (dest / PREVIEW_FILE).exists()
+    assert _preview_records() == []
+
+
+def test_a_quarantined_file_gets_no_preview(disk, dest):
+    disk.add_file(DEAD_PATH, DEAD, modified=MODIFIED, preview=PHOTO_PREVIEW)
+    disk.corrupt(DEAD_PATH, 0)
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 1
+    assert 'Quarantined: 1\n' in result.stdout
+    assert not _mentions_previews(result.stdout)
+    assert _preview_requests(disk) == []
+    assert not _previews_folder(dest).exists()
+
+
+@pytest.mark.parametrize('cause', ['folder-not-made', 'permission'])
+def test_failures_with_a_local_cause_get_no_preview(disk, dest, monkeypatch, cause):
+    if cause == 'folder-not-made':
+        failing = ['disk:/Q?', 'disk:/Q?/napkin.jpg']
+        disk.add_file(failing[-1], DEAD, preview=PHOTO_PREVIEW)
+        _refuse_names(monkeypatch, lambda name: '?' in name or '_' in name)
+    else:
+        failing = ['disk:/Docs/napkin.jpg']
+        disk.add_file(failing[-1], DEAD, preview=PHOTO_PREVIEW)
+        (dest / 'Docs').mkdir(parents=True)
+        (dest / 'Docs' / 'napkin.jpg').write_bytes(b'x' * len(DEAD))
+        _refuse(monkeypatch, 'open_file', errno.EACCES, lambda name: name == 'napkin.jpg')
+
+    result = run_download(str(dest))
+
+    assert result.exit_code == 1
+    assert f'Failed: {len(failing)}\n' in result.stdout
+    assert not _mentions_previews(result.stdout)
+    assert _preview_requests(disk) == []
+
+
+def test_a_preview_for_a_version_changed_since_the_scan_is_not_saved(photo, dest):
+    assert runner.invoke(app, ['scan']).exit_code == 0
+    photo.add_file(DEAD_PATH, DEAD * 2, preview=PHOTO_PREVIEW)
+
+    result = _failing_run(photo, dest)
+
+    assert result.exit_code == 1
+    reason = 'changed on the Disk since the scan; rerun with --scan-max-age 0'
+    assert f'Previews not saved or deleted: 1\n  {DEAD_PATH}: {reason}\n' in result.stdout
+    assert _preview_requests(photo) == [f'meta {DEAD_PATH}']
+    assert _preview_records() == []
+
+
+def _stopped_child(fake, dest, stop: signal.Signals, *args: str) -> tuple[int, str, str]:
+    """A `download` child with `args` stopped by `stop` once it has asked the preview host for a preview: its exit
+    code, stdout and stderr."""
+    child = start_command('download', '--download-passes', '1', *args, str(dest))
+    try:
+        wait_until(lambda: any(r.path == '/preview' for r in fake.requests), child, 'fetched a preview')
+        child.send_signal(stop)
+        stdout, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+    return child.returncode, stdout, stderr
+
+
+@pytest.mark.parametrize('stop', [signal.SIGINT, signal.SIGTERM], ids=['sigint', 'sigterm'])
+def test_an_interrupt_during_the_preview_phase_keeps_the_summary_and_the_exit_code(
+    photo, dest, tmp_path, monkeypatch, stop
+):
+    photo.inject('GET', '/download', 503, where={'path': DEAD_PATH})
+    photo.inject('GET', '/preview', Delay(30))
+
+    exit_code, stdout, stderr = _stopped_child(photo, dest, stop)
+
+    assert exit_code == 1, stderr
+    assert f'Failed: 1\n  {DEAD_PATH}: {SERVICE_UNAVAILABLE}\n' in stdout
+    assert (
+        'Previews interrupted: 1 of 1 files not handled; the next run saves them.\n'
+        f'Manifest: {manifest_path()}\nLog: {log_path()}\n'
+    ) in stdout
+    assert SAVED_ONLY not in stdout
+    assert stderr_lines(stderr)[-1] == 'Error: 1 failed; see the list above.'
+    assert 'Interrupted' not in stderr
+    assert _preview_records() == []
+
+    again = _failing_run(photo, dest)
+
+    assert again.exit_code == 1
+    assert f'{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n' in again.stdout
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+    photo.requests.clear()
+    photo.inject('GET', '/download', 503, where={'path': DEAD_PATH})
+    photo.inject('GET', '/preview', Delay(30))
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path / 'json-state'))
+
+    exit_code, stdout, stderr = _stopped_child(photo, tmp_path / 'twin', stop, '--json')
+
+    assert exit_code == 1, stderr
+    document = json.loads(stdout)
+    assert (document['exit_code'], document['counts']['previews_pending']) == (1, 1)
+    assert (document['preview_only'], document['preview_errors']) == ([], [])
+
+
+# Installed as `sitecustomize` in a download subprocess: with `FSYNC_GATE` set to a folder, an fsync of a preview being
+# saved creates the marker `blocked` there and waits for the marker `release`, then runs.
+_PREVIEW_FSYNC_GATE = """
+import os, pathlib, time
+
+_gate = pathlib.Path(os.environ['FSYNC_GATE'])
+_fsync = os.fsync
+
+
+def fsync(fd):
+    if os.readlink(f'/proc/self/fd/{fd}').endswith('.preview-saving'):
+        (_gate / 'blocked').touch()
+        while not (_gate / 'release').exists():
+            time.sleep(0.01)
+    return _fsync(fd)
+
+
+os.fsync = fsync
+"""
+
+
+@pytest.mark.parametrize('stop', [signal.SIGINT, signal.SIGTERM], ids=['sigint', 'sigterm'])
+def test_an_interrupt_while_a_preview_is_saved_waits_for_the_save_and_its_record(
+    photo, dest, tmp_path, monkeypatch, stop
+):
+    gate = _gated(monkeypatch, tmp_path, _PREVIEW_FSYNC_GATE)
+    photo.inject('GET', '/download', 503, where={'path': DEAD_PATH})
+    child = start_command('download', '--download-passes', '1', str(dest))
+    try:
+        wait_until((gate / 'blocked').exists, child, 'began saving the preview')
+        child.send_signal(stop)
+        time.sleep(0.5)
+        (gate / 'release').touch()
+        stdout, stderr = child.communicate(timeout=60)
+    finally:
+        child.kill()
+        child.communicate()
+
+    assert child.returncode == 1, stderr
+    assert f'Failed: 1\n  {DEAD_PATH}: {SERVICE_UNAVAILABLE}\n{SAVED_ONLY}: 1\n  {DEAD_PATH} -> {PREVIEW_FILE}\n' in (
+        stdout
+    )
+    assert 'Previews interrupted' not in stdout
+    assert (dest / PREVIEW_FILE).read_bytes() == PHOTO_PREVIEW
+    assert _preview_records() == [(DEAD_PATH, PREVIEW_FILE, len(PHOTO_PREVIEW), 'image/jpeg', 'XXXL')]
+
+
+@pytest.mark.parametrize('stop', ['sigint', 'run-stopping-error'])
+def test_an_interrupted_or_stopped_transfer_phase_fetches_no_previews(photo, dest, stop):
+    photo.inject('GET', '/download', 503, where={'path': DEAD_PATH})
+    if stop == 'sigint':
+        photo.inject('GET', '/download', Delay(30), where={'path': 'disk:/Docs/readme.txt'})
+        child = start_command('download', '--download-passes', '1', str(dest))
+        try:
+            wait_until(lambda: _fetches(photo, 'disk:/Docs/readme.txt'), child, 'fetched readme.txt')
+            wait_until(lambda: _fetches(photo, DEAD_PATH), child, 'fetched the photo')
+            child.send_signal(signal.SIGINT)
+            _, stderr = child.communicate(timeout=60)
+        finally:
+            child.kill()
+            child.communicate()
+        assert child.returncode == 130, stderr
+    else:
+        other = 'disk:/Docs/readme.txt'
+        photo.inject('GET', '/v1/disk/resources/download', *[500] * 10, where={'path': other})
+        result = run_download('--api-retries', '1', '--download-passes', '1', str(dest))
+        assert result.exit_code == 1
+        assert stderr_lines(result.stderr)[-1].startswith(f'Error: Could not download {other}: ')
+
+    assert _preview_requests(photo) == []
+    assert not _previews_folder(dest).exists()
 
 
 def test_retry_failed_fetches_only_the_failed_files_and_never_looks_at_the_others(disk, dest):
@@ -3972,6 +4499,84 @@ def test_the_partial_folder_probe_reports_sparse_files_and_leaves_nothing_behind
     with Destination.open(dest, partial_dir=None) as destination:
         assert destination.sparse_partials is False
         assert list(destination.partial_folder.iterdir()) == []
+
+
+PREVIEWS = PurePosixPath('.yandex-disk-rescue/previews')
+
+
+def test_a_preview_is_saved_below_the_work_folder_replaced_by_a_newer_one_and_never_through_a_link(dest, tmp_path):
+    with Destination.open(dest, partial_dir=None) as destination:
+        path = destination.preview_path(PurePosixPath('Photos/2024/a.jpg'), 'image/jpeg')
+        destination.save_preview(path, b'first')
+        destination.save_preview(path, b'second')
+        saved = sorted(p.relative_to(dest) for p in (dest / PREVIEWS).rglob('*'))
+        content = (dest / path).read_bytes()
+
+        outside = tmp_path / 'outside'
+        outside.mkdir()
+        shutil.rmtree(dest / PREVIEWS / 'Photos')
+        (dest / PREVIEWS / 'Photos').symlink_to(outside)
+        with pytest.raises(NotADirectoryError):
+            destination.save_preview(path, b'third')
+
+        folder_path = destination.preview_path(PurePosixPath('b.png'), 'image/png')
+        (dest / folder_path).mkdir()
+        with pytest.raises(FileExistsError):
+            destination.save_preview(folder_path, b'png')
+
+    assert path == PREVIEWS / 'Photos/2024/a.jpg.preview.jpg'
+    assert saved == [PREVIEWS / 'Photos', PREVIEWS / 'Photos/2024', PREVIEWS / 'Photos/2024/a.jpg.preview.jpg']
+    assert content == b'second'
+    assert list(outside.iterdir()) == []
+    assert (dest / folder_path).is_dir()
+    assert list((dest / folder_path).iterdir()) == []
+    assert sorted(p.name for p in (dest / PREVIEWS).iterdir()) == ['Photos', 'b.png.preview.png']
+
+
+@pytest.mark.parametrize(
+    ('content_type', 'ending'),
+    [('image/jpeg', '.preview.jpg'), ('image/heic', '.preview.heic'), ('image/x-portable-pixmap', '.preview.img')],
+)
+def test_a_long_name_gets_a_shortened_preview_name_that_fits(content_type, ending):
+    name = 'Я' * 120 + '.tiff'
+
+    path = Destination.preview_path(PurePosixPath('Scans', name), content_type)
+
+    assert path.parent == PREVIEWS / 'Scans'
+    assert len(path.name.encode()) <= 255
+    assert path.name.endswith(f'.tiff{ending}')
+    assert path.name.startswith('Я' * 100)
+    assert re.search(r'~[0-9a-f]{8}\.tiff\.preview', path.name)
+    assert Destination.preview_path(PurePosixPath('Scans', name[1:]), content_type).name != path.name
+    with pytest.raises(ValueError, match="a preview is an image, not 'text/html'"):
+        Destination.preview_path(PurePosixPath('a.jpg'), 'text/html')
+
+
+def test_removing_a_preview_deletes_the_folders_it_left_empty_but_not_previews(dest):
+    with Destination.open(dest, partial_dir=None) as destination:
+        deep = destination.preview_path(PurePosixPath('A/B/C/deep.jpg'), 'image/jpeg')
+        beside = destination.preview_path(PurePosixPath('A/beside.jpg'), 'image/jpeg')
+        top = destination.preview_path(PurePosixPath('top.jpg'), 'image/jpeg')
+        for path in (deep, beside, top):
+            destination.save_preview(path, b'jpeg')
+
+        destination.remove_preview(deep)
+        after_deep = sorted(str(p.relative_to(dest / PREVIEWS)) for p in (dest / PREVIEWS).rglob('*'))
+        destination.remove_preview(deep)
+        destination.remove_preview(destination.preview_path(PurePosixPath('X/Y/never.jpg'), 'image/jpeg'))
+        destination.remove_preview(beside)
+        destination.remove_preview(top)
+        emptied = list((dest / PREVIEWS).iterdir())
+
+        destination.save_preview(top, b'jpeg')
+        (dest / top).unlink()
+        (dest / top).mkdir()
+        with pytest.raises(FileExistsError):
+            destination.remove_preview(top)
+
+    assert after_deep == ['A', 'A/beside.jpg.preview.jpg', 'top.jpg.preview.jpg']
+    assert emptied == []
+    assert (dest / top).is_dir()
 
 
 def test_a_probe_error_in_the_separate_partial_folder_names_that_folder(disk, dest, partial_root, monkeypatch):

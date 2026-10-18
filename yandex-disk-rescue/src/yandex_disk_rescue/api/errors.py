@@ -20,6 +20,11 @@ class DownloadRefusedError(RescueError):
         self.reason = reason
 
 
+class PreviewRefusedError(RescueError):
+    """A preview link was not fetched, or its answer was not a usable preview; the message is the reason, which
+    never quotes the link."""
+
+
 class RemotePathNotFoundError(RescueError):
     pass
 

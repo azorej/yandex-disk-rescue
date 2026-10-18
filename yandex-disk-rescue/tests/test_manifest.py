@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 
@@ -23,6 +24,7 @@ from yandex_disk_rescue.manifest import (
     ManifestMissingError,
     Mirror,
     MirrorMismatchError,
+    PreviewRecord,
     Quarantine,
     RemoteIdentity,
     ScanTime,
@@ -237,17 +239,21 @@ def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_a
             silent_since=MODIFIED,
         )
     with closing(sqlite3.connect(db)) as connection, connection:
+        connection.execute('DROP TABLE previews')
         connection.execute('ALTER TABLE failures DROP COLUMN silent_since')
         connection.execute('ALTER TABLE failures DROP COLUMN silent_turns')
-        connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 1}')
+        connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 2}')
     with Manifest.open_existing(db) as manifest:
         assert [r.path for r in manifest.entries(UID, 'disk:/')] == sorted(r.path for r in TREE)
         with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
             Manifest.open(db)
         with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
             Manifest.open_existing(db)
-        failures = _failures(manifest.mirror(UID, 'disk:/', Path('/dest')))
+        mirror = manifest.mirror(UID, 'disk:/', Path('/dest'))
+        failures = _failures(mirror)
+        previews = [e.preview for e in mirror.entries() if e.preview is not None]
     assert failures == {'disk:/A/keep.txt': FailureRecord(STALLED, 3, 0, None)}
+    assert previews == []
     with closing(sqlite3.connect(db)) as connection:
         assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION
 
@@ -382,7 +388,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 11
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 12
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -406,7 +412,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 11
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 12
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -437,7 +443,7 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 11
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 12
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
@@ -1103,6 +1109,69 @@ def test_a_finding_survives_download_record_changes_and_goes_with_verifying_clea
         assert connection.execute('SELECT entry_id, finding FROM verify_findings').fetchall() == [
             (ids[edit.path], 'modified')
         ]
+
+
+def _previews(mirror: Mirror) -> dict[str, PreviewRecord]:
+    return {e.resource.path: e.preview for e in mirror.entries() if e.preview is not None}
+
+
+def test_a_preview_record_is_replaced_kept_by_every_other_record_and_dropped_with_its_entry(tmp_path):
+    db, manifest, mirror, ids = _journaled(tmp_path)
+    keep, edit, gone = (
+        next(r for r in TREE if r.path == p) for p in ('disk:/A/keep.txt', 'disk:/A/edit.txt', 'disk:/A/gone.txt')
+    )
+    older = RemoteIdentity(size=4, md5='dd', sha256='ee', modified=MODIFIED - timedelta(days=1))
+    placed = tmp_path / 'keep.txt'
+    placed.write_bytes(b'0123456789')
+    first = PreviewRecord(
+        older, PurePosixPath('.yandex-disk-rescue/previews/A/keep.txt.preview.png'), 70, 'image/png', 'XXXL'
+    )
+    second = PreviewRecord(
+        RemoteIdentity.of(keep),
+        PurePosixPath('.yandex-disk-rescue/previews/A/keep.txt.preview.jpg'),
+        71_000,
+        'image/jpeg',
+        'XXXL',
+    )
+    of_edit = replace(second, identity=RemoteIdentity.of(edit), path=second.path.with_name('edit.txt.preview.jpg'))
+    of_gone = replace(second, identity=RemoteIdentity.of(gone), path=second.path.with_name('gone.txt.preview.jpg'))
+    quarantined = PurePosixPath('.yandex-disk-rescue/quarantine/2026-10-17T09-30-00Z/A/edit.txt')
+    with manifest:
+        other = manifest.mirror(UID, 'disk:/', Path('/other'))
+        mirror.record_preview(ids[keep.path], first)
+        mirror.record_preview(ids[keep.path], second)
+        mirror.record_preview(ids[edit.path], of_edit)
+        mirror.record_preview(ids[gone.path], of_gone)
+        recorded = _previews(mirror)
+
+        mirror.record_partial(ids[keep.path], RemoteIdentity.of(keep), [Segment(0, 10, 6, 'aa')])
+        mirror.record_failure(ids[keep.path], STALLED, turns=2, **_EMPTY_STREAK)
+        mirror.record_finding(ids[keep.path], Finding('missing', 'A/keep.txt is missing'))
+        mirror.record_verified(ids[keep.path], RemoteIdentity.of(keep), 'md5', os.lstat(placed))
+        mirror.forget(ids[keep.path])
+        mirror.record_quarantined(ids[edit.path], RemoteIdentity.of(edit), quarantined, 'size mismatch')
+        mirror.clear_failure(ids[keep.path])
+        mirror.clear_finding(ids[keep.path])
+        kept = _previews(mirror)
+        elsewhere = _previews(other)
+
+        mirror.forget_preview(ids[edit.path])
+        mirror.forget_preview(ids[edit.path])
+        forgotten = _previews(mirror)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.record_preview(10_000, second)
+        with pytest.raises(ValueError, match='is not a committed entry'):
+            mirror.forget_preview(10_000)
+
+    assert recorded == {keep.path: second, edit.path: of_edit, gone.path: of_gone}
+    assert kept == recorded
+    assert elsewhere == {}
+    assert forgotten == {keep.path: second, gone.path: of_gone}
+
+    rescanned = [replace(r, size=11) if r.path == keep.path else r for r in TREE if r.path != gone.path]
+    _scan(db, rescanned)
+    with Manifest.open(db) as manifest:
+        assert _previews(manifest.mirror(UID, 'disk:/', Path('/dest'))) == {keep.path: second}
 
 
 def test_a_verify_pass_round_trips_is_replaced_by_a_new_one_and_goes_with_its_mirror(tmp_path):

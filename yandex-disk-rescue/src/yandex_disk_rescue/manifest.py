@@ -11,8 +11,8 @@ A `Mirror` is one destination directory holding one remote folder of one account
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
 of a partial download (`download_segments`), the reason and count of an entry's failed turns with its silent streak
 (`failures`), the copy of a download that failed verification and was moved to quarantine (`quarantined`), and what
-`verify` last found wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), all
-keyed by `entries.id`.
+`verify` last found wrong at the entry's final path, or `download` found unreadable there (`verify_findings`), and
+the preview image saved for a file not downloaded (`previews`), all keyed by `entries.id`.
 A rescan never rewrites them: a record keeps the remote identity it was made for, and only an entry's removal from
 the manifest deletes its rows.
 A mirror also keeps the `verify` pass in progress on it (`verify_passes`): when it started and how far it got, and the
@@ -244,6 +244,26 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         """,
         'ALTER TABLE failures ADD COLUMN silent_since TEXT CHECK ((silent_turns = 0) = (silent_since IS NULL))',
     ),
+    (
+        # The preview image saved for a file not downloaded: the identity columns are the remote file it was taken
+        # for, `path` the saved image relative to the destination, `bytes` its size, `content_type` its type and
+        # `size_name` the preview size it was asked for.
+        """
+        CREATE TABLE previews (
+            mirror_id INTEGER NOT NULL REFERENCES mirrors (id) ON DELETE CASCADE,
+            entry_id INTEGER NOT NULL REFERENCES entries (id) ON DELETE CASCADE,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            md5 TEXT,
+            sha256 TEXT,
+            modified TEXT NOT NULL,
+            path TEXT NOT NULL,
+            bytes INTEGER NOT NULL CHECK (bytes >= 0),
+            content_type TEXT NOT NULL,
+            size_name TEXT NOT NULL,
+            PRIMARY KEY (mirror_id, entry_id)
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -334,6 +354,18 @@ class Quarantine:
 
 
 @dataclass(frozen=True)
+class PreviewRecord:
+    """The preview image of `identity` saved at `path` (relative to the destination): `bytes` long, of `content_type`,
+    asked for as the preview size `size_name`."""
+
+    identity: RemoteIdentity
+    path: PurePosixPath
+    bytes: int
+    content_type: str
+    size_name: str
+
+
+@dataclass(frozen=True)
 class Finding:
     """What was found wrong with the file at an entry's final path: by `verify`, nothing there (`missing`), something
     else there (`modified`), or the recorded file with other content or unreadable (`corrupt`); by `download`, a copy
@@ -374,6 +406,15 @@ class MirrorEntry:
     failure: FailureRecord | None  # the entry's failed turns in this mirror; `None` once it succeeded
     quarantine: Quarantine | None  # the last quarantined copy; `None` once the file is verified
     finding: Finding | None  # what was found wrong at the final path; `None` once a copy is verified there
+    preview: PreviewRecord | None  # the saved preview image; kept by every other record and by a rescan
+
+
+def verified_now(entry: MirrorEntry) -> bool:
+    """Whether `entry` is a file whose download record is verified for its current identity."""
+    record = entry.download
+    if entry.resource.kind != 'file' or record is None or record.state != 'verified':
+        return False
+    return record.identity == RemoteIdentity.of(entry.resource)
 
 
 @dataclass(frozen=True)
@@ -676,8 +717,8 @@ class Mirror:
 
     def entries(self) -> list[MirrorEntry]:
         """The committed entries below `remote_root` (not the root itself) ordered by path, with their local names,
-        download records, failures, quarantine records and findings, read in full so no read stays open across later
-        writes."""
+        download records, failures, quarantine records, findings and preview records, read in full so no read stays
+        open across later writes."""
         params = {'mirror': self.id, **_subtree_params(self.account_uid, self.remote_root)}
         connection = self._manifest._connection
         with self._manifest._transaction('read'):
@@ -859,6 +900,32 @@ class Mirror:
                 'DELETE FROM verify_findings WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
             )
 
+    def record_preview(self, entry_id: int, record: PreviewRecord) -> None:
+        """Record `record` as the entry's saved preview, replacing any earlier one."""
+        params = {
+            'mirror': self.id,
+            'entry': entry_id,
+            'size': record.identity.size,
+            'md5': record.identity.md5,
+            'sha256': record.identity.sha256,
+            'modified': _timestamp(record.identity.modified),
+            'path': _local_path_text(record.path),
+            'bytes': record.bytes,
+            'content_type': record.content_type,
+            'size_name': record.size_name,
+        }
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            self._manifest._connection.execute(_RECORD_PREVIEW_SQL, params)
+
+    def forget_preview(self, entry_id: int) -> None:
+        """Delete the entry's preview record, if any."""
+        with self._manifest._transaction('update'):
+            self._check_entry(entry_id)
+            self._manifest._connection.execute(
+                'DELETE FROM previews WHERE mirror_id = ? AND entry_id = ?', (self.id, entry_id)
+            )
+
     def verify_pass(self) -> VerifyPass | None:
         """The `verify` pass in progress on this mirror, if any."""
         with self._manifest._errors('read'):
@@ -962,7 +1029,8 @@ _MIRROR_ENTRY_COLUMNS = """
     d.state, d.size, d.md5, d.sha256, d.modified, d.verified_by, d.local_size, d.local_mtime_ns, d.local_ino,
     f.reason, f.turns, f.silent_turns, f.silent_since,
     q.size, q.md5, q.sha256, q.modified, q.copy_path, q.reason,
-    v.finding, v.reason
+    v.finding, v.reason,
+    p.size, p.md5, p.sha256, p.modified, p.path, p.bytes, p.content_type, p.size_name
 """
 _MIRROR_JOINS = """
     FROM entries e
@@ -971,6 +1039,7 @@ _MIRROR_JOINS = """
     LEFT JOIN failures f ON f.mirror_id = :mirror AND f.entry_id = e.id
     LEFT JOIN quarantined q ON q.mirror_id = :mirror AND q.entry_id = e.id
     LEFT JOIN verify_findings v ON v.mirror_id = :mirror AND v.entry_id = e.id
+    LEFT JOIN previews p ON p.mirror_id = :mirror AND p.entry_id = e.id
 """
 _MIRROR_ENTRIES_SQL = f"""
     SELECT {_MIRROR_ENTRY_COLUMNS} {_MIRROR_JOINS}
@@ -1037,6 +1106,14 @@ _RECORD_QUARANTINE_SQL = """
 _RECORD_FINDING_SQL = """
     INSERT INTO verify_findings (mirror_id, entry_id, finding, reason) VALUES (?, ?, ?, ?)
     ON CONFLICT (mirror_id, entry_id) DO UPDATE SET finding = excluded.finding, reason = excluded.reason
+"""
+_RECORD_PREVIEW_SQL = """
+    INSERT INTO previews (mirror_id, entry_id, size, md5, sha256, modified, path, bytes, content_type, size_name)
+    VALUES (:mirror, :entry, :size, :md5, :sha256, :modified, :path, :bytes, :content_type, :size_name)
+    ON CONFLICT (mirror_id, entry_id) DO UPDATE SET
+        size = excluded.size, md5 = excluded.md5, sha256 = excluded.sha256, modified = excluded.modified,
+        path = excluded.path, bytes = excluded.bytes, content_type = excluded.content_type,
+        size_name = excluded.size_name
 """
 _UNENCODABLE_SQL = """
     SELECT path, kind FROM unencodable_entries
@@ -1279,6 +1356,7 @@ def _mirror_entry(row: tuple, segments: tuple[Segment, ...]) -> MirrorEntry:
         failure=None if row[17] is None else _failure(row[17:21]),
         quarantine=None if row[21] is None else _quarantine(row[21:27]),
         finding=None if row[27] is None else Finding(kind=row[27], reason=row[28]),
+        preview=None if row[29] is None else _preview(row[29:37]),
     )
 
 
@@ -1294,6 +1372,16 @@ def _quarantine(row: tuple) -> Quarantine:
     size, md5, sha256, modified, copy_path, reason = row
     identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
     return Quarantine(identity=identity, copy=PurePosixPath(copy_path), reason=reason)
+
+
+def _preview(row: tuple) -> PreviewRecord:
+    """Build a `PreviewRecord` from the `previews` columns size, md5, sha256, modified, path, bytes, content_type and
+    size_name."""
+    size, md5, sha256, modified, path, length, content_type, size_name = row
+    identity = RemoteIdentity(size=size, md5=md5, sha256=sha256, modified=datetime.fromisoformat(modified))
+    return PreviewRecord(
+        identity=identity, path=PurePosixPath(path), bytes=length, content_type=content_type, size_name=size_name
+    )
 
 
 def _download_record(row: tuple, segments: tuple[Segment, ...]) -> DownloadRecord:

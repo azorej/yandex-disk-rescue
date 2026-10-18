@@ -78,6 +78,14 @@ def rejected_name_conversion(name: str, taken: Collection[str]) -> str:
     raise ValueError(f'no converted name for {name!r} is free among its siblings')
 
 
+def with_ending(name: str, ending: str) -> str:
+    """`name` followed by `ending`; when that is too long, `name` is shortened as a too-long remote name is, its
+    `~<hex>` suffix included, until the result with `ending` fits."""
+    if _fits(name + ending):
+        return name + ending
+    return _with_suffix(name, _hex(name, _HASH_DIGITS[0]), ending)
+
+
 def _fits(name: str) -> bool:
     return (
         len(name.encode()) <= MAX_NAME_BYTES
@@ -141,11 +149,11 @@ def _hex(name: str, digits: int) -> str:
     return hashlib.sha256(name.encode()).hexdigest()[:digits]
 
 
-def _with_suffix(name: str, hex_digits: str) -> str:
-    """Insert `~<hex_digits>` before the extension of `name` (or at its end), cutting the stem at a character
-    boundary until the result fits."""
+def _with_suffix(name: str, hex_digits: str, ending: str = '') -> str:
+    """Insert `~<hex_digits>` before the extension of `name` (or at its end) and append `ending`, cutting the stem at a
+    character boundary until the result fits."""
     stem, extension = _split_extension(name)
-    tail = f'~{hex_digits}{extension}'
+    tail = f'~{hex_digits}{extension}{ending}'
     low, high = 0, len(stem)
     while low < high:
         middle = (low + high + 1) // 2

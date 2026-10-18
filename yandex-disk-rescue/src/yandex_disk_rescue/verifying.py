@@ -11,8 +11,9 @@ as it is made, an intact file drops its earlier finding, and `download` fetches 
 Any other file is reported without being read: under its finding when it has one (the copy found broken, by `verify`
 or by `download` as unreadable, is still at its path), else as quarantined when its quarantine record is for its
 current identity, else as not downloaded. A file listed under its finding whose quarantine record is for its current
-identity has its repair quarantined, and its line says so with the quarantine reason and the copy's path.
-Paths with no manifest entry are never opened, listed or reported.
+identity has its repair quarantined, and its line says so with the quarantine reason and the copy's path. A file not
+downloaded whose preview record is for its current identity names the preview's path. Paths with no manifest entry,
+and everything below `.yandex-disk-rescue/previews/`, are never opened, listed or reported.
 
 A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C,
 SIGTERM, SIGKILL or an unreadable destination continues where its committed cursor stands, and its report covers the
@@ -45,6 +46,7 @@ from yandex_disk_rescue.manifest import (
     MirrorEntry,
     RemoteIdentity,
     VerifyPass,
+    verified_now,
 )
 from yandex_disk_rescue.mirroring import (
     Digest,
@@ -77,11 +79,13 @@ class DestinationUnreadableError(RescueError):
 @dataclass(frozen=True)
 class Problem:
     """A file listed for `reason`; under a finding, `repair` is its quarantine record for its current identity: the
-    download meant to repair it was quarantined."""
+    download meant to repair it was quarantined. A file not downloaded has the path of its `preview` saved for its
+    current identity, if any."""
 
     path: str
     reason: str
     repair: QuarantinedFile | None = None
+    preview: PurePosixPath | None = None
 
 
 @dataclass
@@ -134,7 +138,7 @@ class VerifyRun:
         self._progress = progress
         self._entries = [e for e in mirror.entries() if e.resource.kind == 'file']
         through = verify_pass.checked_through
-        verified = [e for e in self._entries if _verified_now(e)]
+        verified = [e for e in self._entries if verified_now(e)]
         pending = [e for e in verified if through is None or e.resource.path > through]
         self._pending = {e.entry_id for e in pending}
         self._verified = {e.entry_id for e in verified}
@@ -183,7 +187,7 @@ class VerifyRun:
         else:
             reason = _not_downloaded_reason(entry)
             _log.debug('%s not downloaded: %s', entry.resource.path, reason)
-            report.not_downloaded.append(Problem(entry.resource.path, reason))
+            report.not_downloaded.append(Problem(entry.resource.path, reason, preview=_saved_preview(entry)))
 
     def _commit_cursor(self) -> None:
         if self._through is not None and self._through != self._committed:
@@ -244,7 +248,7 @@ def verify_document(report: VerifyReport) -> dict[str, object]:
         'modified': [_finding_document(problem) for problem in report.modified],
         'corrupt': [_finding_document(problem) for problem in report.corrupt],
         'quarantined': [quarantined_document(held) for held in report.quarantined],
-        'not_downloaded': [{'path': problem.path, 'reason': problem.reason} for problem in report.not_downloaded],
+        'not_downloaded': [_not_downloaded_document(problem) for problem in report.not_downloaded],
     }
 
 
@@ -253,8 +257,17 @@ def _finding_document(problem: Problem) -> dict[str, object]:
     return {'path': problem.path, 'reason': problem.reason, 'repair_quarantined': repair}
 
 
+def _not_downloaded_document(problem: Problem) -> dict[str, object]:
+    preview = None if problem.preview is None else str(problem.preview)
+    return {'path': problem.path, 'reason': problem.reason, 'preview': preview}
+
+
 def _problems(problems: list[Problem]) -> list[str]:
-    return [f'{problem.path}: {problem.reason}{_repair(problem.repair)}' for problem in problems]
+    return [f'{problem.path}: {problem.reason}{_repair(problem.repair)}{_preview(problem)}' for problem in problems]
+
+
+def _preview(problem: Problem) -> str:
+    return '' if problem.preview is None else f'; a preview is saved at {problem.preview}'
 
 
 def _repair(held: QuarantinedFile | None) -> str:
@@ -312,9 +325,12 @@ def _content_mismatch(chunks: Iterator[bytes], identity: RemoteIdentity, read: C
     return digest.mismatch(identity)
 
 
-def _verified_now(entry: MirrorEntry) -> bool:
-    record = entry.download
-    return record is not None and record.state == 'verified' and record.identity == RemoteIdentity.of(entry.resource)
+def _saved_preview(entry: MirrorEntry) -> PurePosixPath | None:
+    """The path of the preview recorded for the entry's current identity; the file itself is never looked at."""
+    preview = entry.preview
+    if preview is None or preview.identity != RemoteIdentity.of(entry.resource):
+        return None
+    return preview.path
 
 
 def _not_downloaded_reason(entry: MirrorEntry) -> str:

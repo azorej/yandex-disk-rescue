@@ -20,7 +20,7 @@ TOKEN = 'y0_AgAAAAB-config-sentinel-token'
 OPTIONS = (
     'api_interval_ms, api_concurrency, api_timeout, api_retries, api_url, download_timeout, download_retries, '
     'download_passes, download_connections, download_checkpoint_mib, download_segments, '
-    'download_segment_threshold_mib, partial_dir, scan_max_age, progress_interval, client_id'
+    'download_segment_threshold_mib, partial_dir, scan_max_age, progress_interval, previews, client_id'
 )
 
 
@@ -184,6 +184,7 @@ def test_download_reads_the_scan_max_age_from_the_config_file(disk, tmp_path, ag
         ('partial_dir = 1\n', 'partial_dir: must be a string.'),
         ('progress_interval = 0\n', 'progress_interval: must be an integer from 1 to 3600.'),
         ('progress_interval = 3601\n', 'progress_interval: must be an integer from 1 to 3600.'),
+        ('previews = "no"\n', 'previews: must be true or false.'),
         ('[api]\ninterval_ms = 100\n', f'api: unknown option; the options are {OPTIONS}.'),
         ('api_interval_ms = \n', 'is not valid TOML: Invalid value (at line 1, column 19).'),
         (b'client_id = "\xff"\n', 'is not UTF-8 text.'),
@@ -257,3 +258,42 @@ def test_download_reads_the_partial_folder_from_the_config_file_and_an_empty_fla
         )
         assert list(folder.iterdir()) == []
     assert (dest / 'A' / 'file.txt').read_bytes() == b'A'
+
+
+NAPKIN = 'disk:/A/napkin.jpg'
+
+
+@pytest.mark.parametrize(
+    ('config', 'env', 'args', 'saved'),
+    [
+        ('previews = false\n', None, [], False),
+        ('previews = false\n', None, ['--previews'], True),
+        ('', '0', [], False),
+        ('previews = false\n', 'yes', [], True),
+    ],
+    ids=['config', 'flag-over-config', 'env', 'env-over-config'],
+)
+def test_download_reads_previews_from_the_config_file_and_the_flag_overrides_it(
+    disk, monkeypatch, tmp_path, config, env, args, saved
+):
+    _write_default_config(config)
+    if env is not None:
+        monkeypatch.setenv('YANDEX_DISK_RESCUE_PREVIEWS', env)
+    disk.add_file(NAPKIN, b'napkin', preview=b'\xff\xd8 reduced')
+    disk.inject('GET', '/download', 503, where={'path': NAPKIN})
+    dest = tmp_path / 'dest'
+
+    result = runner.invoke(app, ['download', '--download-passes', '1', *args, str(dest)])
+
+    assert result.exit_code == 1
+    previews = dest / '.yandex-disk-rescue' / 'previews'
+    asked = [r for r in disk.requests if r.path == '/preview' or 'preview_size' in r.params]
+    if saved:
+        assert (previews / 'A' / 'napkin.jpg.preview.jpg').read_bytes() == b'\xff\xd8 reduced'
+        assert len(asked) == 2
+    else:
+        assert not previews.exists()
+        assert asked == []
+        assert 'Saving the previews' not in result.stdout
+    [started] = [message for message in log_messages() if message.startswith('download started: ')]
+    assert f', previews={saved}, ' in started

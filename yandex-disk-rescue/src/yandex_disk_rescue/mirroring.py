@@ -108,6 +108,7 @@ from yandex_disk_rescue.manifest import (
     Segment,
     UnencodableEntry,
     VerifiedBy,
+    verified_now,
 )
 from yandex_disk_rescue.progress import ActiveFile, MirrorProgress, MoveProgress, Outcome, TransferState
 from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
@@ -139,11 +140,13 @@ _log = logging.getLogger(__name__)
 
 
 class FileFailed(Exception):
-    """One file (or folder) could not be mirrored; `reason` is the user-facing text. The run goes on."""
+    """One file (or folder) could not be mirrored; `reason` is the user-facing text, and `on_yandex` is set when the
+    cause is on Yandex's side (the API or the download host refused or broke off the file). The run goes on."""
 
-    def __init__(self, reason: str) -> None:
+    def __init__(self, reason: str, *, on_yandex: bool = False) -> None:
         super().__init__(reason)
         self.reason = reason
+        self.on_yandex = on_yandex
 
 
 class FileQuarantined(Exception):
@@ -184,11 +187,13 @@ class NoRoomYet(FileDeferred):
 @dataclass(frozen=True)
 class Failure:
     """An entry that failed for `reason`; `unavailable` when it is a file unavailable on Yandex Disk (see
-    `UNAVAILABLE_TURNS`)."""
+    `UNAVAILABLE_TURNS`), and `on_yandex` when it is a file whose failure came from Yandex's side: out of passes after
+    transient transfer failures, unavailable, or refused by the API or the download host."""
 
     path: str
     reason: str
     unavailable: bool = False
+    on_yandex: bool = False
 
 
 @dataclass(frozen=True)
@@ -252,9 +257,20 @@ class QuarantinedFile:
     last_retry: str | None
 
 
+@dataclass(frozen=True)
+class PreviewOnly:
+    """A failed file whose preview image is saved at `preview` (relative to the destination), `bytes` long."""
+
+    path: str
+    preview: PurePosixPath
+    bytes: int
+
+
 @dataclass
 class MirrorReport:
-    """What a run did. Lists hold every member in path order; the summary shows the first few."""
+    """What a run did. Lists hold every member in path order; the summary shows the first few. The preview step at the
+    end of a run fills `preview_only`, `preview_errors` and `previews_pending`, the count of failed files it did not
+    get to when it was interrupted."""
 
     remote_root: str
     destination: str
@@ -271,6 +287,9 @@ class MirrorReport:
     failed: list[Failure] = field(default_factory=list)
     partials_left: list[PartialLeft] = field(default_factory=list)
     passes: tuple[int, int] | None = None  # (used, limit; 0 is no limit) once a transient failure deferred a file
+    preview_only: list[PreviewOnly] = field(default_factory=list)
+    preview_errors: list[Failure] = field(default_factory=list)
+    previews_pending: int = 0
 
 
 @dataclass(frozen=True)
@@ -851,7 +870,9 @@ class MirrorRun:
 
     def _check(self, destination: Destination) -> set[int]:
         """The files whose verified copy is still in place, by an `lstat` of each candidate."""
-        candidates = [e for e in self._entries if e.entry_id not in self._held and _verified_now(e)]
+        candidates = [
+            e for e in self._entries if e.entry_id not in self._held and e.finding is None and verified_now(e)
+        ]
         if not candidates:
             return set()
         self._progress.start_checking(len(candidates), str(destination.path))
@@ -1017,8 +1038,9 @@ class MirrorRun:
         stuck = _stuck_for_room(deferred, tools.room, changes)
         suffix = f' (after {used} passes)' if used > 1 else ''
         for entry, failure in deferred:
-            reason = failure.final if stuck and isinstance(failure, NoRoomYet) else failure.reason + suffix
-            self._fail(tools.report, entry, reason, new_turn=entry.entry_id not in self._counted)
+            no_room = isinstance(failure, NoRoomYet)
+            reason = failure.final if stuck and no_room else failure.reason + suffix
+            self._fail(tools.report, entry, reason, new_turn=entry.entry_id not in self._counted, on_yandex=not no_room)
         tools.report.passes = (used, passes)
 
     async def _turn(
@@ -1034,24 +1056,29 @@ class MirrorRun:
                 entry, later.reason, turns=turns, streak=self._after_deferral(entry, later)
             )
             if unavailable and not later.throttled and not self._retry_failed:
-                self._report_failed(tools.report, entry, reason, unavailable=True)
+                self._report_failed(tools.report, entry, reason, unavailable=True, on_yandex=True)
                 return
         _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
         self._progress.defer(entry.entry_id)
         deferred.append((entry, later))
 
-    def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str, *, new_turn: bool = True) -> None:
-        """Report `entry` as failed for `reason` and record it; `new_turn` counts one more failed turn and ends its
-        silent streak, otherwise the record keeps the count and the streak this run already gave it. While the streak
-        makes the file unavailable, it is reported and recorded with the unavailable reason instead."""
+    def _fail(
+        self, report: MirrorReport, entry: MirrorEntry, reason: str, *, new_turn: bool = True, on_yandex: bool = False
+    ) -> None:
+        """Report `entry` as failed for `reason`, from Yandex's side with `on_yandex`, and record it; `new_turn`
+        counts one more failed turn and ends its silent streak, otherwise the record keeps the count and the streak
+        this run already gave it. While the streak makes the file unavailable, it is reported and recorded with the
+        unavailable reason instead, as a failure from Yandex's side."""
         if new_turn:
             turns, streak = self._count_failed_turn(entry), _Streak()
         else:
             turns, streak = self._failed_turns[entry.entry_id], self._streak(entry)
         reason, unavailable = self._record(entry, reason, turns=turns, streak=streak)
-        self._report_failed(report, entry, reason, unavailable=unavailable)
+        self._report_failed(report, entry, reason, unavailable=unavailable, on_yandex=on_yandex or unavailable)
 
-    def _report_failed(self, report: MirrorReport, entry: MirrorEntry, reason: str, *, unavailable: bool) -> None:
+    def _report_failed(
+        self, report: MirrorReport, entry: MirrorEntry, reason: str, *, unavailable: bool, on_yandex: bool
+    ) -> None:
         """Report `entry`, already recorded, as failed for `reason`, or as quarantined when it is held."""
         path = entry.resource.path
         outcome: Outcome
@@ -1062,7 +1089,7 @@ class MirrorRun:
             outcome = 'quarantined'
         else:
             _log.warning('%s failed: %s', path, reason)
-            report.failed.append(Failure(entry.resource.path, reason, unavailable))
+            report.failed.append(Failure(entry.resource.path, reason, unavailable, on_yandex))
             outcome = 'failed'
         self._settle(entry, outcome)
 
@@ -1175,7 +1202,7 @@ class MirrorRun:
         except FileDeferred as deferred:
             return deferred
         except FileFailed as failed:
-            self._fail(report, entry, failed.reason)
+            self._fail(report, entry, failed.reason, on_yandex=failed.on_yandex)
             return None
         except FileQuarantined as quarantined:
             _log.warning('%s quarantined: %s; kept at %s', path, quarantined.reason, quarantined.copy)
@@ -2001,7 +2028,7 @@ class _FileFetch:
             await self._fetch([stream])
 
     async def _fetch(self, streams: list[_Stream]) -> None:
-        results = await _concurrently([self._stream(stream) for stream in streams if stream.pending])
+        results = await concurrently([self._stream(stream) for stream in streams if stream.pending])
         deferred = [result for result in results if result is not None]
         if deferred:
             waits = [failure.retry_after for failure in deferred if failure.retry_after is not None]
@@ -2048,7 +2075,7 @@ class _FileFetch:
                     return FileDeferred(reason, retry_after=None, throttled=False, received=self._received)
             except api.RangeNotHonouredError as exc:
                 if before == 0 and stream.end == size:
-                    raise FileFailed(exc.reason) from None
+                    raise FileFailed(exc.reason, on_yandex=True) from None
                 raise
             except api.TransientTransferError as exc:
                 if stream.written == stream.end:
@@ -2061,7 +2088,7 @@ class _FileFetch:
                 _log.debug('%s: %s; resuming at once from byte %d', self._path, exc.reason, stream.written)
                 attempt_number += 1
             except api.TransferError as exc:
-                raise FileFailed(exc.reason) from None
+                raise FileFailed(exc.reason, on_yandex=True) from None
             else:
                 return None
 
@@ -2092,7 +2119,7 @@ class _FileFetch:
                 self._progress.disconnected()
 
 
-async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]:
+async def concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]:
     """The results of `calls`, run at once. The first exception one of them raises cancels the others and, once they
     have all ended, is raised itself, with what the others raised meanwhile added as notes."""
     try:
@@ -2101,7 +2128,7 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
     except BaseExceptionGroup as raised:
         first, *others = raised.exceptions
         for other in others:
-            first.add_note(f'Also raised while the file was stopping: {type(other).__name__}: {other}')
+            first.add_note(f'Also raised while the others were stopping: {type(other).__name__}: {other}')
         raise first from None
     return [task.result() for task in tasks]
 
@@ -2109,8 +2136,9 @@ async def _concurrently[T](calls: list[Coroutine[object, object, T]]) -> list[T]
 def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a run: the counts, the passes once a transient failure deferred a file, adopted and size-only
     files, renamed entries, the copies found unreadable, what was moved aside, quarantined files with their reasons and
-    copies, and failures with their reasons, with a hint when any is unavailable on Yandex Disk; each list shows its
-    first `limit` members (`None`: all)."""
+    copies, failures with their reasons, with a hint when any is unavailable on Yandex Disk, the failed files saved only
+    as a preview, the previews not saved or deleted with their reasons, how many failed files an interrupted preview
+    step left, and the partial files not deleted; each list shows its first `limit` members (`None`: all)."""
     lines = [
         f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
@@ -2148,6 +2176,20 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines += listed('', shown, len(shown), '', limit=limit)
         if unavailable := sum(failure.unavailable for failure in report.failed):
             lines.append(_unavailable_hint(unavailable))
+    if report.preview_only:
+        lines.append(f'Saved only as a preview (a reduced image, not verified): {len(report.preview_only)}')
+        shown = [f'{saved.path} -> {saved.preview}' for saved in report.preview_only]
+        lines += listed('', shown, len(shown), '', limit=limit)
+    if report.preview_errors:
+        lines.append(f'Previews not saved or deleted: {len(report.preview_errors)}')
+        shown = [f'{error.path}: {error.reason}' for error in report.preview_errors]
+        lines += listed('', shown, len(shown), '', limit=limit)
+    if report.previews_pending:
+        candidates = sum(failure.on_yandex for failure in report.failed)
+        lines.append(
+            f'Previews interrupted: {report.previews_pending} of {candidates} files not handled; the next run saves '
+            'them.'
+        )
     if report.partials_left:
         lines.append(f'Partial files not deleted: {len(report.partials_left)}')
         shown = [f'{left.path}: {left.reason}' for left in report.partials_left]
@@ -2157,7 +2199,8 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
 
 def mirror_document(report: MirrorReport) -> dict[str, object]:
     """The JSON object of a run: the counts of the summary's head line (`skipped` includes `adopted`; `unavailable`
-    counts the failures unavailable on Yandex Disk, each flagged in `failed`), the passes, and every list in full."""
+    counts the failures unavailable on Yandex Disk, each flagged in `failed`; `previews_pending` the failed files an
+    interrupted preview step did not get to), the passes, and every list in full."""
     passes = None if report.passes is None else {'used': report.passes[0], 'limit': report.passes[1]}
     return {
         'remote_root': report.remote_root,
@@ -2174,6 +2217,9 @@ def mirror_document(report: MirrorReport) -> dict[str, object]:
             'quarantined': len(report.quarantined),
             'failed': len(report.failed),
             'unavailable': sum(failure.unavailable for failure in report.failed),
+            'preview_only': len(report.preview_only),
+            'preview_errors': len(report.preview_errors),
+            'previews_pending': report.previews_pending,
         },
         'passes': passes,
         'adopted': report.adopted,
@@ -2187,6 +2233,10 @@ def mirror_document(report: MirrorReport) -> dict[str, object]:
             {'path': failure.path, 'reason': failure.reason, 'unavailable': failure.unavailable}
             for failure in report.failed
         ],
+        'preview_only': [
+            {'path': saved.path, 'preview': str(saved.preview), 'bytes': saved.bytes} for saved in report.preview_only
+        ],
+        'preview_errors': [{'path': error.path, 'reason': error.reason} for error in report.preview_errors],
         'partials_left': [{'path': str(left.path), 'reason': left.reason} for left in report.partials_left],
     }
 
@@ -2250,14 +2300,6 @@ def quarantined_document(held: QuarantinedFile) -> dict[str, object]:
     return {'path': held.path, 'reason': held.reason, 'last_retry': held.last_retry, 'copy': str(held.copy)}
 
 
-def _verified_now(entry: MirrorEntry) -> bool:
-    """Whether the entry is a file verified for its current identity, with no finding."""
-    record = entry.download
-    if entry.resource.kind != 'file' or record is None or record.state != 'verified' or entry.finding is not None:
-        return False
-    return record.identity == RemoteIdentity.of(entry.resource)
-
-
 def _in_place(entry: MirrorEntry, destination: Destination) -> bool:
     """Whether the placed copy of the verified file `entry` has the recorded `lstat`.
 
@@ -2298,7 +2340,7 @@ async def _download_link(client: api.DiskClient, path: str) -> str:
     except api.RemotePathNotFoundError:
         raise FileFailed('removed from the Disk after the scan') from None
     except api.DownloadRefusedError as exc:
-        raise FileFailed(exc.reason) from None
+        raise FileFailed(exc.reason, on_yandex=True) from None
 
 
 async def _remove_recorded_partial(

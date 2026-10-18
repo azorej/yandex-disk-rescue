@@ -1,6 +1,6 @@
 """`download`: scan a remote folder (unless a recent scan covers it), mirror it into a local folder with every file
 verified, or retry only the files whose last attempt failed, was quarantined or never finished and those `verify`
-found broken, and summarize the run."""
+found broken, save the preview of each file that failed on Yandex's side, and summarize the run."""
 
 import logging
 from dataclasses import dataclass
@@ -12,10 +12,11 @@ from typing import Annotated
 import typer
 
 from yandex_disk_rescue import api, auth, console, interrupts, paths, settings
-from yandex_disk_rescue.destination import Destination, check_destination, check_partial_dir
+from yandex_disk_rescue.destination import PREVIEWS_DIR_NAME, Destination, check_destination, check_partial_dir
 from yandex_disk_rescue.errors import RescueError
+from yandex_disk_rescue.local_names import WORK_DIR_NAME
 from yandex_disk_rescue.logs import timestamp
-from yandex_disk_rescue.manifest import Manifest, ScanTime
+from yandex_disk_rescue.manifest import Manifest, Mirror, ScanTime
 from yandex_disk_rescue.mirroring import (
     MirrorReport,
     MirrorRun,
@@ -25,7 +26,8 @@ from yandex_disk_rescue.mirroring import (
     mirror_document,
     mirror_summary,
 )
-from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, ScanProgress
+from yandex_disk_rescue.previews import preview_candidates, save_previews
+from yandex_disk_rescue.progress import MirrorProgress, MoveProgress, PreviewProgress, ScanProgress
 from yandex_disk_rescue.scanning import resolve_scan_root, scan_document, scan_summary, scan_tree
 from yandex_disk_rescue.units import format_size
 
@@ -79,6 +81,7 @@ def download(
         ),
     ] = False,
     partial_dir: settings.PartialDir = settings.PARTIAL_DIR.default,
+    previews: settings.Previews = settings.PREVIEWS.default,
     scan_max_age: settings.ScanMaxAge = settings.SCAN_MAX_AGE.default,
     download_timeout: settings.DownloadTimeout = settings.DOWNLOAD_TIMEOUT.default,
     download_retries: settings.DownloadRetries = settings.DOWNLOAD_RETRIES.default,
@@ -131,6 +134,7 @@ def download(
         'no_scan': no_scan,
         'retry_failed': retry_failed,
         'partial_dir': partial_folder,
+        'previews': previews,
         'scan_max_age': scan_max_age,
         'download_timeout': download_timeout,
         'download_retries': download_retries,
@@ -160,6 +164,7 @@ def download(
                 scan_policy=_ScanPolicy(no_scan=no_scan, max_age=timedelta(minutes=scan_max_age)),
                 retry_failed=retry_failed,
                 transfers=transfers,
+                previews=previews,
                 manifest_path=manifest_path,
             )
         )
@@ -168,6 +173,7 @@ def download(
                 **mirror_document(report),
                 'retry_failed': retry_failed,
                 'partial_dir': None if partial_folder is None else str(partial_folder),
+                'previews': previews,
                 **facts,
             }
         )
@@ -248,10 +254,13 @@ async def _run(
     scan_policy: _ScanPolicy,
     retry_failed: bool,
     transfers: _Transfers,
+    previews: bool,
     manifest_path: Path,
 ) -> tuple[MirrorReport, dict[str, object]]:
     """The report of the run, and the JSON members it does not hold: the scan, the files to download, the move of
-    the partial files, the room measured in the partial folder and whether that folder keeps sparse files."""
+    the partial files, the room measured in the partial folder and whether that folder keeps sparse files. The preview
+    step runs once the transfers have ended normally, fetching previews only with `previews`; an interrupt or an error
+    that stops the transfers propagates before it."""
     async with api.DiskClient(token, base_url=base_url, limits=limits) as client:
         account = await client.account()
         scan_root = await resolve_scan_root(client, root)
@@ -278,7 +287,28 @@ async def _run(
                 report, facts = await _mirror(
                     client, run, destination, output, progress, transfers, retry_failed=retry_failed
                 )
+                await _previews(report, mirror, destination, client, output, fetch=previews)
                 return report, {'scan': scan, **facts}
+
+
+async def _previews(
+    report: MirrorReport,
+    mirror: Mirror,
+    destination: Destination,
+    client: api.DiskClient,
+    output: console.Output,
+    *,
+    fetch: bool,
+) -> None:
+    progress = PreviewProgress()
+    if not fetch or not (candidates := len(preview_candidates(report))):
+        await save_previews(report, mirror, destination, client, progress, fetch=fetch)
+        return
+    files = 'file' if candidates == 1 else 'files'
+    folder = destination.path / WORK_DIR_NAME / PREVIEWS_DIR_NAME
+    output.headline(f'Saving the previews of {candidates} failed {files} to {folder}')
+    with output.progress(progress):
+        await save_previews(report, mirror, destination, client, progress, fetch=fetch)
 
 
 async def _mirror(

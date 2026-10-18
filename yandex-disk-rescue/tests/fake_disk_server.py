@@ -1,9 +1,10 @@
 """A fake Yandex Disk REST API and download host on a real socket: an in-memory tree, a routes table, faults.
 
 A request is answered by the first of: the download host's refusal of an `Authorization` header (`/download`
-and `/storage` only), an `inject`ed fault, the `token` check (every other path), a `routes` entry, a built-in
-handler (`GET /v1/disk/`, `GET /v1/disk/resources`, `GET /v1/disk/resources/download`, `GET /download`,
-`GET /storage`), then a Yandex-style 404. Bodies are sent in 64 KiB chunks, `chunk_delay` seconds apart.
+and `/storage` only), an `inject`ed fault, the preview host's 403 to a request without the token (`/preview`), the
+`token` check (every other path), a `routes` entry, a built-in handler (`GET /v1/disk/`, `GET /v1/disk/resources`,
+`GET /v1/disk/resources/download`, `GET /download`, `GET /storage`, `GET /preview`), then a Yandex-style 404. Bodies
+are sent in 64 KiB chunks, `chunk_delay` seconds apart.
 """
 
 import enum
@@ -91,6 +92,8 @@ class FakeNode:
     content: bytes = b''
     md5: str | None = None
     sha256: str | None = None
+    preview: bytes | None = None
+    preview_type: str = 'image/jpeg'
 
 
 @dataclass
@@ -130,6 +133,12 @@ class FakeDiskApi:
     `redirect_downloads` (`/download` answers 302 to `/storage` with the same query, which serves the bytes,
     as the real host redirects to a storage host), `chunk_delay`, and the `Truncate` fault for `inject`.
 
+    A file added with a `preview` has a `preview` link in its `GET /v1/disk/resources` body when the request has a
+    `preview_size` and its `fields`, if any, name `preview`: `<base_url>/preview?path=<disk:/ path>&size=<size>`.
+    The preview host (`/preview`) serves the preview with its `preview_type`, 404 for a file without one. As the real
+    host does, it answers 403 `text/html` to a request without `Authorization: OAuth <token>` (any token when
+    `token` is None). `redirect_previews`, a base URL, makes it answer 302 to `<that base>/preview?<same query>`.
+
     `peak_in_flight` is the most requests ever answered at once; `peak_content_in_flight` the most content requests
     (`/download`, `/storage`), each counted until just before its last byte is sent. A request still sleeping in a
     `Delay` counts, also after its client gave up.
@@ -145,6 +154,7 @@ class FakeDiskApi:
     peak_content_in_flight: int = 0
     ignore_range: bool = False
     redirect_downloads: bool = False
+    redirect_previews: str | None = None
     chunk_delay: float = 0.0
     tree: dict[str, FakeNode] = field(default_factory=lambda: {'/': FakeNode('dir', DEFAULT_MODIFIED)})
     _faults: dict[tuple[str, str], list[_Fault]] = field(default_factory=dict)
@@ -180,8 +190,13 @@ class FakeDiskApi:
         modified: datetime = DEFAULT_MODIFIED,
         md5: str | None | _Checksum = _Checksum.OF_CONTENT,
         sha256: str | None | _Checksum = _Checksum.OF_CONTENT,
+        preview: bytes | None = None,
+        preview_type: str = 'image/jpeg',
     ) -> None:
-        """Add a file (and any missing parent folders); checksums default to the digests of `content`, None omits one."""
+        """Add a file (and any missing parent folders); checksums default to the digests of `content`, None omits one.
+
+        `preview` is the image the preview host serves for it, as `preview_type`; None gives the file no preview.
+        """
         key = _tree_key(path)
         self.add_dir(_parent(key))
         if self.tree.get(key, FakeNode('file', modified)).kind != 'file':
@@ -192,6 +207,8 @@ class FakeDiskApi:
             content,
             md5=hashlib.md5(content).hexdigest() if md5 is _Checksum.OF_CONTENT else md5,
             sha256=hashlib.sha256(content).hexdigest() if sha256 is _Checksum.OF_CONTENT else sha256,
+            preview=preview,
+            preview_type=preview_type,
         )
 
     def remove(self, path: str) -> None:
@@ -283,6 +300,13 @@ class FakeDiskApi:
 
     def _normal(self, request: RecordedRequest) -> FakeResponse:
         params = request.params
+        authorization = request.headers.get('authorization')
+        if request.path == '/preview' and (
+            authorization is None
+            or not authorization.startswith('OAuth ')
+            or (self.token is not None and authorization != f'OAuth {self.token}')
+        ):
+            return FakeResponse(403, b'<html><body>403 Forbidden</body></html>', {'Content-Type': 'text/html'})
         if (
             request.path not in _CONTENT_PATHS
             and self.token is not None
@@ -302,6 +326,10 @@ class FakeDiskApi:
                 return FakeResponse(302, headers={'Location': f'{self.base_url}/storage?{request.query}'})
             case ('GET', '/download' | '/storage'):
                 return self._content(params, request.headers.get('range'))
+            case ('GET', '/preview') if self.redirect_previews is not None:
+                return FakeResponse(302, headers={'Location': f'{self.redirect_previews}/preview?{request.query}'})
+            case ('GET', '/preview'):
+                return self._preview(params)
         return FakeResponse.json(
             404, {'error': 'NotFound', 'description': f'No fake route for {request.method} {request.path}'}
         )
@@ -345,6 +373,12 @@ class FakeDiskApi:
         headers['Content-Range'] = f'bytes {first}-{last}/{len(content)}'
         return FakeResponse(206, bytes(content[first : last + 1]), headers)
 
+    def _preview(self, params: dict[str, str]) -> FakeResponse:
+        node = self.tree.get(_tree_key(params.get('path', '')))
+        if node is None or node.preview is None:
+            return FakeResponse.json(404, {'error': 'NotFound', 'description': 'No preview of this file.'})
+        return FakeResponse(200, node.preview, {'Content-Type': node.preview_type})
+
     def _resources(self, params: dict[str, str]) -> FakeResponse:
         if 'path' not in params:
             return FakeResponse.json(400, {'error': 'FieldValidationError', 'description': 'path is required'})
@@ -353,6 +387,10 @@ class FakeDiskApi:
         if node is None:
             return FakeResponse.json(404, {'error': 'DiskNotFoundError', 'description': 'Resource not found.'})
         body = self._resource_json(key, node)
+        fields = params.get('fields')
+        if node.preview is not None and 'preview_size' in params and (fields is None or 'preview' in fields.split(',')):
+            query = urlencode({'path': 'disk:' + key, 'size': params['preview_size']})
+            body['preview'] = f'{self.base_url}/preview?{query}'
         if node.kind == 'dir':
             limit = int(params.get('limit', _DEFAULT_LIMIT))
             offset = int(params.get('offset', 0))

@@ -142,7 +142,7 @@ STATUS_LINE = re.compile(
     NOTICE_TIMESTAMP.pattern
     + r'(?:(?:Scanning|Scanned) \S.*: \d+ files?, \d+ folders? \(.*\) listed'
     + r'|Checking \d+ files? already in |Checked \d+ of \d+ files? already in '
-    + r'|(?:Moving|Moved|Downloading|Downloaded|Verifying|Verified): \d+ of \d+ files?, )'
+    + r'|(?:Moving|Moved|Downloading|Downloaded|Verifying|Verified|Previews): \d+ of \d+ files?, )'
 )
 
 
