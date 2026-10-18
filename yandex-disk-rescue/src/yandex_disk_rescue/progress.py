@@ -50,16 +50,17 @@ class ProgressState(Protocol):
 
 
 class _Rate:
-    """The history of a growing byte count, one sample a second at most, kept for the last `ETA_SECONDS`; not
-    thread-safe."""
+    """The history of a growing byte count, one sample a second at most, kept for the last `horizon` seconds, the
+    longest window it measures; not thread-safe."""
 
-    def __init__(self, now: float) -> None:
+    def __init__(self, now: float, *, horizon: float) -> None:
+        self._horizon = horizon
         self._samples: deque[tuple[float, int]] = deque([(now, 0)])
 
     def note(self, now: float, total: int) -> None:
         if now - self._samples[-1][0] >= _SAMPLE_SECONDS:
             self._samples.append((now, total))
-        while len(self._samples) > 1 and self._samples[1][0] <= now - ETA_SECONDS:
+        while len(self._samples) > 1 and self._samples[1][0] <= now - self._horizon:
             self._samples.popleft()
 
     def per_second(self, now: float, total: int, window: float) -> float | None:
@@ -207,13 +208,13 @@ class MoveProgress:
         self._started_at = now
         self._started = False
         self._files = self._size = self._moved = self._moved_size = 0
-        self._rate = _Rate(now)
+        self._rate = _Rate(now, horizon=ETA_SECONDS)
 
     def start(self, files: int, size: int) -> None:
         """The move of `files` partial files holding `size` confirmed bytes starts."""
         with self._lock:
             now = time.monotonic()
-            self._started, self._started_at, self._rate = True, now, _Rate(now)
+            self._started, self._started_at, self._rate = True, now, _Rate(now, horizon=ETA_SECONDS)
             self._files, self._size = files, size
 
     def copied(self, size: int) -> None:
@@ -346,7 +347,7 @@ class MirrorProgress:
         self._active: dict[int, _Active] = {}
         self._retry: dict[int, int] = {}
         self._received = 0
-        self._rate = _Rate(now)
+        self._rate = _Rate(now, horizon=ETA_SECONDS)
         self._pass_number, self._passes = 1, 0
         self._starts_at: float | None = None
 
@@ -364,7 +365,7 @@ class MirrorProgress:
         """The first of at most `passes` passes (0: no limit) over `files` files of `size` bytes starts."""
         with self._lock:
             now = time.monotonic()
-            self._phase, self._started, self._rate = 'transferring', now, _Rate(now)
+            self._phase, self._started, self._rate = 'transferring', now, _Rate(now, horizon=ETA_SECONDS)
             self._files, self._size, self._passes = files, size, passes
 
     def pausing(self, number: int, seconds: float) -> None:
@@ -383,7 +384,8 @@ class MirrorProgress:
         count again."""
         with self._lock:
             self._retry.pop(key, None)
-            self._active[key] = _Active(path, size, 0, 'waiting for a connection', None, _Rate(time.monotonic()))
+            rate = _Rate(time.monotonic(), horizon=TRANSFER_SPEED_SECONDS)
+            self._active[key] = _Active(path, size, 0, 'waiting for a connection', None, rate)
         return ActiveFile(self, key, path)
 
     def defer(self, key: int) -> None:
@@ -454,7 +456,8 @@ class MirrorProgress:
             if change == 1:
                 active.connected = now
                 if active.connections == 1:
-                    active.state, active.received, active.rate = 'downloading', 0, _Rate(now)
+                    active.state, active.received = 'downloading', 0
+                    active.rate = _Rate(now, horizon=TRANSFER_SPEED_SECONDS)
             elif active.connections == 0:
                 active.state, active.connected = 'waiting for a connection', None
 
@@ -555,13 +558,13 @@ class VerifyProgress:
         self._started = False
         self._files = self._size = self._checked = self._done_size = self._problems = self._read = self._current = 0
         self._reading: tuple[str, int] | None = None
-        self._rate = _Rate(now)
+        self._rate = _Rate(now, horizon=ETA_SECONDS)
 
     def start(self, files: int, size: int) -> None:
         """The part over `files` files of `size` bytes starts."""
         with self._lock:
             now = time.monotonic()
-            self._started, self._started_at, self._rate = True, now, _Rate(now)
+            self._started, self._started_at, self._rate = True, now, _Rate(now, horizon=ETA_SECONDS)
             self._files, self._size = files, size
 
     def reading(self, path: str, size: int) -> None:

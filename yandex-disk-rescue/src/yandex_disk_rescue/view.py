@@ -11,7 +11,7 @@ import threading
 from collections.abc import Callable, Iterator
 from typing import Self
 
-from rich.cells import cell_len
+from rich.cells import cell_len, split_graphemes
 from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
 from rich.live import Live
 from rich.progress_bar import ProgressBar
@@ -176,10 +176,13 @@ def _rows(rows: list[tuple[str, str, str]], width: int) -> Iterator[Text]:
 
 
 def _shortened(path: str, room: int) -> str:
-    """`path`, or its end after `…`, in at most `room` cells."""
-    if cell_len(path) <= room:
+    """`path`, or its end after `…`, in at most `room` cells, cut between two graphemes."""
+    graphemes, width = split_graphemes(path)
+    if width <= room:
         return path
-    end = path
-    while end and cell_len(end) > room - 1:
-        end = end[1:]
-    return f'…{end}'
+    start, kept = len(path), 0
+    for begin, _, cells in reversed(graphemes):
+        if kept + cells > room - 1:
+            break
+        start, kept = begin, kept + cells
+    return f'…{path[start:]}'

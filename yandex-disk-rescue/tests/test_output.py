@@ -3,6 +3,7 @@ lines on stderr, the verbosity and progress flags and the log file in the XDG st
 
 import errno
 import fcntl
+import io
 import json
 import os
 import pty
@@ -11,6 +12,7 @@ import signal
 import stat
 import struct
 import subprocess
+import sys
 import termios
 import threading
 import time
@@ -31,7 +33,8 @@ from mirror_tree import (
     stderr_lines,
     wait_until,
 )
-from yandex_disk_rescue import destination, localfs, logs, mirroring, progress
+from rich.cells import cell_len
+from yandex_disk_rescue import destination, localfs, logs, mirroring, progress, view
 from yandex_disk_rescue.cli import app
 from yandex_disk_rescue.commands import scan as scan_command
 from yandex_disk_rescue.commands.download import INTERRUPTED
@@ -737,6 +740,31 @@ def test_no_speed_shows_before_a_second_of_bytes_was_measured(monkeypatch):
         r'Downloading: 0 of 1 file, 1\.1 MiB of 10\.0 MiB \(10\.6%\), 1\.1 MiB/s, ETA 8 s; .*',
         later.status_line(final=False),
     )
+    for _ in range(30):
+        clock[0] += 1.0
+        active.wrote(2 * 1024 * 1024)
+    [transfer] = state.snapshot().active
+    assert transfer.speed == pytest.approx(2 * 1024 * 1024)
+
+
+def test_the_view_shortens_a_very_long_path_from_the_left_to_its_row(monkeypatch):
+    path = 'disk:/' + 'дир/' * 50_000 + '文件.bin'
+    state = progress.MirrorProgress()
+    state.start_transferring(1, 1, passes=7)
+    state.begin(1, path, 1)
+    terminal = io.StringIO()
+    monkeypatch.setattr(sys, 'stderr', terminal)
+    monkeypatch.setenv('COLUMNS', '100')
+
+    started = time.monotonic()
+    with view.LiveView(state):
+        pass
+
+    assert time.monotonic() - started < 5
+    frames = re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', terminal.getvalue()).replace('\r', '')
+    [shown] = set(re.findall(r'  ….*?waiting for a connection', frames))
+    assert re.fullmatch(r'  …(?:/?дир)*/文件\.bin +0 B of 1 B \(0\.0%\)  waiting for a connection', shown)
+    assert cell_len(shown) == 100
 
 
 def test_a_file_with_no_connection_open_waits_for_one_and_is_never_without_data(monkeypatch):
