@@ -1,9 +1,9 @@
 """The handlers of the `yandex_disk_rescue` logger: the rotating log file and the notices on stderr.
 
-Every line of the log file, and every notice on a stderr that is not a terminal, starts with a UTC timestamp; a
-multi-line message (a summary, a traceback) is written as one prefixed line per line, so each line of the log file
-says when and which run wrote it. Every control character of a message but its line breaks is escaped
-(`display.display_text`), in the log file as on stderr.
+Every line of the log file, and every notice on a stderr that is not a terminal, starts with a UTC timestamp. A
+message is one line, every control character in it, a newline too, escaped (`display.display_line`), in the log file
+as on stderr; a traceback is written as one prefixed line per line, so each line of the log file says when and which
+run wrote it.
 """
 
 import contextlib
@@ -17,7 +17,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from yandex_disk_rescue.display import display_text
+from yandex_disk_rescue.display import display_line, display_text
 
 LOGGER_NAME = 'yandex_disk_rescue'
 MAX_BYTES = 10 * 2**20
@@ -40,10 +40,9 @@ class _PrefixedFormatter(logging.Formatter):
         self._prefix = prefix
 
     def format(self, record: logging.LogRecord) -> str:
-        text = record.getMessage()
+        text = display_line(record.getMessage())
         if record.exc_info:
-            text = f'{text}\n{self.formatException(record.exc_info).rstrip()}'
-        text = display_text(text)
+            text = f'{text}\n{display_text(self.formatException(record.exc_info).rstrip())}'
         prefix = self._prefix(record)
         return '\n'.join(f'{prefix}{line}' for line in text.splitlines() or [''])
 
@@ -132,7 +131,9 @@ _stderr = _Stderr()
 
 
 def notice(text: str, *, timestamped: bool) -> None:
-    """Write `text` to stderr as a notice: `<UTC timestamp> <text>`, or `text` alone when not `timestamped`."""
+    """Write `text`, as one line, to stderr as a notice: `<UTC timestamp> <text>`, or `text` alone when not
+    `timestamped`."""
+    text = display_line(text)
     write_stderr(f'{timestamp(time.time())} {text}' if timestamped else text)
 
 

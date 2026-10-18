@@ -3,11 +3,10 @@
 import asyncio
 import bisect
 import logging
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from yandex_disk_rescue import api
-from yandex_disk_rescue.display import display_path
 from yandex_disk_rescue.manifest import Manifest, ScanDiff, ScanSession
 from yandex_disk_rescue.progress import ScanProgress
 from yandex_disk_rescue.units import format_size
@@ -95,11 +94,11 @@ async def scan_tree(
     listed, and the result and the commit name it. Folders are listed with `client.limits.concurrency` concurrent listings; the first
     failed listing stops the walk, is raised, and leaves the manifest unchanged.
     """
-    _log.info('Scanning %s', display_path(root.path))
+    _log.info('Scanning %s', root.path)
     session = manifest.begin_scan(account.uid, root.path)
     if root.resource is not None:
         session.add([root.resource])
-    progress.start(display_path(root.path))
+    progress.start(root.path)
     walk = _Walk(client, session, root.path, progress, workers=client.limits.concurrency)
     await walk.run()
     totals = ScanTotals()
@@ -114,7 +113,7 @@ async def scan_tree(
     )
     _log.info(
         'Scan of %s committed: %s, %s, %s; %s',
-        display_path(root.path),
+        root.path,
         _plural(totals.files, 'file'),
         _plural(totals.folders, 'folder'),
         format_size(totals.size),
@@ -126,19 +125,19 @@ async def scan_tree(
 def scan_summary(result: ScanResult, *, limit: int | None = SHOWN_PATHS) -> list[str]:
     """The lines reporting a scan: totals, files without a checksum, vanished folders, entries left out for their
     names, and the changes; each list shows its first `limit` members (`None`: all)."""
-    totals, diff, root = result.totals, result.diff, display_path(result.root)
+    totals, diff, root = result.totals, result.diff, result.root
     lines = [
         f'Scanned {root}: {_plural(totals.files, "file")}, {_plural(totals.folders, "folder")}, '
         f'{format_size(totals.size)}',
         f'Files without a cloud checksum: {totals.without_checksum.count}',
-        *listed('', _shown(totals.without_checksum.smallest), totals.without_checksum.count, '', limit=limit),
+        *listed('', totals.without_checksum.smallest, totals.without_checksum.count, '', limit=limit),
     ]
     if result.vanished:
         lines.append(f'Folders that disappeared during the scan: {len(result.vanished)}')
-        lines += listed('', _shown(result.vanished), len(result.vanished), '', limit=limit)
+        lines += listed('', result.vanished, len(result.vanished), '', limit=limit)
     if result.unencodable:
         lines.append(f'Not recorded, the name is not valid Unicode: {len(result.unencodable)}')
-        shown = _shown(resource.path for resource in result.unencodable)
+        shown = [resource.path for resource in result.unencodable]
         lines += listed('', shown, len(shown), '', limit=limit)
     if diff.first_scan:
         lines.append(f'First scan of {root}')
@@ -147,9 +146,9 @@ def scan_summary(result: ScanResult, *, limit: int | None = SHOWN_PATHS) -> list
             f'Changes since the last scan: {len(diff.added)} added, {len(diff.changed)} changed, '
             f'{len(diff.removed)} removed'
         )
-        lines += listed('+ ', _shown(diff.added), len(diff.added), ' added', limit=limit)
-        lines += listed('~ ', _shown(diff.changed), len(diff.changed), ' changed', limit=limit)
-        lines += listed('- ', _shown(diff.removed), len(diff.removed), ' removed', limit=limit)
+        lines += listed('+ ', diff.added, len(diff.added), ' added', limit=limit)
+        lines += listed('~ ', diff.changed, len(diff.changed), ' changed', limit=limit)
+        lines += listed('- ', diff.removed, len(diff.removed), ' removed', limit=limit)
     return lines
 
 
@@ -170,10 +169,6 @@ def scan_document(result: ScanResult) -> dict[str, object]:
         'changed': diff.changed,
         'removed': diff.removed,
     }
-
-
-def _shown(paths: Iterable[str]) -> list[str]:
-    return [display_path(path) for path in paths]
 
 
 def listed(marker: str, shown: Sequence[str], count: int, what: str, *, limit: int | None) -> list[str]:
@@ -250,7 +245,7 @@ class _Walk:
                 if resource.path in self._vanished:
                     continue
                 if not _is_unicode(resource.path):
-                    _log.warning('%s left out: the name is not valid Unicode', display_path(resource.path))
+                    _log.warning('%s left out: the name is not valid Unicode', resource.path)
                     self._unencodable[resource.path] = resource
                     continue
                 self._batch.append(resource)
@@ -261,7 +256,7 @@ class _Walk:
                     self._progress.listed_file(resource.size or 0)
                 if len(self._batch) >= _STAGE_BATCH:
                     self._stage()
-            _log.debug('Listed %s', display_path(folder))
+            _log.debug('Listed %s', folder)
         except api.RemotePathNotFoundError, api.NotAFolderError:
             if folder == self._root:
                 raise
@@ -279,7 +274,7 @@ class _Walk:
     def _vanish(self, folder: str) -> None:
         if self._has_vanished(folder):
             return
-        _log.warning('%s disappeared during the scan; it is recorded as removed', display_path(folder))
+        _log.warning('%s disappeared during the scan; it is recorded as removed', folder)
         self._vanished = {path for path in self._vanished if not _within(path, folder)} | {folder}
         self._batch = [resource for resource in self._batch if not _within(resource.path, folder)]
         self._unencodable = {path: r for path, r in self._unencodable.items() if not _within(path, folder)}

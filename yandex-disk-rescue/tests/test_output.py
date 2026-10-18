@@ -593,6 +593,50 @@ def test_control_characters_of_a_remote_name_are_escaped_in_the_report_the_notic
     assert [failure['path'] for failure in document['failed']] == [RED]
 
 
+def test_a_reason_quoting_a_local_name_with_a_newline_stays_one_line_in_the_report_the_notices_and_the_log(
+    disk, dest, monkeypatch, tmp_path
+):
+    disk.add_file('disk:/Two\nlines.txt', b'two', modified=MODIFIED)
+    disk.add_file('disk:/Blocked\nhere/x.txt', b'x', modified=MODIFIED)
+    make_dir = localfs.make_dir
+
+    def refusing(name, *, dir_fd):
+        if name.startswith('Blocked'):
+            raise OSError(errno.EACCES, os.strerror(errno.EACCES))
+        make_dir(name, dir_fd=dir_fd)
+
+    monkeypatch.setattr(localfs, 'make_dir', refusing)
+    blocker = tmp_path / 'not\na folder'
+    blocker.write_bytes(b'')
+
+    downloaded = run_download(str(dest))
+    (dest / 'Two\nlines.txt').unlink()
+    verified = runner.invoke(app, ['verify', str(dest)])
+    document = json.loads(runner.invoke(app, ['verify', '--json', str(dest)]).stdout)
+    refused = run_download(str(blocker))
+
+    assert (downloaded.exit_code, verified.exit_code, refused.exit_code) == (1, 1, 2)
+    blocked = f'could not write Blocked\\x0ahere: {os.strerror(errno.EACCES)}'
+    missing = r'disk:/Two\x0alines.txt: Two\x0alines.txt is missing'
+    assert f'Failed: 2\n  disk:/Blocked\\x0ahere: {blocked}\n  disk:/Blocked\\x0ahere/x.txt: {blocked}\n' in (
+        downloaded.stdout
+    )
+    assert f'Missing: 1\n  {missing}\nNot downloaded: 1\n  disk:/Blocked\\x0ahere/x.txt: {blocked}\n' in (
+        verified.stdout
+    )
+    assert f'disk:/Blocked\\x0ahere failed: {blocked}' in stderr_lines(downloaded.stderr)
+    assert r'disk:/Two\x0alines.txt missing: Two\x0alines.txt is missing' in stderr_lines(verified.stderr)
+    shown = str(blocker).replace('\n', r'\x0a')
+    assert refused.stderr == f'Error: Destination {shown} exists and is not a folder.\n'
+    messages = log_messages()
+    assert f'disk:/Blocked\\x0ahere failed: {blocked}' in messages
+    assert f'  {missing}' in messages
+    assert [problem['path'] for problem in document['missing']] == ['disk:/Two\nlines.txt']
+    assert document['not_downloaded'] == [
+        {'path': 'disk:/Blocked\nhere/x.txt', 'reason': f'could not write Blocked\nhere: {os.strerror(errno.EACCES)}'}
+    ]
+
+
 def test_the_live_view_shows_the_control_characters_of_a_remote_name_escaped(disk, dest):
     slow = 'disk:/\x1b[31mslow\r.bin'
     disk.add_file(slow, bytes(6 * 64 * 1024), modified=MODIFIED)

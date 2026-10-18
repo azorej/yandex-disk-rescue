@@ -211,9 +211,9 @@ yandex-disk-rescue/
 │   │                 #   one notice when a write fails) and the notices on stderr (timestamped off a terminal),
 │   │                 #   sent through the live view while one is shown
 │   ├── units.py      # format_size and format_duration — binary-unit byte counts and durations for command output
-│   ├── display.py    # display_path and display_text — names and messages with every control character and lone
-│   │                 #   surrogate escaped (`\x1b`, `\udcxx`), for every line the report, stderr, the live view
-│   │                 #   and the log file get
+│   ├── display.py    # display_line and display_text — text with every control character and lone surrogate
+│   │                 #   escaped (`\x1b`, `\x0a`, `\udcxx`), applied where the report, stderr, the live view and
+│   │                 #   the log file are written
 │   ├── errors.py     # RescueError — expected, user-facing failures with an exit code
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its

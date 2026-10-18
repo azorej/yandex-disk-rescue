@@ -83,7 +83,6 @@ from yandex_disk_rescue.destination import (
     PreviousPartials,
 )
 from yandex_disk_rescue.disk_threads import DiskThreads
-from yandex_disk_rescue.display import display_path
 from yandex_disk_rescue.local_names import WORK_DIR_NAME, collision_key, map_local_names, rejected_name_conversion
 from yandex_disk_rescue.manifest import (
     LocalFingerprint,
@@ -719,7 +718,7 @@ class MirrorRun:
         moved = sum(segment.confirmed - segment.start for segment in movable)
         _log.debug(
             '%s: partial file moved from %s to %s (%s confirmed)',
-            display_path(entry.resource.path),
+            entry.resource.path,
             source.path,
             self._destination.partial_folder,
             format_size(moved),
@@ -783,7 +782,7 @@ class MirrorRun:
         report.replaced_folder = self._destination.replaced_folder
         for unencodable in self._mirror.unencodable():
             reason = unencodable_reason(unencodable)
-            _log.warning('%s failed: %s', display_path(unencodable.path), reason)
+            _log.warning('%s failed: %s', unencodable.path, reason)
             report.failed.append(Failure(unencodable.path, reason))
         self._in_path_order(report)
         return report
@@ -800,14 +799,14 @@ class MirrorRun:
                     _note_renamed(report, entry, local)
                 if entry.entry_id in self._held:
                     held = held_copy(entry, entry.failure)
-                    _log.debug('%s held in quarantine: kept at %s', display_path(entry.resource.path), held.copy)
+                    _log.debug('%s held in quarantine: kept at %s', entry.resource.path, held.copy)
                     report.quarantined.append(held)
                 elif reason := _blocked_by(local, blocked):
                     self._fail(report, entry, reason)
                 elif entry.resource.kind == 'dir':
                     await self._make_folder(entry, local, blocked, tools)
                 elif entry.entry_id in self._current:
-                    _log.debug('%s verified already: skipped', display_path(entry.resource.path))
+                    _log.debug('%s verified already: skipped', entry.resource.path)
                     report.skipped += 1
                     _note_verified(report, entry, _recorded_method(entry))
                     self._succeeded(entry)
@@ -884,12 +883,12 @@ class MirrorRun:
     ) -> None:
         """One file's turn in a pass; a deferred file is added to `deferred`."""
         if (later := await self._download(entry, tools)) is not None:
-            _log.info('%s deferred to a later pass: %s', display_path(entry.resource.path), later.reason)
+            _log.info('%s deferred to a later pass: %s', entry.resource.path, later.reason)
             self._progress.defer(entry.entry_id)
             deferred.append((entry, later))
 
     def _fail(self, report: MirrorReport, entry: MirrorEntry, reason: str) -> None:
-        path = display_path(entry.resource.path)
+        path = entry.resource.path
         outcome: Outcome
         if is_held(entry):
             held = held_copy(entry, reason)
@@ -930,7 +929,7 @@ class MirrorRun:
     async def _download(self, entry: MirrorEntry, tools: _RunTools) -> FileDeferred | None:
         """Mirror one file into the report; the failure when it is deferred to a later pass instead."""
         report = tools.report
-        path = display_path(entry.resource.path)
+        path = entry.resource.path
         size = entry.resource.size or 0
         started = time.monotonic()
         try:
@@ -1323,7 +1322,7 @@ async def _copy_to_destination(
 ) -> Digest:
     """Copy the finished partial file to its staged copy in the destination, in order, one chunk per thread call,
     under `copying`; then give the copy the cloud mtime, durably. The digest of the bytes copied."""
-    path = display_path(entry.resource.path)
+    path = entry.resource.path
     if copying.locked():
         _log.debug('%s waits for the copy of another file to %s', path, destination.path)
         progress.state('waiting for the copy')
@@ -1391,7 +1390,7 @@ async def _resume(
         return _streams((), size)
     held = partial.size()
     streams = _streams(record.segments, size)
-    path = display_path(entry.resource.path)
+    path = entry.resource.path
     for position, segment in enumerate(record.segments):
         if segment.start < segment.confirmed <= held:
             stream = streams[position]
@@ -1528,7 +1527,7 @@ class _Journal:
     ) -> None:
         self.streams = streams
         self._entry_id = entry_id
-        self._path = display_path(path)
+        self._path = path
         self._identity = identity
         self._mirror = mirror
         self._partial = partial
@@ -1598,7 +1597,7 @@ class _Link:
                 return True
             if generation > 1:
                 return False
-            _log.debug('%s: the download host rejected the link; getting a new one', display_path(self._path))
+            _log.debug('%s: the download host rejected the link; getting a new one', self._path)
             self._href = await _download_link(self._client, self._path)
             self._generation += 1
             return True
@@ -1622,7 +1621,7 @@ class _FileFetch:
         retries: int,
         progress: ActiveFile,
     ) -> None:
-        self._path = display_path(path)
+        self._path = path
         self._identity = identity
         self._partial = partial
         self._journal = journal
@@ -1745,7 +1744,7 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
     files, renamed entries, what was moved aside, quarantined files with their reasons and copies, and failures with
     their reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
-        f'Mirrored {display_path(report.remote_root)} to {report.destination}: {report.downloaded} downloaded '
+        f'Mirrored {report.remote_root} to {report.destination}: {report.downloaded} downloaded '
         f'({format_size(report.downloaded_size)}), {report.skipped} skipped, {len(report.quarantined)} quarantined, '
         f'{len(report.failed)} failed'
     ]
@@ -1754,17 +1753,17 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines.append(f'Passes: {used} of {most or "unlimited"}')
     if report.adopted:
         lines.append(f'Already on disk and verified: {len(report.adopted)}')
-        lines += listed('', [display_path(path) for path in report.adopted], len(report.adopted), '', limit=limit)
+        lines += listed('', report.adopted, len(report.adopted), '', limit=limit)
     if report.size_only:
         lines.append(f'Verified by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', [display_path(path) for path in report.size_only], len(report.size_only), '', limit=limit)
+        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
     if report.renamed:
         lines.append(f'Renamed for the destination: {len(report.renamed)}')
-        shown = [f'{display_path(remote)} -> {display_path(str(local))}' for remote, local in report.renamed]
+        shown = [f'{remote} -> {local}' for remote, local in report.renamed]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.moved_aside:
         lines.append(f'Moved aside to {report.replaced_folder}/: {len(report.moved_aside)}')
-        shown = [display_path(str(local)) for local in report.moved_aside]
+        shown = [str(local) for local in report.moved_aside]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.quarantined:
         lines.append(f'Quarantined: {len(report.quarantined)}')
@@ -1773,7 +1772,7 @@ def mirror_summary(report: MirrorReport, *, limit: int | None = SHOWN_PATHS) -> 
         lines.append(_QUARANTINE_HINT)
     if report.failed:
         lines.append(f'Failed: {len(report.failed)}')
-        shown = [f'{display_path(failure.path)}: {failure.reason}' for failure in report.failed]
+        shown = [f'{failure.path}: {failure.reason}' for failure in report.failed]
         lines += listed('', shown, len(shown), '', limit=limit)
     if report.partials_left:
         lines.append(f'Partial files not deleted: {len(report.partials_left)}')
@@ -1851,7 +1850,7 @@ def held_copy(entry: MirrorEntry, last_retry: str | None) -> QuarantinedFile:
 
 def quarantined_line(held: QuarantinedFile) -> str:
     """How a summary lists the quarantined file `held`: its path and reason, its last retry, and its copy."""
-    return f'{display_path(held.path)}: {quarantined_reason(held)}; kept at {display_path(str(held.copy))}'
+    return f'{held.path}: {quarantined_reason(held)}; kept at {held.copy}'
 
 
 def quarantined_reason(held: QuarantinedFile) -> str:
@@ -1924,7 +1923,7 @@ async def _remove_recorded_partial(
         left = PartialLeft(Path(exc.filename), exc.strerror)
         _log.warning(
             '%s: partial file %s not deleted: %s; the outcome stands',
-            display_path(entry.resource.path),
+            entry.resource.path,
             left.path,
             left.reason,
         )
@@ -1987,7 +1986,7 @@ def _note_verified(report: MirrorReport, entry: MirrorEntry, verified_by: Verifi
 
 
 def _note_renamed(report: MirrorReport, entry: MirrorEntry, local: PurePosixPath) -> None:
-    _log.info('%s renamed for the destination: %s', display_path(entry.resource.path), local)
+    _log.info('%s renamed for the destination: %s', entry.resource.path, local)
     report.renamed.append((entry.resource.path, local))
 
 

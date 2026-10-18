@@ -815,11 +815,13 @@ terminal, nothing the tool writes contains escape codes or carriage returns,
 whatever `FORCE_COLOR` or `TTY_COMPATIBLE` say.
 
 A name on the Disk can hold any character. In the report, the notices, the
-status lines, the live view and the log file, each control character of a
-name (an escape, a carriage return, a newline, any other C0 or C1 control,
-U+2028 or U+2029) is shown as its escape, such as `\x1b` or `\x0d`, and a
-lone surrogate (a name that is not valid Unicode) as `\udcxx`: a hostile name
-cannot move the cursor, recolour the terminal or forge a line of the log.
+status lines, the live view, the error line and the log file, each control
+character of a name (an escape, a carriage return, a newline, any other C0 or
+C1 control, U+2028 or U+2029) is shown as its escape, such as `\x1b` or
+`\x0a`, and a lone surrogate (a name that is not valid Unicode) as `\udcxx`,
+whether the name appears as a path or inside a reason that quotes the local
+file: a hostile name cannot move the cursor, recolour the terminal or forge a
+line of the report or the log.
 
 A notice is one line, `<UTC time> <message>` (on a terminal, the message
 alone):
@@ -861,9 +863,9 @@ summary lists them.
 2026-10-17T09:41:12.457Z INFO download[12345] download completed (exit 0)
 ```
 
-- Each line starts with the UTC time, the level, the command and its pid; a
-  multi-line record (a summary, a traceback) gets that prefix on every line,
-  so `grep` always shows when and which run wrote a line.
+- Each line starts with the UTC time, the level, the command and its pid;
+  every line of a summary or a traceback gets that prefix too, so `grep`
+  always shows when and which run wrote a line.
 - A run logs its start (the version and every argument and option value,
   `partial_dir` included), its start lines (`Downloading N files …`,
   `Moving the confirmed bytes …`, `The partial folder of the last run … is

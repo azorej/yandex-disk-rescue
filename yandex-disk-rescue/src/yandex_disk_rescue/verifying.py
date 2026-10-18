@@ -30,7 +30,6 @@ from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
 from yandex_disk_rescue.destination import ReadOnlyDestination
-from yandex_disk_rescue.display import display_path
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import (
     DownloadRecord,
@@ -174,11 +173,11 @@ class VerifyRun:
             _count_intact(entry, report)
         elif is_held(entry):
             held = held_copy(entry, entry.failure)
-            _log.debug('%s quarantined: kept at %s', display_path(entry.resource.path), held.copy)
+            _log.debug('%s quarantined: kept at %s', entry.resource.path, held.copy)
             report.quarantined.append(held)
         else:
             reason = _not_downloaded_reason(entry)
-            _log.debug('%s not downloaded: %s', display_path(entry.resource.path), reason)
+            _log.debug('%s not downloaded: %s', entry.resource.path, reason)
             report.not_downloaded.append(Problem(entry.resource.path, reason))
 
     def _commit_cursor(self) -> None:
@@ -188,15 +187,15 @@ class VerifyRun:
         self._committed_at = time.monotonic()
 
     def _check(self, entry: MirrorEntry, report: VerifyReport) -> None:
-        self._progress.reading(display_path(entry.resource.path), entry.resource.size or 0)
+        self._progress.reading(entry.resource.path, entry.resource.size or 0)
         finding = _finding(entry, self._destination, self._progress.read)
         self._progress.checked()
         if finding is not None:
-            _log.warning('%s %s: %s', display_path(entry.resource.path), finding.kind, finding.reason)
+            _log.warning('%s %s: %s', entry.resource.path, finding.kind, finding.reason)
             self._mirror.record_finding(entry.entry_id, finding)
             report.add(entry, finding)
             return
-        _log.debug('%s intact', display_path(entry.resource.path))
+        _log.debug('%s intact', entry.resource.path)
         _count_intact(entry, report)
         if entry.finding is not None:
             self._mirror.clear_finding(entry.entry_id)
@@ -206,13 +205,13 @@ def verify_summary(report: VerifyReport, *, limit: int | None = SHOWN_PATHS) -> 
     """The lines reporting a check: the counts, the files checked by size only, then each kind of problem with its
     reasons; each list shows its first `limit` members (`None`: all)."""
     lines = [
-        f'Verified {report.destination} ({display_path(report.remote_root)}): {report.intact} intact, '
+        f'Verified {report.destination} ({report.remote_root}): {report.intact} intact, '
         f'{len(report.missing)} missing, {len(report.modified)} modified, {len(report.corrupt)} corrupt, {len(report.quarantined)} quarantined, '
         f'{len(report.not_downloaded)} not downloaded'
     ]
     if report.size_only:
         lines.append(f'Checked by size only (no cloud checksum): {len(report.size_only)}')
-        lines += listed('', [display_path(path) for path in report.size_only], len(report.size_only), '', limit=limit)
+        lines += listed('', report.size_only, len(report.size_only), '', limit=limit)
     for title, problems in (('Missing', report.missing), ('Modified', report.modified), ('Corrupt', report.corrupt)):
         lines += _problem_lines(title, _problems(problems), limit)
     lines += _problem_lines('Quarantined', [quarantined_line(held) for held in report.quarantined], limit)
@@ -250,13 +249,13 @@ def _finding_document(problem: Problem) -> dict[str, object]:
 
 
 def _problems(problems: list[Problem]) -> list[str]:
-    return [f'{display_path(problem.path)}: {problem.reason}{_repair(problem.repair)}' for problem in problems]
+    return [f'{problem.path}: {problem.reason}{_repair(problem.repair)}' for problem in problems]
 
 
 def _repair(held: QuarantinedFile | None) -> str:
     if held is None:
         return ''
-    return f'; repair quarantined: {quarantined_reason(held)}; kept at {display_path(str(held.copy))}'
+    return f'; repair quarantined: {quarantined_reason(held)}; kept at {held.copy}'
 
 
 def _problem_lines(title: str, shown: list[str], limit: int | None) -> list[str]:

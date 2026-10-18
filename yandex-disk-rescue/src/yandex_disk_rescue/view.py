@@ -19,7 +19,7 @@ from rich.segment import Segment
 from rich.spinner import Spinner
 from rich.text import Text
 
-from yandex_disk_rescue.display import display_text
+from yandex_disk_rescue.display import display_line
 from yandex_disk_rescue.progress import (
     ActiveTransfer,
     MirrorSnapshot,
@@ -96,7 +96,7 @@ class _View:
         line = self._snapshot.status_line(final=False)
         if line is None:
             return
-        line = display_text(line)
+        line = display_line(line)
         # A notice printed above the view comes with no wrapping, which the view, drawn in the same pass, must not
         # take on.
         wrapped = options.update(no_wrap=False, overflow='fold')
@@ -170,7 +170,7 @@ def _rows(rows: list[tuple[str, str, str]], width: int) -> Iterator[Text]:
     details = max(cell_len(detail) for _, _, detail in rows)
     room = max(width - amounts - details - 6, 1)
     for path, amount, detail in rows:
-        shown = _shortened(display_text(path), room)
+        shown = _shortened(display_line(path), room)
         padding = ' ' * (room - cell_len(shown))
         yield Text(f'  {shown}{padding}  {" " * (amounts - cell_len(amount))}{amount}  {detail}', no_wrap=True)
 

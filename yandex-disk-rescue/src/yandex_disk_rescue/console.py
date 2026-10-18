@@ -29,7 +29,7 @@ from typing import Annotated, Literal, TextIO
 import typer
 
 from yandex_disk_rescue import __version__, paths
-from yandex_disk_rescue.display import display_text
+from yandex_disk_rescue.display import display_line
 from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.logs import (
     CONSOLE,
@@ -135,9 +135,9 @@ class Output:
         return self._log_file.path
 
     def line(self, text: str) -> None:
-        """Write the report line `text`, its control characters escaped, to stdout, above the live view when one is
-        shown; with `--json` to stderr as a notice instead (nowhere with `--quiet`)."""
-        text = display_text(text)
+        """Write the report line `text` as one line, its control characters (a newline too) escaped, to stdout, above
+        the live view when one is shown; with `--json` to stderr as a notice instead (nowhere with `--quiet`)."""
+        text = display_line(text)
         if self._options.json:
             if self._options.verbosity != 'quiet':
                 write_stderr(text)
@@ -154,7 +154,9 @@ class Output:
     def summary(self, lines: Callable[..., list[str]]) -> None:
         """Log the summary `lines(limit=None)`, every list in full, to the log file, then print `lines()`, whose lists
         show their first few members."""
-        _log.info('Summary:\n%s', '\n'.join(lines(limit=None)), extra=FILE_ONLY)
+        _log.info('Summary:', extra=FILE_ONLY)
+        for line in lines(limit=None):
+            _log.info('%s', line, extra=FILE_ONLY)
         for line in lines():
             self.line(line)
 
