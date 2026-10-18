@@ -58,7 +58,8 @@ A user-visible change adds a line under `## [Unreleased]` in [`CHANGELOG.md`](CH
 4. In the Actions run, **Review deployments → approve `pypi`**.
 
 The first release is the pre-release `v1.0.0rc1`, which rehearses the whole pipeline on PyPI. Once it is verified,
-a release PR sets `1.0.0` and renames its CHANGELOG heading, and the tag `v1.0.0` follows.
+a release PR sets `1.0.0`, renames its CHANGELOG heading and drops the release-candidate notes from
+`README.md`'s status banner and Installation, and the tag `v1.0.0` follows.
 
 ### When a job fails
 

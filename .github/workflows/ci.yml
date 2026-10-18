@@ -31,7 +31,7 @@ jobs:
     name: Detect changed paths
     runs-on: ubuntu-latest
     permissions:
-      pull-requests: read
+      pull-requests: read # dorny/paths-filter lists a pull request's changed files through the API
     # Each output is an explicit boolean: dorny's 'false' is a non-empty
     # (truthy) string, so `steps.filter.outputs.x || ...` would be wrong.
     outputs:

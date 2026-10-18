@@ -47,6 +47,11 @@ pinned to a full-length commit SHA**.
 For pipeline traces, add a `DAGGER_CLOUD_TOKEN` repository secret
 (**Settings → Secrets and variables → Actions**). CI works without it.
 
+The `ci.yml` jobs pass it only to their `mise run` step. It stays a
+repository secret rather than an environment secret, which
+`zizmor --persona=auditor` reports as `secrets-outside-env`: the token only
+uploads traces, and an environment would add a deployment to every CI run.
+
 ## Codespaces prebuilds (optional)
 
 **Settings → Codespaces → Set up prebuild**: branch `main`, trigger

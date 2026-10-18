@@ -1145,7 +1145,7 @@ wheels = [
 
 [[package]]
 name = "yandex-disk-rescue"
-version = "0.1.0"
+version = "1.0.0rc1"
 source = { editable = "yandex-disk-rescue" }
 dependencies = [
     { name = "httpx" },

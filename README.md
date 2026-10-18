@@ -4,14 +4,14 @@ A Linux command-line tool that downloads everything from a Yandex Disk
 account to local storage. It is a headless analogue of the Windows app
 [Yandex-Disk-Rescue](https://github.com/fefenke/Yandex-Disk-Rescue).
 
-> **Status: early development.** OAuth token handling
+> **Status: 1.0, release candidate `1.0.0rc1`.** Authentication
 > (`yandex-disk-rescue auth`), scanning the remote tree into a local
-> manifest (`yandex-disk-rescue scan`) and verified, parallel, resumable
-> mirroring with segmented downloads of large files
-> (`yandex-disk-rescue download`), an offline, resumable integrity check
-> of a mirror (`yandex-disk-rescue verify`), and their progress (a live view
-> on a terminal, status lines elsewhere), log file and `--json` reports work. Further features
-> are being built; planned work is tracked in GitHub issues.
+> manifest (`yandex-disk-rescue scan`),
+> verified, parallel, resumable mirroring with segmented downloads of large
+> files (`yandex-disk-rescue download`) and an offline, resumable integrity
+> check of a mirror (`yandex-disk-rescue verify`) are complete, with
+> progress, a log file, `--json` reports and documented exit codes. Changes
+> are listed in the [changelog](CHANGELOG.md).
 
 ## Goals
 
@@ -31,6 +31,60 @@ account to local storage. It is a headless analogue of the Windows app
   no GUI.
 
 This is an independent, unofficial tool. It is not affiliated with Yandex.
+
+## Installation
+
+The tool is on PyPI as
+[`yandex-disk-rescue`](https://pypi.org/project/yandex-disk-rescue/). It
+needs Linux and Python 3.14 or newer. Install it with
+[uv](https://docs.astral.sh/uv/), which fetches Python 3.14 when the system
+has none:
+
+```bash
+uv tool install yandex-disk-rescue
+```
+
+or with [pipx](https://pipx.pypa.io/), which needs a Python 3.14
+interpreter:
+
+```bash
+pipx install yandex-disk-rescue
+pipx install --python python3.14 yandex-disk-rescue   # when the default Python is older
+```
+
+While the only release on PyPI is the release candidate `1.0.0rc1`, both
+install it by default.
+
+Both put the command at `~/.local/bin/yandex-disk-rescue`, the path the
+[systemd and cron examples](#running-unattended) use; make sure
+`~/.local/bin` is on your `PATH` (`uv tool update-shell` or
+`pipx ensurepath` adds it). Check the install:
+
+```bash
+yandex-disk-rescue --version
+```
+
+Upgrade with `uv tool upgrade yandex-disk-rescue` or
+`pipx upgrade yandex-disk-rescue`. Uninstall with
+`uv tool uninstall yandex-disk-rescue` or
+`pipx uninstall yandex-disk-rescue`; that removes only the program. The
+token and the config file (`~/.config/yandex-disk-rescue/`) and the
+manifest and the log file (`~/.local/state/yandex-disk-rescue/`), or their
+`$XDG_CONFIG_HOME` and `$XDG_STATE_HOME` equivalents, stay until you delete
+them; `yandex-disk-rescue auth logout` deletes the token first.
+
+## Quick start
+
+```bash
+uv tool install yandex-disk-rescue                # or: pipx install yandex-disk-rescue
+yandex-disk-rescue auth login                     # open the printed URL, allow access, paste the token
+yandex-disk-rescue download disk:/ /mnt/backup    # the whole Disk into /mnt/backup
+yandex-disk-rescue download disk:/ /mnt/backup    # after an interruption (Ctrl+C, a crash): continues where it stopped
+yandex-disk-rescue verify /mnt/backup             # re-hash the mirror offline
+```
+
+[Authentication](#authentication), [Downloading](#downloading) and
+[Verifying a mirror](#verifying-a-mirror) describe each step in full.
 
 ## Authentication
 
@@ -863,7 +917,7 @@ summary lists them.
 `XDG_STATE_HOME` is unset or not an absolute path), whatever `-q` says:
 
 ```
-2026-10-17T09:30:00.123Z INFO download[12345] download started: version 0.1.0, pid 12345; remote_path=disk:/Photos, dest=/mnt/backup, …
+2026-10-17T09:30:00.123Z INFO download[12345] download started: version 1.0.0rc1, pid 12345; remote_path=disk:/Photos, dest=/mnt/backup, …
 2026-10-17T09:41:12.456Z INFO download[12345] Summary:
 2026-10-17T09:41:12.456Z INFO download[12345] Mirrored disk:/Photos to /mnt/backup: 1234 downloaded (12.3 GiB), …
 2026-10-17T09:41:12.457Z INFO download[12345] download completed (exit 0)
@@ -1272,7 +1326,12 @@ named file that does not exist, a file that is not valid TOML, an unknown
 key, a value of the wrong type or an invalid value. A missing file at the
 default location means no values.
 
-## Quick start
+## Development
+
+The repository is a uv workspace with mise tasks and a Dagger CI pipeline;
+[`AGENTS.md`](AGENTS.md) holds its rules.
+
+### Setup
 
 **Devcontainer (recommended):** open the repo in VS Code → *Reopen in
 Container*, or create a GitHub Codespace. Everything below runs on creation.
@@ -1286,7 +1345,7 @@ mise run check                      # lint + test
 uv run yandex-disk-rescue --help
 ```
 
-## Everyday commands
+### Everyday commands
 
 | Command | What it does |
 |---|---|
@@ -1306,7 +1365,7 @@ Dependencies: `uv add <pkg> --package <member>` (runtime) or
 `uv add --dev <pkg>` (tooling). Local secrets go in `.env` (see
 [`.env.example`](.env.example)); mise loads it automatically.
 
-## Layout
+### Layout
 
 ```
 ├── yandex-disk-rescue/   # The CLI package — workspace member
@@ -1323,7 +1382,7 @@ Dependencies: `uv add <pkg> --package <member>` (runtime) or
 └── pyproject.toml        # Workspace root: members, dev deps, ruff, pytest
 ```
 
-## How it fits together
+### How it fits together
 
 **Versions.** Each tool is pinned in exactly one place — Python/uv/Dagger in
 `mise.toml`, libraries and ruff in `uv.lock`, the Dagger engine in

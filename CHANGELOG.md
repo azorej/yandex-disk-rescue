@@ -7,6 +7,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+## [1.0.0rc1] - 2026-10-18
+
 ### Added
 
 - `auth login`, `auth status` and `auth logout`: an OAuth token that can only read the Disk, checked with Yandex
