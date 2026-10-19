@@ -1452,6 +1452,86 @@ def test_a_name_that_is_not_valid_unicode_fails_that_entry_only(disk, dest):
     assert 'not valid Unicode' not in rescan.stdout
 
 
+UNLISTED = 'the scan could not list this folder, so files in it may be missing or out of date'
+INJECTED_500 = 'Yandex Disk API returned HTTP 500: Injected HTTP 500 (after 2 attempts)'
+
+
+def test_a_folder_that_cannot_be_listed_fails_only_itself_and_everything_else_is_downloaded(disk, dest):
+    disk.inject('GET', '/v1/disk/resources', 500, 500, where={'path': 'disk:/Photos/2024'})
+    failed = f'Failed: 1\n  disk:/Photos/2024: {UNLISTED}: {INJECTED_500}\n'
+
+    result = run_download('--api-retries', '1', str(dest))
+
+    assert result.exit_code == 1, result.output
+    assert failed in result.stdout
+    *notices, result_line = stderr_lines(result.stderr)
+    assert f'disk:/Photos/2024 failed: {UNLISTED}: {INJECTED_500}' in notices
+    assert result_line == 'Error: 1 failed; see the list above.'
+    outside = {path: content for path, content in FILES.items() if not path.startswith('disk:/Photos/2024/')}
+    assert all(local_file(dest, path).read_bytes() == content for path, content in outside.items())
+    assert list(local_file(dest, 'disk:/Photos/2024').iterdir()) == []
+    assert _preview_requests(disk) == []
+
+    earlier = len(disk.requests)
+    reused = run_download('--no-scan', str(dest))
+
+    assert reused.exit_code == 1, reused.output
+    assert failed in reused.stdout
+    assert _listings(disk, earlier) == []
+
+    rescan = run_download('--scan-max-age', '0', str(dest))
+
+    assert rescan.exit_code == 0, rescan.output
+    assert 'could not list' not in rescan.output
+    assert all(local_file(dest, path).read_bytes() == content for path, content in FILES.items())
+
+
+def test_a_folder_that_cannot_be_listed_keeps_the_files_an_earlier_scan_recorded_in_it(disk, dest):
+    assert run_download(str(dest)).exit_code == 0
+    local_file(dest, 'disk:/Photos/2024/a.jpg').unlink()
+    disk.add_file('disk:/Photos/2024/new.jpg', b'new', modified=MODIFIED)
+    disk.inject('GET', '/v1/disk/resources', 500, 500, where={'path': 'disk:/Photos/2024'})
+
+    result = run_download('--scan-max-age', '0', '--api-retries', '1', str(dest))
+
+    assert result.exit_code == 1, result.output
+    assert f'Failed: 1\n  disk:/Photos/2024: {UNLISTED}: {INJECTED_500}\n' in result.stdout
+    assert (
+        f'Mirrored disk:/ to {dest}: 1 downloaded ({format_size(len(FILES["disk:/Photos/2024/a.jpg"]))}), 5 skipped, '
+        '0 quarantined, 1 failed\n'
+    ) in result.stdout
+    assert all(local_file(dest, path).read_bytes() == content for path, content in FILES.items())
+    assert not local_file(dest, 'disk:/Photos/2024/new.jpg').exists()
+
+
+def test_a_folder_an_ancestor_scan_could_not_list_fails_a_mirror_below_it(disk, dest, tmp_path):
+    disk.inject('GET', '/v1/disk/resources', 500, 500, where={'path': 'disk:/Photos'})
+    assert runner.invoke(app, ['scan', '--api-retries', '1']).exit_code == 1
+    other = tmp_path / 'other'
+
+    below = run_download('--no-scan', 'disk:/Photos/2024', str(dest))
+
+    assert below.exit_code == 1, below.output
+    assert f'Failed: 1\n  disk:/Photos: {UNLISTED}: {INJECTED_500}\n' in below.stdout
+
+    rescanned = run_download('--scan-max-age', '0', 'disk:/Photos/2024', str(dest))
+
+    assert rescanned.exit_code == 0, rescanned.output
+    assert 'Failed:' not in rescanned.stdout
+    assert (dest / 'a.jpg').read_bytes() == FILES['disk:/Photos/2024/a.jpg']
+    assert (dest / 'b.jpg').read_bytes() == FILES['disk:/Photos/2024/b.jpg']
+    still = run_download('--no-scan', 'disk:/Photos', str(other))
+    assert still.exit_code == 1, still.output
+    assert f'Failed: 1\n  disk:/Photos: {UNLISTED}: {INJECTED_500}\n' in still.stdout
+
+    assert runner.invoke(app, ['scan', 'disk:/Photos']).exit_code == 0
+
+    cleared = run_download('--no-scan', 'disk:/Photos', str(other))
+
+    assert cleared.exit_code == 0, cleared.output
+    assert 'Failed:' not in cleared.stdout
+
+
 _REUSED = re.compile(r'Using the scan of (disk:/\S*) completed \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC \((.+)\)')
 
 

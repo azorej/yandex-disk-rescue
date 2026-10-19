@@ -30,6 +30,7 @@ from yandex_disk_rescue.manifest import (
     ScanTime,
     Segment,
     UnencodableEntry,
+    UnlistedFolder,
     VerifyPass,
 )
 from yandex_disk_rescue.paths import state_dir
@@ -1088,6 +1089,35 @@ def test_entries_left_out_for_their_names_are_kept_per_subtree_until_a_scan_cove
         assert manifest.mirror('2', 'disk:/', tmp_path / 'other').unencodable() == [
             UnencodableEntry('disk:/A/other\udc82', 'file')
         ]
+
+
+def test_a_mirror_reports_the_folders_not_listed_at_or_below_its_root_and_above_it_from_its_own_scan(tmp_path):
+    db = tmp_path / 'manifest.sqlite3'
+    a, cd = UnlistedFolder('disk:/A', 'HTTP 500'), UnlistedFolder('disk:/C/D', 'HTTP 503')
+    with Manifest.open(db) as manifest:
+        session = manifest.begin_scan(UID, 'disk:/')
+        session.add(TREE)
+        session.commit(unencodable=(), unlisted=[cd, a], vanished=())
+        session = manifest.begin_scan('2', 'disk:/')
+        session.add([_dir('disk:/A')])
+        session.commit(unencodable=(), unlisted=[UnlistedFolder('disk:/A', 'other account')], vanished=())
+
+        def unlisted(root: str, uid: str = UID) -> list[UnlistedFolder]:
+            return manifest.mirror(uid, root, tmp_path / f'{uid}{root.replace("/", "_")}').unlisted()
+
+        assert unlisted('disk:/') == [a, cd]
+        assert unlisted('disk:/A') == [a]
+        assert unlisted('disk:/A/B') == [a]
+        assert unlisted('disk:/C') == [cd]
+        assert unlisted('disk:/top.bin/x') == []
+
+        session = manifest.begin_scan(UID, 'disk:/A/B')
+        session.add([_dir('disk:/A/B')])
+        session.commit(unencodable=(), unlisted=(), vanished=())
+
+        assert unlisted('disk:/A/B') == []
+        assert unlisted('disk:/A') == [a]
+        assert unlisted('disk:/A/B', uid='2') == [UnlistedFolder('disk:/A', 'other account')]
 
 
 def _findings(mirror: Mirror) -> dict[str, Finding]:

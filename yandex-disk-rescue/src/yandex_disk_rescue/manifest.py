@@ -795,6 +795,25 @@ class Mirror:
             rows = self._manifest._connection.execute(_UNENCODABLE_SQL, params).fetchall()
         return [UnencodableEntry(path=path.decode('utf-8', 'surrogatepass'), kind=kind) for path, kind in rows]
 
+    def unlisted(self) -> list[UnlistedFolder]:
+        """The folders a scan could not list that concern this mirror, ordered by path: those at or below
+        `remote_root`, and those above it recorded by the scan the mirror's entries come from (the newest completed
+        scan covering `remote_root`)."""
+        last = self._manifest.last_scan(self.account_uid, self.remote_root)
+        above = {f'above{n}': path for n, path in enumerate(_ancestors(self.remote_root)[:-1])}
+        sql = (
+            f'SELECT path, reason FROM unlisted_folders AS e WHERE e.account_uid = :account AND ({_SUBTREE} OR '
+            f'(e.path IN ({", ".join(":" + name for name in above)}) AND e.scan_root = :scan_root)) ORDER BY e.path'
+        )
+        params = {
+            **_subtree_params(self.account_uid, self.remote_root),
+            **above,
+            'scan_root': None if last is None else last.root,
+        }
+        with self._manifest._errors('read'):
+            rows = self._manifest._connection.execute(sql, params).fetchall()
+        return [UnlistedFolder(path=path, reason=reason) for path, reason in rows]
+
     def assign_names(self, names: Mapping[int, PurePosixPath]) -> None:
         """Set the local path of each entry id in `names`, replacing any it had; a path already taken by another
         entry of this mirror raises `ManifestError` and leaves every name unchanged."""

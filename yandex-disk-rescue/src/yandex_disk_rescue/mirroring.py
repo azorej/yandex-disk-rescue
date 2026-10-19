@@ -118,6 +118,7 @@ from yandex_disk_rescue.manifest import (
     RemoteIdentity,
     Segment,
     UnencodableEntry,
+    UnlistedFolder,
     VerifiedBy,
     verified_now,
 )
@@ -813,7 +814,8 @@ class MirrorRun:
     keeps the record of its last failed turn. An entry verified, adopted or made in place loses its record. A failed
     entry is reported as failed, or as quarantined when its quarantine record is for its current identity, the
     failure then shown as its last retry. Each entry the manifest records as left out of its scan, because its name
-    is not valid Unicode, is a failure of the run, and has no record.
+    is not valid Unicode, and each folder the manifest records as not listed (`Mirror.unlisted`) is a failure of the
+    run, with or without `retry_failed`, and has no record.
 
     The record also keeps the entry's silent streak, carried across runs. A deferred turn that received no byte of
     the file, while the host was not throttling, is silent and makes it one turn longer, the first starting it at the
@@ -1077,10 +1079,11 @@ class MirrorRun:
             if deferred:
                 await self._later_passes(deferred, tools, passes=passes, changes=changes)
         report.replaced_folder = self._destination.replaced_folder
-        for unencodable in self._mirror.unencodable():
-            reason = unencodable_reason(unencodable)
-            _log.warning('%s failed: %s', unencodable.path, reason)
-            report.failed.append(Failure(unencodable.path, reason))
+        not_mirrored = [(e.path, unencodable_reason(e)) for e in self._mirror.unencodable()]
+        not_mirrored += [(folder.path, unlisted_reason(folder)) for folder in self._mirror.unlisted()]
+        for path, reason in not_mirrored:
+            _log.warning('%s failed: %s', path, reason)
+            report.failed.append(Failure(path, reason))
         self._in_path_order(report)
         return report
 
@@ -2763,6 +2766,10 @@ def unencodable_reason(entry: UnencodableEntry) -> str:
     if entry.kind == 'dir':
         return 'the folder name is not valid Unicode, so the Disk API cannot list it or download anything in it'
     return 'the name is not valid Unicode, so the Disk API cannot download it'
+
+
+def unlisted_reason(folder: UnlistedFolder) -> str:
+    return f'the scan could not list this folder, so files in it may be missing or out of date: {folder.reason}'
 
 
 def _local_path(entry: MirrorEntry) -> PurePosixPath:

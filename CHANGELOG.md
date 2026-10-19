@@ -50,7 +50,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 - A folder whose listing the Disk API keeps failing no longer stops `scan` or `download`: while the API still lists
   other folders, the scan commits everything else, keeps what earlier scans recorded below that folder, lists it
   with the API's reason and exits 1; an outage still stops the scan. The manifest records such folders (schema
-  version 13).
+  version 13). `download` reports such a folder as failed and `verify` as not downloaded on every run until a scan
+  lists it, a reused scan included, and `download` mirrors everything else, the files an earlier scan recorded in it
+  included.
 - `download` no longer stops, or fails the file, when it cannot read a partial file (a bad sector) while resuming,
   reading back, copying or moving it to a new `--partial-dir`: the partial file is emptied and the file downloaded
   again from its first byte, with a notice; a second read error on it in the same run fails that file. A partial

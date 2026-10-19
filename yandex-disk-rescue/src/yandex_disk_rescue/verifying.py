@@ -12,8 +12,10 @@ Any other file is reported without being read: under its finding when it has one
 or by `download` as unreadable, is still at its path), else as quarantined when its quarantine record is for its
 current identity, else as not downloaded. A file listed under its finding whose quarantine record is for its current
 identity has its repair quarantined, and its line says so with the quarantine reason and the copy's path. A file not
-downloaded whose preview record is for its current identity names the preview's path. Paths with no manifest entry,
-and everything below `.yandex-disk-rescue/previews/`, are never opened, listed or reported.
+downloaded whose preview record is for its current identity names the preview's path. The entries the scan left out
+because their names are not valid Unicode, and the folders it could not list (`Mirror.unlisted`), are not downloaded
+either. Paths with no manifest entry, and everything below `.yandex-disk-rescue/previews/`, are never opened, listed
+or reported.
 
 A check is one pass over the mirror, kept in the manifest until every file is checked: a pass stopped by Ctrl+C,
 SIGTERM, SIGKILL or an unreadable destination continues where its committed cursor stands, and its report covers the
@@ -58,6 +60,7 @@ from yandex_disk_rescue.mirroring import (
     quarantined_reason,
     size_mismatch,
     unencodable_reason,
+    unlisted_reason,
 )
 from yandex_disk_rescue.progress import VerifyProgress
 from yandex_disk_rescue.scanning import SHOWN_PATHS, listed
@@ -166,6 +169,7 @@ class VerifyRun:
             raise
         self._mirror.end_verify_pass()
         report.not_downloaded += [Problem(e.path, unencodable_reason(e)) for e in self._mirror.unencodable()]
+        report.not_downloaded += [Problem(f.path, unlisted_reason(f)) for f in self._mirror.unlisted()]
         report.not_downloaded.sort(key=lambda problem: problem.path)
         self._progress.problems(report.problems)
         return report
