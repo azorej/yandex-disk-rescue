@@ -819,7 +819,7 @@ def test_converting_names_in_a_large_mirror_costs_one_folder_not_the_whole_mirro
     with Manifest.open(tmp_path / 'manifest.sqlite3') as manifest:
         session = manifest.begin_scan('uid', 'disk:/')
         session.add([*folders, *files])
-        session.commit(unencodable=())
+        session.commit(unencodable=(), unlisted=(), vanished=())
         mirror = manifest.mirror('uid', 'disk:/', tmp_path / 'dest')
         ids = {e.resource.path: e.entry_id for e in mirror.entries()}
         mirror.assign_names({entry_id: PurePosixPath(path.removeprefix('disk:/')) for path, entry_id in ids.items()})

@@ -62,7 +62,7 @@ def _scan(path: Path, resources: list[Resource], root: str = 'disk:/', uid: str 
     with Manifest.open(path) as manifest:
         session = manifest.begin_scan(uid, root)
         session.add(resources)
-        return session.commit(unencodable=())
+        return session.commit(unencodable=(), unlisted=(), vanished=())
 
 
 def _unconfirmed(resource: Resource) -> tuple[Segment, ...]:
@@ -184,7 +184,7 @@ def test_a_discarded_subtree_is_left_out_of_the_commit(tmp_path):
         assert [r.path for r in session.staged()] == ['disk:/A', 'disk:/A/x', 'disk:/A0', 'disk:/AB']
         session.discard('disk:/A')
         assert [r.path for r in session.staged()] == ['disk:/A0', 'disk:/AB']
-        diff = session.commit(unencodable=())
+        diff = session.commit(unencodable=(), unlisted=(), vanished=())
 
     assert (diff.added, diff.removed) == (['disk:/A0'], ['disk:/A', 'disk:/A/B', 'disk:/A/B/y', 'disk:/A/x'])
     assert [r.path for r in _entries(db)] == ['disk:/A0', 'disk:/AB']
@@ -239,10 +239,11 @@ def test_opening_an_existing_manifest_creates_nothing_and_still_takes_the_lock_a
             silent_since=MODIFIED,
         )
     with closing(sqlite3.connect(db)) as connection, connection:
+        connection.execute('DROP TABLE unlisted_folders')
         connection.execute('DROP TABLE previews')
         connection.execute('ALTER TABLE failures DROP COLUMN silent_since')
         connection.execute('ALTER TABLE failures DROP COLUMN silent_turns')
-        connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 2}')
+        connection.execute(f'PRAGMA user_version = {SCHEMA_VERSION - 3}')
     with Manifest.open_existing(db) as manifest:
         assert [r.path for r in manifest.entries(UID, 'disk:/')] == sorted(r.path for r in TREE)
         with pytest.raises(ManifestError, match='Another yandex-disk-rescue run is using'):
@@ -388,7 +389,7 @@ def test_a_v1_manifest_upgrades_to_the_current_schema_keeping_its_entries_and_th
     assert photos == ['disk:/Photos', 'disk:/Photos/a.jpg', 'disk:/Photos/old.bmp', 'disk:/notes.txt']
     assert _ids(db) == v1_ids
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 12
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 13
         assert connection.execute('SELECT count(*) FROM scans').fetchone()[0] == 0
         assert connection.execute('SELECT account_uid, remote_root FROM mirrors').fetchall() == [(UID, 'disk:/')]
 
@@ -412,7 +413,7 @@ def test_a_v3_manifest_upgrades_with_every_partial_download_restarting_from_byte
     }
     assert records['disk:/Photos/a.jpg'].local is not None
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 12
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 13
 
 
 V4_FIXTURE = Path(__file__).parent / 'data' / 'manifest-v4.sql'
@@ -443,7 +444,7 @@ def test_a_v4_manifest_upgrades_keeping_its_download_records_with_no_failures(tm
         (Segment(0, 2500, 1000, 'ab' * 32), Segment(2500, 5000, 2500, None)),
     )
     with closing(sqlite3.connect(db)) as connection:
-        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 12
+        assert connection.execute('PRAGMA user_version').fetchone()[0] == SCHEMA_VERSION == 13
         assert connection.execute('SELECT count(*) FROM failures').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM quarantined').fetchone()[0] == 0
         assert connection.execute('SELECT count(*) FROM verify_findings').fetchone()[0] == 0
@@ -1063,12 +1064,12 @@ def test_entries_left_out_for_their_names_are_kept_per_subtree_until_a_scan_cove
     with Manifest.open(db) as manifest:
         session = manifest.begin_scan(UID, 'disk:/')
         session.add(TREE)
-        session.commit(unencodable=[bad_file, bad_dir])
+        session.commit(unencodable=[bad_file, bad_dir], unlisted=(), vanished=())
         session = manifest.begin_scan('2', 'disk:/')
         session.add([_dir('disk:/A')])
-        session.commit(unencodable=[_file('disk:/A/other\udc82')])
+        session.commit(unencodable=[_file('disk:/A/other\udc82')], unlisted=(), vanished=())
         with pytest.raises(ValueError, match='is not below the scan root'):
-            manifest.begin_scan(UID, 'disk:/A').commit(unencodable=[bad_dir])
+            manifest.begin_scan(UID, 'disk:/A').commit(unencodable=[bad_dir], unlisted=(), vanished=())
 
     with Manifest.open(db) as manifest:
         whole = manifest.mirror(UID, 'disk:/', tmp_path / 'whole')
@@ -1081,7 +1082,7 @@ def test_entries_left_out_for_their_names_are_kept_per_subtree_until_a_scan_cove
         ]
         session = manifest.begin_scan(UID, 'disk:/A')
         session.add([_dir('disk:/A')])
-        session.commit(unencodable=())
+        session.commit(unencodable=(), unlisted=(), vanished=())
 
         assert whole.unencodable() == [UnencodableEntry('disk:/B\udc81', 'dir')]
         assert manifest.mirror('2', 'disk:/', tmp_path / 'other').unencodable() == [

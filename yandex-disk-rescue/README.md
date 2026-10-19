@@ -51,7 +51,11 @@ as the API names it, so rescanning `disk:/A` keeps the `disk:/A` row a scan of `
 It also records when the last scan of each folder completed (`Manifest.last_scan` finds the newest one covering a
 folder: a scan of the folder itself or of an ancestor), and the entries each scan left out because their paths are
 not valid Unicode (`unencodable_entries`, the path stored as a BLOB; `Mirror.unencodable` lists those below a
-mirror's root), so a run reusing a scan still reports them.
+mirror's root), so a run reusing a scan still reports them. It records the folders a scan could not list while
+the Disk API answered for other folders (`unlisted_folders`: path, reason and the root of the scan that recorded
+it); a commit replaces the records at or below its root, the root included. Below such a folder the commit keeps the
+entries earlier scans recorded that the scan could not settle: an entry whose parent is a folder not listed or an
+entry kept so, unless it is at or below a folder that vanished during the scan.
 
 For each destination directory ("mirror") it records the local name of every entry, each file's download state,
 and the folder the partial files of its downloads in progress are in (`mirrors.partial_folder`, the path in OS bytes;
@@ -152,8 +156,9 @@ yandex-disk-rescue/
 │   │                 #   mirror, starting or continuing a pass (`--restart`), its start line, summary, JSON
 │   │                 #   object with the pass, exit code and interrupt message; no token, no network
 │   ├── scanning.py   # The scan engine any command runs: resolving the root folder, the concurrent walk into a
-│   │                 #   scan session (folders that vanish mid-walk, names that are not valid Unicode), the
-│   │                 #   commit, the summary lines and `scan_document`, the scan's JSON object
+│   │                 #   scan session (folders that vanish mid-walk, folders that could not be listed, told apart
+│   │                 #   from an outage by a probe listing, names that are not valid Unicode), the commit, the
+│   │                 #   summary lines and `scan_document`, the scan's JSON object
 │   ├── mirroring.py  # The mirror engine: local names, the walk over a mirror's entries or, with --retry-failed,
 │   │                 #   over the retry set (failed, quarantined or partial files, files with a finding, failed
 │   │                 #   folders) and the folders above it (skip, hold quarantined files, fetch again files with a
@@ -271,8 +276,8 @@ yandex-disk-rescue/
 │   ├── interrupts.py # SIGTERM as a clean stop: `Terminated`, the run-scoped handler (`sigterm_stops`) and the
 │   │                 #   asyncio runner of the commands (`run`)
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
-│   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan and its
-│   │                 #   completion time, mirrors (local names, download records and their checkpoint journals,
+│   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan, its
+│   │                 #   completion time and the folders it could not list, mirrors (local names, download records and their checkpoint journals,
 │   │                 #   failure and quarantine records, findings, preview records, the verify pass and the
 │   │                 #   folder of the partial files per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion

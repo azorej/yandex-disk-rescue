@@ -247,21 +247,71 @@ def test_an_invalid_api_option_is_a_usage_error(disk):
     assert disk.requests == []
 
 
-def test_a_folder_failing_past_the_retries_names_it_and_keeps_the_previous_scan(disk):
-    assert _scan().exit_code == 0
-    previous = _rows()
+INJECTED_503 = 'Yandex Disk API returned HTTP 503: Injected HTTP 503 (after 2 attempts)'
+NOT_LISTED_ERROR = 'Error: 1 folder could not be listed; see the list above.'
+
+
+def _probe_lines(folder: str, outcome: str) -> list[str]:
+    """The log's probe lines for `folder`: `outcome` is `still answers` or `failed`."""
+    return [m for m in log_messages() if m.startswith(f'{folder}: the Disk API {outcome} for the listing of disk:/')]
+
+
+@pytest.mark.parametrize('first_scan', [True, False], ids=['first-scan', 'rescan'])
+def test_a_folder_failing_past_the_retries_is_not_listed_and_the_rest_is_committed(disk, first_scan):
+    if not first_scan:
+        assert _scan().exit_code == 0
     disk.add_file('disk:/Photos/2024/new.jpg', b'new')
+    disk.add_file('disk:/Docs/more.txt', b'more')
+    disk.remove('disk:/top.txt')
     disk.inject('GET', '/v1/disk/resources', 503, 503, where={'path': 'disk:/Photos/2024'})
 
     result = _scan('--api-retries', '1')
 
+    assert result.exit_code == 1, result.output
+    assert f'Folders that could not be listed: 1\n  disk:/Photos/2024: {INJECTED_503}\n' in result.stdout
+    assert stderr_lines(result.stderr) == [f'disk:/Photos/2024 could not be listed: {INJECTED_503}', NOT_LISTED_ERROR]
+    assert len(_probe_lines('disk:/Photos/2024', 'still answers')) == 1
+    if first_scan:
+        assert 'First scan of disk:/\n' in result.stdout
+        assert _rows() == [r for r in _tree_rows(disk) if not r.path.startswith('disk:/Photos/2024/')]
+    else:
+        assert (
+            'Changes since the last scan: 1 added, 0 changed, 1 removed\n  + disk:/Docs/more.txt\n  - disk:/top.txt\n'
+        ) in result.stdout
+        assert _rows() == [r for r in _tree_rows(disk) if r.path != 'disk:/Photos/2024/new.jpg']
+    disk.inject('GET', '/v1/disk/resources', 503, 503, where={'path': 'disk:/Photos/2024'})
+
+    document = _scan('--json', '--api-retries', '1')
+
+    assert document.exit_code == 1, document.output
+    assert json.loads(document.stdout)['unlisted'] == [{'path': 'disk:/Photos/2024', 'reason': INJECTED_503}]
+
+    healthy = _scan()
+
+    assert healthy.exit_code == 0, healthy.output
+    assert 'could not be listed' not in healthy.output
+    assert '  + disk:/Photos/2024/new.jpg\n' in healthy.stdout
+    assert _rows() == _tree_rows(disk)
+
+
+def test_a_disk_api_outage_during_the_walk_stops_the_scan_and_keeps_the_previous_scan(disk):
+    assert _scan().exit_code == 0
+    previous = _rows()
+    disk.add_file('disk:/Photos/2024/new.jpg', b'new')
+    disk.inject('GET', '/v1/disk/resources', Delay(0), Delay(0), *[503] * 20, where={'path': 'disk:/Photos'})
+    disk.inject('GET', '/v1/disk/resources', *[503] * 20, where={'path': 'disk:/Photos/2024'})
+
+    result = _scan('disk:/Photos', '--api-retries', '1')
+
     assert result.exit_code == 1
-    assert stderr_lines(result.stderr) == [
-        'Error: Could not list disk:/Photos/2024: Yandex Disk API returned HTTP 503: Injected HTTP 503 '
-        '(after 2 attempts)'
-    ]
+    assert stderr_lines(result.stderr)[-1] == f'Error: Could not list disk:/Photos/2024: {INJECTED_503}'
+    assert result.stdout == ''
     assert 'Traceback' not in result.output
     assert _rows() == previous
+    assert _probe_lines('disk:/Photos/2024', 'failed') == [
+        f'disk:/Photos/2024: the Disk API failed for the listing of disk:/Photos too, an outage: '
+        f'Could not list disk:/Photos: {INJECTED_503}'
+    ]
 
 
 def _wait_for_listing(fake, path: str, child: subprocess.Popen[str], *, after: int) -> None:
@@ -415,6 +465,78 @@ def test_a_sub_folder_queued_when_its_parent_vanished_is_never_listed(disk):
     assert not any(r.params.get('path', '').startswith('disk:/Gone/') for r in disk.requests)
 
 
+def _delete_y(fake) -> None:
+    fake.remove('disk:/Gone/Sub/y.txt')
+
+
+def _replace_sub_by_a_file(fake) -> None:
+    fake.remove('disk:/Gone/Sub')
+    fake.add_file('disk:/Gone/Sub', b's')
+
+
+def _vanish_sub_during_the_scan(fake) -> None:
+    fake.inject('GET', '/v1/disk/resources', 404, where={'path': 'disk:/Gone/Sub'})
+
+
+@pytest.mark.parametrize(
+    ('change', 'removed'),
+    [
+        (None, []),
+        (_delete_y, ['disk:/Gone/Sub/y.txt']),
+        (_replace_sub_by_a_file, ['disk:/Gone/Sub/Deep', 'disk:/Gone/Sub/Deep/x.txt', 'disk:/Gone/Sub/y.txt']),
+        (
+            _vanish_sub_during_the_scan,
+            ['disk:/Gone/Sub', 'disk:/Gone/Sub/Deep', 'disk:/Gone/Sub/Deep/x.txt', 'disk:/Gone/Sub/y.txt'],
+        ),
+    ],
+    ids=['nothing', 'file-deleted-below-a-listed-sub-folder', 'sub-folder-now-a-file', 'sub-folder-vanishing'],
+)
+def test_a_folder_not_listed_keeps_only_the_rows_its_listing_could_not_settle(disk, change, removed):
+    _add_vanishing_tree(disk)
+    assert _scan().exit_code == 0
+    previous = {r.path: r for r in _rows()}
+    disk.add_file('disk:/Gone/b.txt', b'b changed after the first scan')
+    if change is not None:
+        change(disk)
+    disk.inject('GET', '/v1/disk/resources', 503, where=GONE_SECOND_PAGE)
+
+    result = _scan('--api-retries', '0')
+
+    assert result.exit_code == 1, result.output
+    assert 'Folders that could not be listed: 1\n  disk:/Gone: Yandex Disk API returned HTTP 503: ' in result.stdout
+    assert [line for line in result.stdout.splitlines() if line.startswith('  - ')] == [f'  - {p}' for p in removed]
+    if change is _vanish_sub_during_the_scan:
+        assert 'Folders that disappeared during the scan: 1\n  disk:/Gone/Sub\n' in result.stdout
+        disk.remove('disk:/Gone/Sub')
+    rows = _rows()
+    assert [r for r in rows if r.path in {'disk:/Gone/b.txt', 'disk:/Gone/c.txt'}] == [
+        previous['disk:/Gone/b.txt'],
+        previous['disk:/Gone/c.txt'],
+    ]
+    assert rows == [previous[r.path] if r.path == 'disk:/Gone/b.txt' else r for r in _tree_rows(disk)]
+
+
+@pytest.mark.parametrize('child_first', [True, False], ids=['parent-vanishes-after', 'child-fails-after'])
+def test_a_folder_failing_to_list_below_a_vanished_folder_is_not_reported(disk, child_first):
+    _add_vanishing_tree(disk)
+    later = Delay(1, then=FakeResponse.error(404 if child_first else 503))
+    sub, gone_page = (503, later) if child_first else (later, 404)
+    disk.inject('GET', '/v1/disk/resources', sub, where={'path': 'disk:/Gone/Sub'})
+    disk.inject('GET', '/v1/disk/resources', gone_page, where=GONE_SECOND_PAGE)
+
+    result = _scan('--api-retries', '0')
+
+    assert result.exit_code == 0, result.output
+    assert 'Folders that disappeared during the scan: 1\n  disk:/Gone\n' in result.stdout
+    assert 'could not be listed' not in result.stdout
+    if not child_first:
+        assert 'could not be listed' not in result.stderr
+        assert _probe_lines('disk:/Gone/Sub', 'still answers') == []
+        assert any(r.params.get('path') == 'disk:/Gone/Sub' for r in disk.requests)
+    disk.remove('disk:/Gone')
+    assert _rows() == _tree_rows(disk)
+
+
 @pytest.mark.parametrize('sub_first', [True, False], ids=['sub-folder-first', 'parent-first'])
 def test_a_vanished_sub_folder_is_reported_once_under_its_vanished_parent(disk, sub_first):
     _add_vanishing_tree(disk)
@@ -447,4 +569,18 @@ def test_the_scanned_folder_itself_vanishing_fails_the_scan(disk, answer, messag
     result = _scan('disk:/Photos')
 
     assert (result.exit_code, stderr_lines(result.stderr)) == (1, [message])
+    assert _rows() == previous
+
+
+def test_the_scanned_folder_failing_to_list_stops_the_scan(disk):
+    assert _scan().exit_code == 0
+    previous = _rows()
+    disk.inject('GET', '/v1/disk/resources', *[503] * 20, where={'path': 'disk:/Photos', 'offset': '0'})
+
+    result = _scan('disk:/Photos', '--api-retries', '1')
+
+    assert (result.exit_code, stderr_lines(result.stderr)) == (
+        1,
+        [f'Error: Could not list disk:/Photos: {INJECTED_503}'],
+    )
     assert _rows() == previous
