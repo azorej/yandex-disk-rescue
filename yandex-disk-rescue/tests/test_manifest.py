@@ -1118,6 +1118,8 @@ def test_a_mirror_reports_the_folders_not_listed_at_or_below_its_root_and_above_
         assert unlisted('disk:/A/B') == []
         assert unlisted('disk:/A') == [a]
         assert unlisted('disk:/A/B', uid='2') == [UnlistedFolder('disk:/A', 'other account')]
+        with pytest.raises(ValueError, match='is not below the scan root'):
+            manifest.begin_scan(UID, 'disk:/A').commit(unencodable=(), unlisted=[a], vanished=())
 
 
 def _findings(mirror: Mirror) -> dict[str, Finding]:

@@ -281,9 +281,9 @@ yandex-disk-rescue/
 │   │                 #   asyncio runner of the commands (`run`)
 │   ├── paths.py      # XDG config and state directories, the manifest and log file paths
 │   ├── manifest.py   # The manifest database: schema migrations, the run lock, atomic commit of a scan, its
-│   │                 #   completion time and the folders it could not list, mirrors (local names, download records and their checkpoint journals,
-│   │                 #   failure and quarantine records, findings, preview records, the verify pass and the
-│   │                 #   folder of the partial files per destination)
+│   │                 #   completion time and the folders it could not list, mirrors (local names, download
+│   │                 #   records and their checkpoint journals, failure and quarantine records, findings,
+│   │                 #   preview records, the verify pass and the folder of the partial files per destination)
 │   ├── local_names.py # Local name mapping: long-name shortening, collision keys, the rejected-name conversion
 │   ├── settings.py   # The options registry: name, flag, env var, default and validation of every option;
 │   │                 #   bool options as `--x/--no-x` flags
