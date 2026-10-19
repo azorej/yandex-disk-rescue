@@ -7,11 +7,20 @@ from typing import Annotated
 import typer
 
 from yandex_disk_rescue import api, auth, console, interrupts, paths, settings
+from yandex_disk_rescue.errors import RescueError
 from yandex_disk_rescue.manifest import Manifest
 from yandex_disk_rescue.progress import ScanProgress
 from yandex_disk_rescue.scanning import ScanResult, resolve_scan_root, scan_document, scan_summary, scan_tree
 
 INTERRUPTED = 'Interrupted; the manifest holds the last completed scan.'
+
+
+class FoldersNotListedError(RescueError):
+    """The scan committed, but some folders could not be listed."""
+
+    def __init__(self, count: int) -> None:
+        folders = 'folder' if count == 1 else 'folders'
+        super().__init__(f'{count} {folders} could not be listed; see the list above.')
 
 
 def scan(
@@ -60,6 +69,8 @@ def scan(
         output.report(scan_document(result))
         output.summary(partial(scan_summary, result))
         output.footer(manifest_path)
+        if result.unlisted:
+            raise FoldersNotListedError(len(result.unlisted))
 
 
 async def _run(

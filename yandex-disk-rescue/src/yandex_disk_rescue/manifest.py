@@ -3,9 +3,11 @@ mirrors made from it.
 
 A scan streams its rows into a staging table through a `ScanSession`; only `ScanSession.commit()` moves them into
 `entries`, in one transaction. A scan that stops in any other way (an exception, Ctrl+C, SIGTERM, SIGKILL, a power cut)
-leaves `entries` as the previous completed scan wrote it. The commit also records when that scan completed, and
-the entries it left out because their names are not valid Unicode (`unencodable_entries`), so a run that reuses the
-scan still knows about them.
+leaves `entries` as the previous completed scan wrote it. The commit also records when that scan completed, the
+entries it left out because their names are not valid Unicode (`unencodable_entries`), and the folders it could not
+list while the Disk API answered for other folders (`unlisted_folders`), so a run that reuses the scan still knows
+about them. Below a folder not listed, the commit keeps the entries earlier scans recorded that this scan could not
+settle.
 
 A `Mirror` is one destination directory holding one remote folder of one account. Per mirror, the manifest keeps
 the local name of every entry (`local_names`), each file's download state (`downloads`), with the checkpoint journal
@@ -264,6 +266,19 @@ _MIGRATIONS: tuple[tuple[str, ...], ...] = (
         )
         """,
     ),
+    (
+        # A folder a scan could not list while the Disk API answered for another folder: `reason` is the listing's
+        # failure and `scan_root` the root of the scan that recorded it.
+        """
+        CREATE TABLE unlisted_folders (
+            account_uid TEXT NOT NULL,
+            path TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            scan_root TEXT NOT NULL,
+            PRIMARY KEY (account_uid, path)
+        )
+        """,
+    ),
 )
 
 SCHEMA_VERSION = len(_MIGRATIONS)
@@ -423,6 +438,15 @@ class UnencodableEntry:
 
     path: str
     kind: Literal['file', 'dir']
+
+
+@dataclass(frozen=True)
+class UnlistedFolder:
+    """A folder a scan could not list while the Disk API answered for another folder; `reason` is the failure of its
+    listing."""
+
+    path: str
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -641,17 +665,27 @@ class ScanSession:
             for row in cursor:
                 yield _resource(row)
 
-    def commit(self, *, unencodable: Iterable[Resource]) -> ScanDiff:
+    def commit(
+        self, *, unencodable: Iterable[Resource], unlisted: Iterable[UnlistedFolder], vanished: Iterable[str]
+    ) -> ScanDiff:
         """Replace the committed subtree of `root` with the staged rows in one transaction and return the diff.
 
-        `unencodable` are the entries below `root` the scan left out because their paths are not valid Unicode; they
-        replace the ones the subtree's previous scans recorded.
+        `unencodable` are the entries below `root` the scan left out because their paths are not valid Unicode, and
+        `unlisted` the folders below `root` it could not list; each replaces what the previous scans recorded at
+        `root` or below. `vanished` are the folders that disappeared during the scan.
+
+        A committed row the scan did not stage is kept as it is when its parent is a folder not listed or a row kept
+        so, unless it is at or below a vanished folder: the scan could not settle it. Every other committed row the
+        scan did not stage is removed, and the diff's `removed` lists exactly those.
         """
         self._check_open()
-        left_out = [(self._params['account'], *_unencodable_row(resource, self._root)) for resource in unencodable]
+        account = self._params['account']
+        left_out = [(account, *_unencodable_row(resource, self._root)) for resource in unencodable]
+        not_listed = [(account, *_unlisted_row(folder, self._root), self._root) for folder in unlisted]
         connection = self._manifest._connection
         with self._manifest._transaction('update'):
             (had_entries,) = connection.execute(_HAD_ENTRIES_SQL, self._params).fetchone()
+            self._stage_unsettled({path for _, path, _, _ in not_listed}, list(vanished))
             diff = ScanDiff(
                 added=self._paths(_ADDED_SQL) if had_entries else [],
                 changed=self._paths(_CHANGED_SQL),
@@ -665,11 +699,29 @@ class ScanSession:
             connection.executemany(
                 'INSERT INTO unencodable_entries (account_uid, path, kind) VALUES (?, ?, ?)', left_out
             )
+            connection.execute(_DELETE_UNLISTED_SQL, self._params)
+            connection.executemany(
+                'INSERT INTO unlisted_folders (account_uid, path, reason, scan_root) VALUES (?, ?, ?, ?)', not_listed
+            )
             connection.execute('DELETE FROM staged_entries WHERE session_id = ?', (self._id,))
             connection.execute('DELETE FROM scan_sessions WHERE id = ?', (self._id,))
         self._committed = True
         self._manifest._end_session(self)
         return diff
+
+    def _stage_unsettled(self, unlisted: set[str], vanished: list[str]) -> None:
+        """Stage again, unchanged, the committed rows the scan could not settle (`commit`'s kept rows)."""
+        if not unlisted:
+            return
+        kept: set[str] = set()
+        # Ordered by path, a parent comes before its children.
+        for path in self._paths(_REMOVED_SQL):
+            parent = path.rpartition('/')[0]
+            if (parent in unlisted or parent in kept) and not any(_in_subtree(path, gone) for gone in vanished):
+                kept.add(path)
+        self._manifest._connection.executemany(
+            _STAGE_KEPT_SQL, [{**self._params, 'path': path} for path in sorted(kept)]
+        )
 
     def _paths(self, sql: str) -> list[str]:
         return [path for (path,) in self._manifest._connection.execute(sql, self._params)]
@@ -742,6 +794,25 @@ class Mirror:
         with self._manifest._errors('read'):
             rows = self._manifest._connection.execute(_UNENCODABLE_SQL, params).fetchall()
         return [UnencodableEntry(path=path.decode('utf-8', 'surrogatepass'), kind=kind) for path, kind in rows]
+
+    def unlisted(self) -> list[UnlistedFolder]:
+        """The folders a scan could not list that concern this mirror, ordered by path: those at or below
+        `remote_root`, and those above it recorded by the scan the mirror's entries come from (the newest completed
+        scan covering `remote_root`)."""
+        last = self._manifest.last_scan(self.account_uid, self.remote_root)
+        above = {f'above{n}': path for n, path in enumerate(_ancestors(self.remote_root)[:-1])}
+        sql = (
+            f'SELECT path, reason FROM unlisted_folders AS e WHERE e.account_uid = :account AND ({_SUBTREE} OR '
+            f'(e.path IN ({", ".join(":" + name for name in above)}) AND e.scan_root = :scan_root)) ORDER BY e.path'
+        )
+        params = {
+            **_subtree_params(self.account_uid, self.remote_root),
+            **above,
+            'scan_root': None if last is None else last.root,
+        }
+        with self._manifest._errors('read'):
+            rows = self._manifest._connection.execute(sql, params).fetchall()
+        return [UnlistedFolder(path=path, reason=reason) for path, reason in rows]
 
     def assign_names(self, names: Mapping[int, PurePosixPath]) -> None:
         """Set the local path of each entry id in `names`, replacing any it had; a path already taken by another
@@ -1169,6 +1240,11 @@ _DELETE_REMOVED_SQL = f"""
     WHERE e.account_uid = :account AND {_SUBTREE}
       AND NOT EXISTS (SELECT 1 FROM staged_entries s WHERE s.session_id = :session AND s.path = e.path)
 """
+_STAGE_KEPT_SQL = f"""
+    INSERT INTO staged_entries (session_id, {_COLUMNS})
+    SELECT :session, {_COLUMNS} FROM entries WHERE account_uid = :account AND path = :path
+"""
+_DELETE_UNLISTED_SQL = f'DELETE FROM unlisted_folders AS e WHERE e.account_uid = :account AND {_SUBTREE}'
 _RECORD_SCAN_SQL = """
     INSERT INTO scans (account_uid, root, completed_at) VALUES (:account, :root, :completed_at)
     ON CONFLICT (account_uid, root) DO UPDATE SET completed_at = excluded.completed_at
@@ -1340,6 +1416,12 @@ def _unencodable_row(resource: Resource, root: str) -> tuple[bytes, Literal['fil
     if not resource.path.startswith(_prefix(root)):
         raise ValueError(f'{resource.path!r} is not below the scan root {root!r}')
     return resource.path.encode('utf-8', 'surrogatepass'), resource.kind
+
+
+def _unlisted_row(folder: UnlistedFolder, root: str) -> tuple[str, str]:
+    if not folder.path.startswith(_prefix(root)):
+        raise ValueError(f'{folder.path!r} is not below the scan root {root!r}')
+    return folder.path, folder.reason
 
 
 def _local_path_text(path: PurePosixPath) -> str:

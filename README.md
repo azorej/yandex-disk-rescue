@@ -212,8 +212,18 @@ list of paths shows at most 20 entries, then `… and N more`.
 A folder deleted on the Disk, or replaced by a file of the same name, while
 the scan runs does not stop it: the summary lists it under `Folders that
 disappeared during the scan: N`, and the manifest records that folder and
-everything under it as removed. Only the scanned folder itself disappearing
-fails the scan.
+everything under it as removed.
+
+A folder whose listing keeps failing past the API retries makes the tool
+list another folder of this scan, the last one listed. When that answers,
+only this folder is not listed: the summary lists it under `Folders that
+could not be listed: N` with the API's reason, the manifest records what
+this scan listed and keeps what earlier scans recorded below it that this
+scan could not settle (an entry below a sub-folder listed in full, or below
+a folder now a file, is removed), and `scan` exits 1 after the summary. When
+it does not answer, the scan stops as an outage and the manifest keeps the
+previous scan. Only the scanned folder itself disappearing or failing to
+list fails the scan.
 
 The manifest only ever holds completed scans: a scan that fails or is
 interrupted (Ctrl+C, SIGTERM, SIGKILL, a crash) leaves the previous scan in
@@ -221,8 +231,9 @@ place, and the next run scans again from the start. Ctrl+C or SIGTERM
 (`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; the manifest
 holds the last completed scan.` and exits with 130 (Ctrl+C) or 143
 (SIGTERM). Scanning a folder replaces only that folder's part of the
-manifest. The manifest also records when each scan completed, and the
-entries left out because their names are not valid Unicode. Only one run
+manifest. The manifest also records when each scan completed, the entries
+left out because their names are not valid Unicode, and the folders that
+could not be listed. Only one run
 can use the manifest at a time; a second one fails with `Another
 yandex-disk-rescue run is using ...`.
 Paths outside `disk:/` (such as `trash:/`) are refused.
@@ -579,8 +590,9 @@ Retrying 3 failed, quarantined, unfinished or broken files (1.5 GiB) in /mnt/bac
 in place of `Downloading …`, and its summary and exit code are those of a
 normal run over the retry set. With nothing to retry it prints `Retrying 0
 failed, quarantined, unfinished or broken files (0 B)`, downloads nothing
-and exits `0`. Entries whose names are not valid Unicode have no record;
-they fail every run, `--retry-failed` included.
+and exits `0`. Entries whose names are not valid Unicode and folders the
+scan could not list have no record; they fail every run, `--retry-failed`
+included.
 
 **Previews of files that cannot be downloaded.** For a photo, a video or a
 PDF that Yandex Disk will not send, Yandex often still serves a reduced
@@ -752,7 +764,13 @@ work. A path that is the same file as another mirrored file (a hard link, or
 a name that a case- or normalization-insensitive filesystem treats as the
 same) is never adopted, moved or replaced; it is reported as failed. A Disk
 entry whose name is not valid Unicode cannot be requested from the API; it is
-reported as failed.
+reported as failed. A folder the scan [could not
+list](#scanning-a-folder) is reported as failed with `the scan could not
+list this folder, so files in it may be missing or out of date: <reason>`
+in every run until a scan lists it, a reused scan (`--no-scan`,
+`--scan-max-age`) included; the files an earlier scan recorded in it are
+mirrored as usual. A mirror of a folder below it is reported the same way
+while its entries come from the scan that could not list it.
 
 **The destination.** DEST may exist; if it does not, only its last component
 is created, so a mistyped mount point fails instead of filling another disk.
@@ -800,6 +818,8 @@ run goes on. When it does not answer, the run
 stops as an outage, with the file's error. The run also stops at the 11th such
 file of a run with no such file to ask about, its error ending with
 `(no file of this mirror got a download link: 10 failed the same way)`.
+The scan phase follows the same rule for a folder listing (see
+[Scanning a folder](#scanning-a-folder)).
 Ctrl+C or SIGTERM
 (`kill`, `systemctl stop`, `docker stop`) prints `Interrupted; rerun to
 continue the download.` and exits with 130 (Ctrl+C) or 143 (SIGTERM); every
@@ -912,10 +932,10 @@ Each file of the mirror, as of the last scan, is one of:
 - **Not downloaded:** no verified copy of the current Disk version: never
   downloaded, failed (with the reason its last failed turn was reported with,
   such as `Yandex Disk never started sending this file: …`), unfinished,
-  changed on the Disk since it was downloaded, or a name that is not valid
-  Unicode. When a [preview](#downloading) of the current version is saved,
-  the line ends with `; a preview is saved at <path>`, the path the manifest
-  records.
+  changed on the Disk since it was downloaded, a name that is not valid
+  Unicode, or a folder the last scan could not list. When a
+  [preview](#downloading) of the current version is saved, the line ends
+  with `; a preview is saved at <path>`, the path the manifest records.
 
 A file with a finding (missing, modified or corrupt) is listed under its
 finding even when a later download of it was quarantined: the finding
@@ -1126,7 +1146,7 @@ By default stderr shows a notice for each file or folder that fails or is
 quarantined in this run, each `verify` finding made in this run (`missing`,
 `modified` or `corrupt`), each copy in DEST that `download` found unreadable
 (`<path> corrupt: could not read <local>: <reason>`), each folder that
-disappeared during a scan, each
+disappeared during a scan, each folder a scan could not list, each
 entry left out because its name is not valid Unicode, each partial file
 that could not be deleted once its file's outcome was recorded (`<path>:
 partial file <file> not deleted: <reason>; the outcome stands`), each partial
@@ -1245,7 +1265,7 @@ is `scan`'s `without_checksum.sample`, the 20 smallest paths, with the full
   "schema_version": 1, "command": "scan", "…": "…",
   "root": "disk:/Photos", "files": 1203, "folders": 41, "size": 8573190144,
   "without_checksum": {"count": 2, "sample": ["disk:/Photos/a.heic", "disk:/Photos/b.heic"]},
-  "vanished": [], "unencodable": [], "first_scan": false,
+  "vanished": [], "unlisted": [], "unencodable": [], "first_scan": false,
   "added": ["disk:/Photos/new.jpg"], "changed": [], "removed": ["disk:/Photos/old.jpg"]
 }
 ```
@@ -1495,7 +1515,7 @@ systemctl --user stop yandex-disk-rescue.service
 | Code | Meaning |
 |---|---|
 | `0` | Success; for `download`, every file of the folder is verified at its final path; for `verify`, every file of the mirror is verified and intact |
-| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `download` also one or more failed or quarantined files (after the summary), a destination that cannot be read or written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files (after the summary), a destination that became unreadable, and a destination in use by another run |
+| `1` | A failure the tool reports as `Error: ...` on stderr: no token, a malformed, unreadable or insecure token, a token Yandex rejects, a remote path that is missing or not a folder, an API error after the retries, a manifest that is unusable or in use by another run, a log file that cannot be opened; for `scan` also one or more folders that could not be listed (after the summary); for `download` also one or more failed or quarantined files or folders the scan could not list (after the summary), a destination that cannot be read or written or lacks `RENAME_NOREPLACE`, and a destination in use by another run; for `verify` also one or more missing, modified, corrupt, quarantined or not downloaded files or folders the scan could not list (after the summary), a destination that became unreadable, and a destination in use by another run |
 | `2` | Invalid input: a usage error, an invalid option value from any source, an invalid config file, a remote path outside `disk:/`; for `download` also a number of paths other than one or two, a DEST that is not a folder, whose parent does not exist or that starts with `disk:`, a DEST already mirroring another remote folder or account, and `--no-scan` for a remote folder no completed scan covers; for `verify` a DEST that is not an existing folder or is not a mirror recorded in the manifest |
 | `130` | Interrupted with Ctrl+C |
 | `143` | Stopped with SIGTERM (`kill`, `systemctl stop`, `docker stop`): the same clean stop as Ctrl+C |

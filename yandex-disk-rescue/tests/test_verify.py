@@ -368,6 +368,31 @@ def test_files_not_downloaded_and_quarantined_are_listed_without_being_read(disk
     assert _findings() == []
 
 
+def test_a_folder_the_scan_could_not_list_is_not_downloaded(disk, dest):
+    assert run_download(str(dest)).exit_code == 0
+    disk.inject('GET', '/v1/disk/resources', 500, 500, where={'path': 'disk:/Photos/2024'})
+    assert runner.invoke(app, ['scan', '--api-retries', '1']).exit_code == 1
+    reason = (
+        'the scan could not list this folder, so files in it may be missing or out of date: '
+        'Yandex Disk API returned HTTP 500: Injected HTTP 500 (after 2 attempts)'
+    )
+
+    result = _verify(str(dest))
+
+    assert result.exit_code == 1, result.output
+    assert (
+        _intact_lines(dest, len(FILES), not_downloaded=1) + f'Not downloaded: 1\n  disk:/Photos/2024: {reason}\n'
+    ) in result.stdout
+    assert stderr_lines(result.stderr) == ['Error: 1 problem found; see the list above.']
+
+    as_json = _verify('--json', str(dest))
+
+    assert as_json.exit_code == 1, as_json.output
+    assert json.loads(as_json.stdout)['not_downloaded'] == [
+        {'path': 'disk:/Photos/2024', 'reason': reason, 'preview': None}
+    ]
+
+
 def _paths_touched(monkeypatch) -> list[str]:
     """Record the full path of every name opened, looked up or listed through a folder descriptor."""
     touched: list[str] = []
